@@ -5,6 +5,7 @@
 use super::hyper_client::ProxyResponse;
 use super::{
     body_filter::filter_private_params_with_whitelist,
+    compaction::{CompactionService, MaterializationTarget, ProviderRealm},
     content_encoding::{decompress_body, get_content_encoding},
     error::*,
     failover_switch::FailoverSwitchManager,
@@ -119,6 +120,7 @@ pub struct RequestForwarder {
     current_providers: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
     gemini_shadow: Arc<GeminiShadowStore>,
     codex_chat_history: Arc<CodexChatHistoryStore>,
+    compaction_service: Arc<CompactionService>,
     /// 故障转移切换管理器
     failover_manager: Arc<FailoverSwitchManager>,
     /// AppHandle，用于发射事件和更新托盘
@@ -201,6 +203,7 @@ impl RequestForwarder {
         current_providers: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
         gemini_shadow: Arc<GeminiShadowStore>,
         codex_chat_history: Arc<CodexChatHistoryStore>,
+        compaction_service: Arc<CompactionService>,
         failover_manager: Arc<FailoverSwitchManager>,
         app_handle: Option<tauri::AppHandle>,
         current_provider_id_at_start: String,
@@ -222,6 +225,7 @@ impl RequestForwarder {
             current_providers,
             gemini_shadow,
             codex_chat_history,
+            compaction_service,
             failover_manager,
             app_handle,
             current_provider_id_at_start,
@@ -407,6 +411,7 @@ impl RequestForwarder {
         let mut last_error = None;
         let mut last_provider = None;
         let mut attempted_providers = 0usize;
+        let mut quota_fallback_engaged = false;
 
         // 单 Provider 场景下跳过熔断器检查（故障转移关闭时）
         let bypass_circuit_breaker = providers.len() == 1;
@@ -428,6 +433,21 @@ impl RequestForwarder {
                     self.max_attempts
                 );
                 break;
+            }
+
+            // Latches are rechecked for every attempt, not just when the handler
+            // constructed the provider list. A concurrent request may have learned
+            // that this account is exhausted after routing began.
+            if self
+                .router
+                .is_provider_quota_latched(app_type_str, &provider.id)
+                .unwrap_or(false)
+            {
+                log::info!(
+                    "[{app_type_str}] quota-aware routing skipped provider {}",
+                    provider.name
+                );
+                continue;
             }
 
             // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
@@ -496,7 +516,7 @@ impl RequestForwarder {
                         .await;
 
                     // 更新当前应用类型使用的 provider
-                    {
+                    if !quota_fallback_engaged {
                         let mut current_providers = self.current_providers.write().await;
                         current_providers.insert(
                             app_type_str.to_string(),
@@ -509,21 +529,28 @@ impl RequestForwarder {
                         let mut status = self.status.write().await;
                         status.success_requests += 1;
                         status.last_error = None;
-                        let should_switch =
+                        let provider_changed =
                             self.current_provider_id_at_start.as_str() != provider.id.as_str();
-                        if should_switch {
+                        if provider_changed {
                             status.failover_count += 1;
 
-                            // 异步触发供应商切换，更新 UI/托盘，并把“当前供应商”同步为实际使用的 provider
-                            let fm = self.failover_manager.clone();
-                            let ah = self.app_handle.clone();
-                            let pid = provider.id.clone();
-                            let pname = provider.name.clone();
-                            let at = app_type_str.to_string();
+                            if quota_fallback_engaged {
+                                log::info!(
+                                    "[{app_type_str}] quota fallback used provider {} for this request without changing the global provider",
+                                    provider.name
+                                );
+                            } else {
+                                // 异步触发供应商切换，更新 UI/托盘，并把“当前供应商”同步为实际使用的 provider
+                                let fm = self.failover_manager.clone();
+                                let ah = self.app_handle.clone();
+                                let pid = provider.id.clone();
+                                let pname = provider.name.clone();
+                                let at = app_type_str.to_string();
 
-                            tokio::spawn(async move {
-                                let _ = fm.try_switch(ah.as_ref(), &at, &pid, &pname).await;
-                            });
+                                tokio::spawn(async move {
+                                    let _ = fm.try_switch(ah.as_ref(), &at, &pid, &pname).await;
+                                });
+                            }
                         }
                         // 重新计算成功率
                         if status.total_requests > 0 {
@@ -999,6 +1026,34 @@ impl RequestForwarder {
                         });
                     }
 
+                    if crate::proxy::quota_policy::QuotaPolicy::is_quota_error(&e) {
+                        match self.router.record_quota_error(app_type_str, provider, &e) {
+                            Ok(Some(latch)) => log::warn!(
+                                "[{app_type_str}] provider {} quota-latched until {} ({})",
+                                provider.name,
+                                latch.blocked_until,
+                                latch.quota_kind
+                            ),
+                            Ok(None) => {}
+                            Err(error) => log::error!(
+                                "[{app_type_str}] failed to persist quota latch for {}: {}",
+                                provider.name,
+                                error
+                            ),
+                        }
+                        self.router
+                            .release_permit_neutral(
+                                &provider.id,
+                                app_type_str,
+                                used_half_open_permit,
+                            )
+                            .await;
+                        quota_fallback_engaged = true;
+                        last_error = Some(e);
+                        last_provider = Some(provider.clone());
+                        continue;
+                    }
+
                     // 先分类错误，决定是否计入 provider 健康度
                     // —— NonRetryable / ClientAbort 是客户端层错误，无论换哪家 provider 都会被拒绝，
                     //    不应污染熔断器和数据库健康度（与 release_permit_neutral 同语义）。
@@ -1187,6 +1242,55 @@ impl RequestForwarder {
             // final anthropic_body.
             mapped_body =
                 super::model_mapper::strip_one_m_suffix_for_upstream_from_body(mapped_body);
+        }
+
+        // Materialization is intentionally per provider attempt. A failover chain can
+        // cross protocol/realm boundaries, so doing this once in the handler would let
+        // an opaque token leak into a later Chat/Anthropic transform (which historically
+        // dropped it silently). The canonical suffix remains in the outer request and is
+        // therefore appended exactly once.
+        if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
+            let realm = if codex_responses_to_chat || codex_responses_to_anthropic {
+                ProviderRealm::Bridge
+            } else {
+                ProviderRealm::Official
+            };
+            let realm_key = match realm {
+                ProviderRealm::Bridge => format!("bridge:{}", provider.id),
+                ProviderRealm::Official => format!("native:{}", provider.id),
+            };
+            let target = MaterializationTarget {
+                provider_id: provider.id.clone(),
+                model: mapped_body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                realm,
+                realm_key,
+            };
+            let materialized = self
+                .compaction_service
+                .materialize_for_target(&mapped_body, &target)
+                .map_err(|error| ProxyError::TransformError(error.to_string()))?;
+            if materialized.changed_items > 0 {
+                log::info!(
+                    "[Codex] materialized {} compaction item(s) for provider={} realm={}",
+                    materialized.changed_items,
+                    provider.id,
+                    target.realm.as_str()
+                );
+            }
+            mapped_body = materialized.body;
+            if target.realm == ProviderRealm::Bridge
+                && (endpoint
+                    .split('?')
+                    .next()
+                    .is_some_and(|path| path.ends_with("/responses/compact"))
+                    || CompactionService::is_compaction_request(body))
+            {
+                mapped_body = CompactionService::prepare_local_summary_request(&mapped_body);
+            }
         }
 
         // --- Copilot 优化器：分类 + 请求体优化（在格式转换之前执行） ---
@@ -3501,6 +3605,10 @@ mod tests {
             current_providers: Arc::new(RwLock::new(HashMap::new())),
             gemini_shadow: Arc::new(GeminiShadowStore::new()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            compaction_service: Arc::new(CompactionService::with_store(
+                crate::proxy::compaction::CompactionStore::with_key(db.clone(), vec![13; 32])
+                    .expect("test compaction store"),
+            )),
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
             app_handle: None,
             current_provider_id_at_start: String::new(),

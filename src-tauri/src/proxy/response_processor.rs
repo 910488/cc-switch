@@ -942,6 +942,10 @@ mod tests {
             provider_router: Arc::new(ProviderRouter::new(db.clone())),
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            compaction_service: Arc::new(crate::proxy::compaction::CompactionService::with_store(
+                crate::proxy::compaction::CompactionStore::with_key(db.clone(), vec![11; 32])
+                    .expect("test compaction store"),
+            )),
             app_handle: None,
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
         }

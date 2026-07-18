@@ -8,6 +8,7 @@
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
 use super::{
+    compaction::{CompactionContext, CompactionService, ProviderRealm, Snapshot},
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
     forwarder::ActiveConnectionGuard,
@@ -19,7 +20,7 @@ use super::{
     providers::{
         codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::record_responses_sse_stream,
-        get_adapter, get_claude_api_format,
+        codex_responses_sse, get_adapter, get_claude_api_format,
         streaming::create_anthropic_sse_stream,
         streaming_codex_anthropic::{
             create_responses_sse_stream_from_anthropic_with_context,
@@ -46,6 +47,7 @@ use crate::app_config::AppType;
 use crate::database::PRICING_SOURCE_REQUEST;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use bytes::Bytes;
+use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 
@@ -801,19 +803,43 @@ async fn handle_responses_for_app(
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
     let endpoint = endpoint_with_query(&uri, "/responses");
 
+    let is_compaction = CompactionService::is_compaction_request(&body);
+    let continuity_context =
+        CompactionService::context_from_request(&headers, &body, &ctx.session_id);
+    let snapshot = if is_compaction {
+        let initial_realm =
+            if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint)
+                || super::providers::should_convert_codex_responses_to_anthropic(
+                    &ctx.provider,
+                    &endpoint,
+                )
+            {
+                ProviderRealm::Bridge
+            } else {
+                ProviderRealm::Official
+            };
+        Some(
+            state
+                .compaction_service
+                .save_snapshot(&continuity_context, &body, initial_realm)
+                .map_err(|error| ProxyError::Internal(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+
     let is_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
-
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
         .forward_with_retry(
             &app_type,
             method,
             &endpoint,
-            body,
+            body.clone(),
             headers,
             extensions,
             ctx.get_providers(),
@@ -834,6 +860,48 @@ async fn handle_responses_for_app(
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
+
+    if let Some(snapshot) = snapshot {
+        if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
+            return handle_local_compaction_response(
+                response,
+                &ctx,
+                &state,
+                connection_guard,
+                &continuity_context,
+                &snapshot,
+                &body,
+                false,
+                is_stream,
+                LocalSummaryProtocol::Anthropic,
+            )
+            .await;
+        }
+        if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint) {
+            return handle_local_compaction_response(
+                response,
+                &ctx,
+                &state,
+                connection_guard,
+                &continuity_context,
+                &snapshot,
+                &body,
+                false,
+                is_stream,
+                LocalSummaryProtocol::Chat,
+            )
+            .await;
+        }
+        return handle_native_compaction_response(
+            response,
+            &ctx,
+            &state,
+            connection_guard,
+            &continuity_context,
+            &snapshot,
+        )
+        .await;
+    }
 
     if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
         return handle_codex_anthropic_to_responses_transform(
@@ -916,11 +984,30 @@ async fn handle_responses_compact_for_app(
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
 
+    let continuity_context =
+        CompactionService::context_from_request(&headers, &body, &ctx.session_id);
+    let initial_realm =
+        if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint)
+            || super::providers::should_convert_codex_responses_to_anthropic(
+                &ctx.provider,
+                &endpoint,
+            )
+        {
+            ProviderRealm::Bridge
+        } else {
+            ProviderRealm::Official
+        };
+    // Fail closed: never let the client receive an opaque compaction token unless
+    // the exact canonical request was durably journaled first.
+    let snapshot = state
+        .compaction_service
+        .save_snapshot(&continuity_context, &body, initial_realm)
+        .map_err(|error| ProxyError::Internal(error.to_string()))?;
+
     let is_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
@@ -928,7 +1015,7 @@ async fn handle_responses_compact_for_app(
             &app_type,
             method,
             &endpoint,
-            body,
+            body.clone(),
             headers,
             extensions,
             ctx.get_providers(),
@@ -951,37 +1038,435 @@ async fn handle_responses_compact_for_app(
     let response = result.response;
 
     if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
-        return handle_codex_anthropic_to_responses_transform(
+        return handle_local_compaction_response(
             response,
             &ctx,
             &state,
-            is_stream,
             connection_guard,
-            codex_tool_context,
+            &continuity_context,
+            &snapshot,
+            &body,
+            true,
+            is_stream,
+            LocalSummaryProtocol::Anthropic,
         )
         .await;
     }
 
     if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint) {
-        return handle_codex_chat_to_responses_transform(
+        return handle_local_compaction_response(
             response,
             &ctx,
             &state,
-            is_stream,
             connection_guard,
-            codex_tool_context,
+            &continuity_context,
+            &snapshot,
+            &body,
+            true,
+            is_stream,
+            LocalSummaryProtocol::Chat,
         )
         .await;
     }
 
-    process_response(
+    return handle_native_compaction_response(
         response,
         &ctx,
         &state,
-        &CODEX_PARSER_CONFIG,
         connection_guard,
+        &continuity_context,
+        &snapshot,
     )
-    .await
+    .await;
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LocalSummaryProtocol {
+    Chat,
+    Anthropic,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_local_compaction_response(
+    response: super::hyper_client::ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    connection_guard: Option<ActiveConnectionGuard>,
+    continuity_context: &CompactionContext,
+    snapshot: &Snapshot,
+    original_body: &Value,
+    compact_endpoint: bool,
+    original_stream: bool,
+    protocol: LocalSummaryProtocol,
+) -> Result<axum::response::Response, ProxyError> {
+    let status = response.status();
+    if !status.is_success() {
+        return handle_codex_chat_error_response(response, ctx, status).await;
+    }
+    let body_timeout =
+        if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
+            std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
+        } else {
+            std::time::Duration::ZERO
+        };
+    let (_headers, _status, body_bytes) =
+        read_decoded_body(response, ctx.tag, body_timeout).await?;
+    let text = String::from_utf8_lossy(&body_bytes);
+    let upstream: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(value) => value,
+        Err(_) if body_looks_like_sse(&text) => match protocol {
+            LocalSummaryProtocol::Chat => chat_sse_to_response_value(&text)?,
+            LocalSummaryProtocol::Anthropic => {
+                transform_codex_anthropic::anthropic_sse_to_message_value(&text)?
+            }
+        },
+        Err(error) => {
+            return Err(ProxyError::TransformError(format!(
+                "Failed to parse local compaction response: {error}"
+            )))
+        }
+    };
+    let summary = match protocol {
+        LocalSummaryProtocol::Chat => chat_summary_text(&upstream),
+        LocalSummaryProtocol::Anthropic => anthropic_summary_text(&upstream),
+    }
+    .filter(|summary| !summary.trim().is_empty())
+    .ok_or_else(|| {
+        ProxyError::TransformError("third-party compaction returned an empty summary".to_string())
+    })?;
+
+    let item = state
+        .compaction_service
+        .create_bridge_compaction(
+            continuity_context,
+            snapshot,
+            &ctx.provider.id,
+            summary.trim(),
+        )
+        .map_err(|error| ProxyError::Internal(error.to_string()))?;
+    let _connection_guard = connection_guard;
+    build_local_compaction_response(original_body, item, compact_endpoint, original_stream)
+}
+
+async fn handle_native_compaction_response(
+    response: super::hyper_client::ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    connection_guard: Option<ActiveConnectionGuard>,
+    continuity_context: &CompactionContext,
+    snapshot: &Snapshot,
+) -> Result<axum::response::Response, ProxyError> {
+    let status = response.status();
+    if !status.is_success() {
+        return process_response(response, ctx, state, &CODEX_PARSER_CONFIG, connection_guard)
+            .await;
+    }
+    let is_sse = response.is_sse();
+    let mut headers = response.headers().clone();
+    if is_sse {
+        strip_hop_by_hop_response_headers(&mut headers);
+        headers.remove(axum::http::header::CONTENT_LENGTH);
+        let stream = native_compaction_sse_stream(
+            response,
+            state.compaction_service.clone(),
+            continuity_context.clone(),
+            snapshot.clone(),
+            ctx.provider.id.clone(),
+            connection_guard,
+        );
+        let mut builder = axum::response::Response::builder().status(status);
+        for (key, value) in &headers {
+            builder = builder.header(key, value);
+        }
+        return builder
+            .body(axum::body::Body::from_stream(stream))
+            .map_err(|error| {
+                ProxyError::Internal(format!("Failed to stream compact response: {error}"))
+            });
+    }
+    let body_bytes = response.bytes().await?;
+    let items = compaction_items_from_response_bytes(&body_bytes, &headers);
+    if items.is_empty() {
+        return Err(ProxyError::TransformError(
+            "native compact response contained no compaction item".to_string(),
+        ));
+    }
+    for item in &items {
+        state
+            .compaction_service
+            .register_native_compaction(continuity_context, snapshot, &ctx.provider.id, item)
+            .map_err(|error| ProxyError::Internal(error.to_string()))?;
+    }
+    strip_hop_by_hop_response_headers(&mut headers);
+    let mut builder = axum::response::Response::builder().status(status);
+    for (key, value) in &headers {
+        builder = builder.header(key, value);
+    }
+    let _connection_guard = connection_guard;
+    builder
+        .body(axum::body::Body::from(body_bytes))
+        .map_err(|error| {
+            ProxyError::Internal(format!("Failed to replay compact response: {error}"))
+        })
+}
+
+struct NativeCompactionStreamState {
+    upstream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+    buffer: Vec<u8>,
+    service: std::sync::Arc<CompactionService>,
+    context: CompactionContext,
+    snapshot: Snapshot,
+    provider_id: String,
+    registered_ids: std::collections::BTreeSet<String>,
+    finished: bool,
+    _connection_guard: Option<ActiveConnectionGuard>,
+}
+
+fn native_compaction_sse_stream(
+    response: super::hyper_client::ProxyResponse,
+    service: std::sync::Arc<CompactionService>,
+    context: CompactionContext,
+    snapshot: Snapshot,
+    provider_id: String,
+    connection_guard: Option<ActiveConnectionGuard>,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    let upstream = Box::pin(response.bytes_stream());
+    let state = NativeCompactionStreamState {
+        upstream,
+        buffer: Vec::new(),
+        service,
+        context,
+        snapshot,
+        provider_id,
+        registered_ids: std::collections::BTreeSet::new(),
+        finished: false,
+        _connection_guard: connection_guard,
+    };
+
+    futures::stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(frame) = take_raw_sse_frame(&mut state.buffer) {
+                if let Err(error) = register_native_items_in_sse_frame(&mut state, &frame) {
+                    state.finished = true;
+                    return Some((Err(std::io::Error::other(error.to_string())), state));
+                }
+                return Some((Ok(Bytes::from(frame)), state));
+            }
+
+            if state.finished {
+                if state.registered_ids.is_empty() {
+                    state.registered_ids.insert("__missing__".to_string());
+                    return Some((
+                        Err(std::io::Error::other(
+                            "native compact SSE ended without a compaction item",
+                        )),
+                        state,
+                    ));
+                }
+                if !state.buffer.is_empty() {
+                    let trailing = std::mem::take(&mut state.buffer);
+                    return Some((Ok(Bytes::from(trailing)), state));
+                }
+                return None;
+            }
+
+            match state.upstream.next().await {
+                Some(Ok(chunk)) => state.buffer.extend_from_slice(&chunk),
+                Some(Err(error)) => {
+                    state.finished = true;
+                    return Some((Err(error), state));
+                }
+                None => state.finished = true,
+            }
+        }
+    })
+}
+
+fn register_native_items_in_sse_frame(
+    state: &mut NativeCompactionStreamState,
+    frame: &[u8],
+) -> Result<(), crate::error::AppError> {
+    let text = String::from_utf8_lossy(frame);
+    let mut found = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let Some(data) = strip_sse_field(line, "data") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(data) {
+            collect_compaction_items(&value, &mut found);
+        }
+    }
+    for (id, item) in found {
+        if state.registered_ids.insert(id) {
+            state.service.register_native_compaction(
+                &state.context,
+                &state.snapshot,
+                &state.provider_id,
+                &item,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn take_raw_sse_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    let (position, delimiter_len) = match (lf, crlf) {
+        (Some(lf), Some(crlf)) if lf <= crlf => (lf, 2),
+        (Some(_), Some(crlf)) => (crlf, 4),
+        (Some(lf), None) => (lf, 2),
+        (None, Some(crlf)) => (crlf, 4),
+        (None, None) => return None,
+    };
+    Some(buffer.drain(..position + delimiter_len).collect())
+}
+
+fn build_local_compaction_response(
+    original_body: &Value,
+    item: Value,
+    compact_endpoint: bool,
+    stream: bool,
+) -> Result<axum::response::Response, ProxyError> {
+    if compact_endpoint {
+        return Ok(Json(json!({ "output": [item] })).into_response());
+    }
+    let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+    let model = original_body
+        .get("model")
+        .cloned()
+        .unwrap_or_else(|| Value::String("unknown".to_string()));
+    let created_at = chrono::Utc::now().timestamp();
+    let completed = json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": "completed",
+        "model": model,
+        "output": [item.clone()],
+        "parallel_tool_calls": false,
+        "tool_choice": "none",
+        "tools": [],
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    });
+    if !stream {
+        return Ok(Json(completed).into_response());
+    }
+    let created = json!({
+        "id": completed["id"],
+        "object": "response",
+        "created_at": created_at,
+        "status": "in_progress",
+        "model": completed["model"],
+        "output": [],
+    });
+    let chunks = [
+        codex_responses_sse::response_created(&created),
+        codex_responses_sse::response_in_progress(&created),
+        codex_responses_sse::output_item_added(0, &item),
+        codex_responses_sse::output_item_done(0, &item),
+        codex_responses_sse::response_completed(&completed),
+    ];
+    let mut bytes = Vec::new();
+    for chunk in chunks {
+        bytes.extend_from_slice(&chunk);
+    }
+    let mut response = axum::response::Response::new(axum::body::Body::from(bytes));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    Ok(response)
+}
+
+fn chat_summary_text(value: &Value) -> Option<String> {
+    let content = value.pointer("/choices/0/message/content")?;
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => Some(
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
+}
+
+fn anthropic_summary_text(value: &Value) -> Option<String> {
+    Some(
+        value
+            .get("content")?
+            .as_array()?
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn compaction_items_from_response_bytes(
+    bytes: &[u8],
+    headers: &axum::http::HeaderMap,
+) -> Vec<Value> {
+    let text = String::from_utf8_lossy(bytes);
+    let is_sse = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"))
+        || body_looks_like_sse(&text);
+    let mut found = std::collections::BTreeMap::new();
+    if is_sse {
+        for line in text.lines() {
+            let Some(data) = strip_sse_field(line, "data") else {
+                continue;
+            };
+            if data.trim().is_empty() || data.trim() == "[DONE]" {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(data.trim()) {
+                collect_compaction_items(&value, &mut found);
+            }
+        }
+    } else if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        collect_compaction_items(&value, &mut found);
+    }
+    found.into_values().collect()
+}
+
+fn collect_compaction_items(value: &Value, found: &mut std::collections::BTreeMap<String, Value>) {
+    match value {
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("compaction") {
+                let id = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                found.insert(id, value.clone());
+                return;
+            }
+            for child in object.values() {
+                collect_compaction_items(child, found);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_compaction_items(item, found);
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn handle_codex_chat_to_responses_transform(
@@ -1683,6 +2168,7 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         ProxyError::NoAvailableProvider => "cc_switch_no_available_provider",
         ProxyError::AllProvidersCircuitOpen => "cc_switch_all_providers_circuit_open",
         ProxyError::NoProvidersConfigured => "cc_switch_no_providers_configured",
+        ProxyError::AllProvidersQuotaLimited(_) => "cc_switch_all_providers_quota_limited",
         ProxyError::MaxRetriesExceeded => "cc_switch_max_retries_exceeded",
         ProxyError::ProviderUnhealthy(_) => "cc_switch_provider_unhealthy",
         ProxyError::ConfigError(_) => "cc_switch_config_error",

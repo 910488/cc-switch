@@ -27,6 +27,17 @@ export interface ProxyStatus {
   last_error: string | null;
   failover_count: number;
   active_targets?: ActiveTarget[];
+  continuity?: ContinuityStatus;
+}
+
+export interface ContinuityStatus {
+  available: boolean;
+  key_protection: string | null;
+  snapshots: number;
+  compactions: number;
+  migrations: number;
+  task_states: number;
+  error: string | null;
 }
 
 export interface ActiveTarget {

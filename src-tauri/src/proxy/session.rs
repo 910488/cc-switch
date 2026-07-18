@@ -286,7 +286,7 @@ fn extract_claude_session(
 /// 提取 Codex Session ID
 fn extract_codex_session(headers: &HeaderMap, body: &serde_json::Value) -> Option<SessionIdResult> {
     // 1. 从 headers 提取
-    for header_name in &["session_id", "x-session-id"] {
+    for header_name in &["session-id", "session_id", "x-session-id"] {
         if let Some(value) = headers.get(*header_name) {
             if let Ok(session_id) = value.to_str() {
                 // Codex Session ID 通常较长（UUID 格式）

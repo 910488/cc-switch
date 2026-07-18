@@ -18,6 +18,21 @@ English | [中文](README_ZH.md) | [日本語](README_JA.md) | [Deutsch](README_
 
 </div>
 
+## Codex Continuity Bridge Fork
+
+This fork is maintained at **[910488/cc-switch](https://github.com/910488/cc-switch)** and adds durable context continuity to the built-in Codex proxy. It is intended for long-running Codex tasks that may switch between official OpenAI Responses providers and third-party Chat Completions or Anthropic-compatible providers.
+
+- **Cross-provider compaction continuity** — resumes compacted tasks across official Responses, OpenAI-compatible Chat, and Anthropic-compatible gateways without silently dropping history
+- **Encrypted canonical journal** — stores the exact pre-compaction context in SQLite using AES-256-GCM; Windows protects the master key with current-user DPAPI
+- **Restart-safe resume** — compaction references remain recoverable after restarting CC Switch or reopening its database
+- **Durable native streaming** — native SSE events remain streaming, while compaction state is committed before the reference is exposed to Codex
+- **Quota-aware fallback** — quota-exhausted provider/account routes are temporarily latched and skipped without poisoning circuit-breaker health or permanently changing the selected provider
+- **Large-context protection** — preserves recent turns, tool-call pairs, and bounded chronological excerpts when a cross-provider migration would exceed the next model's context window
+
+The continuity tables are local-only and are excluded from WebDAV/cloud SQL synchronization. Missing, corrupt, or unauthenticated journal data fails closed: CC Switch returns an error instead of forwarding an opaque compaction reference to an incompatible provider.
+
+See [the implementation design](docs/design/codex-continuity-bridge.md) for the storage, migration, streaming, and failure-safety model.
+
 ## ❤️Sponsor
 
 > [Want to appear here?](mailto:farion1231@gmail.com)
@@ -227,6 +242,7 @@ Modern AI-powered coding relies on tools like Claude Code, Claude Desktop, Codex
 
 - **Local proxy with hot-switching** — Format conversion, auto-failover, circuit breaker, provider health monitoring, and request rectifier
 - **App-level takeover** — Independently proxy Claude, Codex, Gemini, or Grok Build, down to individual providers
+- **Codex continuity bridge (this fork)** — Durable compaction journal, official/third-party resume migration, large-context planning, and quota-window-aware fallback
 
 ### MCP, Prompts & Skills
 
@@ -342,6 +358,57 @@ For detailed guides on every feature, check out the **[User Manual](docs/user-ma
 > **Note**: On first launch, you can manually import existing CLI tool configs as the default provider.
 
 ## Download & Installation
+
+### Installing This Fork
+
+The upstream CC Switch project already includes a real Tauri 2 installer. On Windows the release workflow produces a per-user **WiX MSI installer** and a portable ZIP; macOS and Linux bundles are also defined in the existing release workflow.
+
+Custom installers for this fork appear on the **[910488/cc-switch Releases](https://github.com/910488/cc-switch/releases)** page after a tagged release has been built. Do not install an upstream `farion1231/cc-switch` package when you specifically need the continuity-bridge changes described above.
+
+If no custom release is available yet, build the Windows MSI from source:
+
+```powershell
+git clone https://github.com/910488/cc-switch.git
+cd cc-switch
+git switch feature/codex-continuity-bridge
+
+# Required once: Node.js 20, pnpm 10.12.3, Rust 1.85+, and
+# Visual Studio 2022 Build Tools with the Desktop development with C++ workload.
+corepack enable
+corepack prepare pnpm@10.12.3 --activate
+pnpm install --frozen-lockfile
+pnpm tauri build --bundles msi
+```
+
+The installer is generated under:
+
+```text
+src-tauri/target/release/bundle/msi/*.msi
+```
+
+After installation:
+
+1. Open CC Switch and add or import the Codex providers you want to use.
+2. Open the proxy settings, enable the local proxy, and enable Codex takeover.
+3. Verify that **Codex context continuity** in the Proxy panel reports `Encrypted journal ready (dpapi-current-user)` on Windows.
+4. Restart the Codex CLI so it picks up the CC Switch proxy configuration.
+5. Keep at least one fallback provider in the Codex failover queue if you want quota-aware fallback.
+
+> **Updater note:** this branch currently inherits the upstream updater signing configuration. Until this fork publishes a separately signed `latest.json`, install fork updates manually from its Releases page so an upstream update does not replace the custom build.
+
+### Migrating from the Previous Codex Bridge Installer
+
+The previous WinForms setup wizard embeds and installs the standalone Node proxy, `guardian.mjs`, PowerShell launch scripts, and its own compaction journal. It does **not** install the Tauri CC Switch application and should not run alongside CC Switch takeover on the same Codex endpoint.
+
+The wizard is still useful as the basis for a migration/bootstrapper tool. Its recommended future role is to:
+
+1. Read the old provider profiles and Codex configuration.
+2. Stop and remove the old guardian/startup integration.
+3. Launch the CC Switch MSI.
+4. Import provider URLs, model mappings, and environment-variable names into CC Switch.
+5. Verify Codex takeover, DPAPI journal availability, and a compact/resume smoke test.
+
+Do not carry the old Node proxy payload into the new installer. CC Switch now owns the proxy, provider router, SQLite database, continuity journal, and quota fallback lifecycle.
 
 ### System Requirements
 

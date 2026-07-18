@@ -323,6 +323,12 @@ impl Database {
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // 20. Codex continuity journal. Payload-bearing columns are encrypted by
+        // proxy::compaction before they reach SQLite; only routing metadata stays
+        // queryable. Keep these table names compatible with the standalone bridge
+        // so its behavioral fixtures can be reused during the migration.
+        Self::create_compaction_tables(conn)?;
+
         // 修复跑过未发布开发版的库：current 标记曾是全局 key，现按应用分组
         // （随 v12 定稿为 current_profile_id_<scope>，不单独 bump 版本）
         if conn
@@ -505,6 +511,11 @@ impl Database {
                         log::info!("迁移数据库从 v14 到 v15（Skills/MCP 添加 Grok Build 支持）");
                         Self::migrate_v14_to_v15(conn)?;
                         Self::set_user_version(conn, 15)?;
+                    }
+                    15 => {
+                        log::info!("迁移数据库从 v15 到 v16（添加 Codex continuity journal）");
+                        Self::migrate_v15_to_v16(conn)?;
+                        Self::set_user_version(conn, 16)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1508,6 +1519,88 @@ impl Database {
             )?;
         }
         Ok(())
+    }
+
+    fn migrate_v15_to_v16(conn: &Connection) -> Result<(), AppError> {
+        Self::create_compaction_tables(conn)
+    }
+
+    fn create_compaction_tables(conn: &Connection) -> Result<(), AppError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS compaction_snapshots (
+                id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                source_model TEXT NOT NULL,
+                parent_id TEXT,
+                token_estimate INTEGER NOT NULL,
+                payload_hash TEXT NOT NULL,
+                envelope_version INTEGER NOT NULL DEFAULT 1,
+                key_version INTEGER NOT NULL DEFAULT 1,
+                payload_blob BLOB NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_compaction_snapshots_thread_created
+                ON compaction_snapshots(thread_id, session_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS compactions (
+                id TEXT PRIMARY KEY,
+                snapshot_id TEXT NOT NULL REFERENCES compaction_snapshots(id) ON DELETE CASCADE,
+                realm TEXT NOT NULL,
+                source_model TEXT NOT NULL,
+                envelope_version INTEGER NOT NULL DEFAULT 1,
+                key_version INTEGER NOT NULL DEFAULT 1,
+                item_blob BLOB NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_compactions_snapshot
+                ON compactions(snapshot_id, realm);
+
+            CREATE TABLE IF NOT EXISTS compaction_migrations (
+                source_compaction_id TEXT NOT NULL,
+                target_model TEXT NOT NULL,
+                target_realm TEXT NOT NULL,
+                target_provider_id TEXT NOT NULL DEFAULT '',
+                prompt_version INTEGER NOT NULL DEFAULT 1,
+                envelope_version INTEGER NOT NULL DEFAULT 1,
+                key_version INTEGER NOT NULL DEFAULT 1,
+                item_blob BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(source_compaction_id, target_model, target_realm, target_provider_id, prompt_version),
+                FOREIGN KEY(source_compaction_id) REFERENCES compactions(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS compaction_task_states (
+                thread_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                compaction_id TEXT,
+                state_blob BLOB NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(thread_id, session_id),
+                FOREIGN KEY(compaction_id) REFERENCES compactions(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_compaction_task_states_updated
+                ON compaction_task_states(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_compaction_task_states_compaction
+                ON compaction_task_states(compaction_id);
+
+            CREATE TABLE IF NOT EXISTS quota_latches (
+                app_type TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                account_id TEXT NOT NULL DEFAULT '',
+                quota_kind TEXT NOT NULL,
+                blocked_until TEXT,
+                signal_hash TEXT,
+                detail_blob BLOB,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(app_type, provider_id, account_id, quota_kind),
+                FOREIGN KEY(provider_id, app_type) REFERENCES providers(id, app_type) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_quota_latches_blocked_until
+                ON quota_latches(app_type, blocked_until);",
+        )
+        .map_err(|e| AppError::Database(format!("创建 Codex continuity tables 失败: {e}")))
     }
 
     /// 插入默认模型定价数据
@@ -3019,6 +3112,42 @@ mod tests {
         assert_eq!(mcp_values, (1, 0));
         assert_eq!(skill_values, (1, 0));
 
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v15_to_v16_creates_encrypted_continuity_schema() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute("PRAGMA foreign_keys = ON", [])?;
+        Database::set_user_version(&conn, 15)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        for table in [
+            "compaction_snapshots",
+            "compactions",
+            "compaction_migrations",
+            "compaction_task_states",
+            "quota_latches",
+        ] {
+            assert!(Database::table_exists(&conn, table)?, "missing {table}");
+        }
+        assert!(Database::has_column(
+            &conn,
+            "compaction_snapshots",
+            "key_version"
+        )?);
+        assert!(Database::has_column(
+            &conn,
+            "compaction_migrations",
+            "target_provider_id"
+        )?);
+        assert!(Database::has_column(
+            &conn,
+            "compaction_migrations",
+            "prompt_version"
+        )?);
         Ok(())
     }
 }

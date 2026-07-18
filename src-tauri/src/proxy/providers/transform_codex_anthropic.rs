@@ -641,6 +641,12 @@ fn convert_input_to_messages(
                     push_assistant_thinking_block(&mut messages, block);
                 }
             }
+            Some("compaction") => {
+                return Err(ProxyError::InvalidRequest(
+                    "unmaterialized compaction item reached Anthropic transform; refusing to drop context"
+                        .to_string(),
+                ));
+            }
             // message item or an item carrying a role
             _ => {
                 let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");

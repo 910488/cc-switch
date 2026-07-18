@@ -35,6 +35,9 @@ pub enum ProxyError {
     #[error("未配置供应商")]
     NoProvidersConfigured,
 
+    #[error("所有供应商均处于配额恢复期，最早恢复时间: {0}")]
+    AllProvidersQuotaLimited(String),
+
     #[allow(dead_code)]
     #[error("Provider不健康: {0}")]
     ProviderUnhealthy(String),
@@ -133,6 +136,9 @@ impl IntoResponse for ProxyError {
                     }
                     ProxyError::NoProvidersConfigured => {
                         (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
+                    }
+                    ProxyError::AllProvidersQuotaLimited(_) => {
+                        (StatusCode::TOO_MANY_REQUESTS, self.to_string())
                     }
                     ProxyError::ProviderUnhealthy(_) => {
                         (StatusCode::SERVICE_UNAVAILABLE, self.to_string())

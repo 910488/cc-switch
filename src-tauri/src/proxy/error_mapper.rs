@@ -39,6 +39,7 @@ pub fn map_proxy_error_to_status(error: &ProxyError) -> u16 {
 
         // 未配置供应商：503 Service Unavailable
         ProxyError::NoProvidersConfigured => 503,
+        ProxyError::AllProvidersQuotaLimited(_) => 429,
 
         // 重试耗尽：503 Service Unavailable
         ProxyError::MaxRetriesExceeded => 503,
@@ -78,6 +79,9 @@ pub fn get_error_message(error: &ProxyError) -> String {
         ProxyError::NoAvailableProvider => "无可用 Provider".to_string(),
         ProxyError::AllProvidersCircuitOpen => "所有供应商已熔断，无可用渠道".to_string(),
         ProxyError::NoProvidersConfigured => "未配置供应商".to_string(),
+        ProxyError::AllProvidersQuotaLimited(release) => {
+            format!("所有供应商均处于配额恢复期，最早恢复时间: {release}")
+        }
         ProxyError::MaxRetriesExceeded => "所有 Provider 都失败，重试耗尽".to_string(),
         ProxyError::ProviderUnhealthy(msg) => format!("Provider 不健康: {msg}"),
         ProxyError::DatabaseError(msg) => format!("数据库错误: {msg}"),

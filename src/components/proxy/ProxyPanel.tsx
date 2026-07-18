@@ -9,6 +9,7 @@ import {
   Loader2,
   Zap,
   Power,
+  ShieldCheck,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -510,6 +511,53 @@ export function ProxyPanel({
                 })}
                 value={formatUptime(status.uptime_seconds)}
               />
+            </div>
+            <div className="rounded-lg border border-border bg-card/60 p-4">
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex gap-3">
+                  <ShieldCheck
+                    className={`mt-0.5 h-5 w-5 ${
+                      status.continuity?.available
+                        ? "text-green-500"
+                        : "text-destructive"
+                    }`}
+                  />
+                  <div>
+                    <h4 className="text-sm font-semibold">
+                      {t("proxy.continuity.title", {
+                        defaultValue: "Codex context continuity",
+                      })}
+                    </h4>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {status.continuity?.available
+                        ? t("proxy.continuity.ready", {
+                            protection:
+                              status.continuity.key_protection ?? "encrypted",
+                            defaultValue:
+                              "Encrypted journal ready ({{protection}})",
+                          })
+                        : status.continuity?.error ||
+                          t("proxy.continuity.unavailable", {
+                            defaultValue: "Continuity journal unavailable",
+                          })}
+                    </p>
+                  </div>
+                </div>
+                <div className="text-right text-xs text-muted-foreground">
+                  <div>
+                    {status.continuity?.snapshots ?? 0}{" "}
+                    {t("proxy.continuity.snapshots", {
+                      defaultValue: "snapshots",
+                    })}
+                  </div>
+                  <div>
+                    {status.continuity?.compactions ?? 0}{" "}
+                    {t("proxy.continuity.compactions", {
+                      defaultValue: "compactions",
+                    })}
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         ) : (

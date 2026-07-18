@@ -600,6 +600,12 @@ fn append_responses_item_as_chat_message(
 ) -> Result<(), ProxyError> {
     let item_type = item.get("type").and_then(|v| v.as_str());
     match item_type {
+        Some("compaction") => {
+            return Err(ProxyError::InvalidRequest(
+                "unmaterialized compaction item reached Chat transform; refusing to drop context"
+                    .to_string(),
+            ));
+        }
         Some("function_call") => {
             append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
             pending_tool_calls.push(responses_function_call_to_chat_tool_call(
