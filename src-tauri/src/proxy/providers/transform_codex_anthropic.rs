@@ -1176,7 +1176,7 @@ pub(crate) fn anthropic_response_to_responses_with_context(
         if !text_parts.is_empty() {
             let idx = output.len();
             output.push(json!({
-                "id": format!("{response_id}_msg_{idx}"),
+                "id": format!("msg_{response_id}_{idx}"),
                 "type": "message",
                 "status": "completed",
                 "role": "assistant",
@@ -2234,6 +2234,7 @@ mod tests {
         assert_eq!(result["id"], "resp_msg_1");
         assert_eq!(result["status"], "completed");
         assert_eq!(result["output"][0]["type"], "message");
+        assert_eq!(result["output"][0]["id"], "msg_resp_msg_1_0");
         assert_eq!(result["output"][0]["content"][0]["type"], "output_text");
         assert_eq!(result["output"][0]["content"][0]["text"], "Hello!");
         assert_eq!(result["usage"]["input_tokens"], 10);

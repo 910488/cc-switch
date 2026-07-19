@@ -1726,6 +1726,16 @@ impl RequestForwarder {
             mapped_body
         };
 
+        // Bridge responses are replayed by Codex as input on the next turn. Older
+        // CC Switch builds generated message item ids such as `resp_*_msg`, while
+        // the official Responses endpoint requires message ids to begin with
+        // `msg`. Dropping only an invalid message id is lossless (the message
+        // content remains intact) and lets existing third-party conversations
+        // switch back to OpenAI Official without starting a new task.
+        if is_codex_official {
+            sanitize_official_responses_message_ids(&mut request_body);
+        }
+
         if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
             self.apply_media_prevention(&mut request_body, provider);
         }
@@ -3644,6 +3654,29 @@ fn prepare_upstream_request_body(request_body: Value) -> Value {
     canonicalize_value(filter_private_params_with_whitelist(request_body, &[]))
 }
 
+fn sanitize_official_responses_message_ids(body: &mut Value) {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for item in input {
+        let is_message = item.get("type").and_then(Value::as_str) == Some("message");
+        if !is_message {
+            continue;
+        }
+
+        let invalid_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.starts_with("msg"));
+        if invalid_id {
+            if let Some(object) = item.as_object_mut() {
+                object.remove("id");
+            }
+        }
+    }
+}
+
 fn log_prompt_cache_trace(
     app_type: &AppType,
     provider: &Provider,
@@ -3947,6 +3980,26 @@ mod tests {
             serde_json::to_string(&prepared).unwrap(),
             r#"{"a":2,"tools":[{"name":"lookup","parameters":{"properties":{"_id":{"type":"string"},"a":{"type":"string"},"b":{"type":"number"}},"type":"object"}}],"z":1}"#
         );
+    }
+
+    #[test]
+    fn official_responses_drops_legacy_bridge_message_ids_only() {
+        let mut body = json!({
+            "input": [
+                {"type":"message","id":"resp_20260719225020_msg","role":"assistant","content":[]},
+                {"type":"message","id":"msg_official","role":"assistant","content":[]},
+                {"type":"reasoning","id":"rs_resp_1","summary":[]},
+                {"type":"function_call","id":"fc_1","call_id":"call_1","name":"run","arguments":"{}"}
+            ]
+        });
+
+        sanitize_official_responses_message_ids(&mut body);
+
+        assert!(body["input"][0].get("id").is_none());
+        assert_eq!(body["input"][1]["id"], "msg_official");
+        assert_eq!(body["input"][2]["id"], "rs_resp_1");
+        assert_eq!(body["input"][3]["id"], "fc_1");
+        assert_eq!(body["input"][0]["role"], "assistant");
     }
 
     #[test]

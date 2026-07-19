@@ -1431,7 +1431,10 @@ fn chat_message_to_response_output_item(message: &Value, response_id: &str) -> O
     }
 
     Some(json!({
-        "id": format!("{response_id}_msg"),
+        // Responses validates message item ids independently from response ids.
+        // Keep bridge-generated history acceptable when Codex later switches
+        // from this Chat provider back to the official Responses endpoint.
+        "id": format!("msg_{response_id}"),
         "type": "message",
         "status": "completed",
         "role": "assistant",
@@ -2852,6 +2855,7 @@ mod tests {
             "I should check the weather before answering."
         );
         assert_eq!(result["output"][1]["type"], "message");
+        assert_eq!(result["output"][1]["id"], "msg_resp_chatcmpl_1");
         assert_eq!(result["output"][1]["content"][0]["text"], "Let me check.");
         assert_eq!(result["output"][2]["type"], "function_call");
         assert_eq!(result["output"][2]["call_id"], "call_1");

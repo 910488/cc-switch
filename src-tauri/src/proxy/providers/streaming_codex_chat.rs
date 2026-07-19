@@ -308,7 +308,7 @@ impl ChatToResponsesState {
 
         if !self.text.added {
             let output_index = self.next_output_index();
-            let item_id = format!("{}_msg", self.response_id);
+            let item_id = format!("msg_{}", self.response_id);
             self.text.output_index = Some(output_index);
             self.text.item_id = item_id.clone();
             self.text.added = true;
@@ -884,6 +884,7 @@ mod tests {
 
         assert!(output.contains("event: response.created"));
         assert!(output.contains("event: response.output_text.delta"));
+        assert!(output.contains("\"id\":\"msg_resp_chatcmpl_1\""));
         assert!(output.contains("\"text\":\"Hello\""));
         assert!(output.contains("event: response.completed"));
         assert!(output.contains("\"input_tokens\":4"));

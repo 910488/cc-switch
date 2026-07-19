@@ -176,7 +176,7 @@ impl AnthropicToResponsesState {
         match block_type {
             "text" => {
                 let output_index = self.next_output_index();
-                let item_id = format!("{}_msg_{output_index}", self.response_id);
+                let item_id = format!("msg_{}_{output_index}", self.response_id);
                 events.push(sse::message_item_added(output_index, &item_id));
                 events.push(sse::message_content_part_added(output_index, &item_id));
                 self.blocks.insert(
@@ -884,6 +884,7 @@ mod tests {
         let merged = run(input).await;
         assert!(merged.contains("event: response.created"));
         assert!(merged.contains("\"id\":\"resp_msg_1\""));
+        assert!(merged.contains("\"id\":\"msg_resp_msg_1_0\""));
         assert!(merged.contains("\"model\":\"claude\""));
         assert!(merged.contains("event: response.output_text.delta"));
         assert!(merged.contains("\"delta\":\"Hello\""));
