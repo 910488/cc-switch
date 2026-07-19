@@ -4,6 +4,13 @@ use serde_json::Value;
 
 const SETTINGS_KEY: &str = "codex_model_routes";
 
+fn is_managed_virtual_model(model: &str, display_name: Option<&str>) -> bool {
+    let model = model.trim();
+    model.starts_with("ccs-")
+        || model.eq_ignore_ascii_case(super::auto_review::AUTO_REVIEW_MODEL)
+        || display_name.is_some_and(|name| name.trim().eq_ignore_ascii_case("Codex Auto Review"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogModelInput {
@@ -72,15 +79,13 @@ pub fn cached_official_models() -> Result<Vec<CatalogModelInput>, AppError> {
         .flatten()
         .filter_map(|entry| {
             let model = entry.get("slug").and_then(Value::as_str)?.trim();
-            if model.is_empty() || model.starts_with("ccs-") {
+            let display_name = entry.get("display_name").and_then(Value::as_str);
+            if model.is_empty() || is_managed_virtual_model(model, display_name) {
                 return None;
             }
             Some(CatalogModelInput {
                 model: model.to_string(),
-                display_name: entry
-                    .get("display_name")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                display_name: display_name.map(str::to_string),
                 context_window: entry.get("context_window").and_then(Value::as_u64),
             })
         })
@@ -94,6 +99,10 @@ pub fn build_settings(
     official_models: Vec<CatalogModelInput>,
     third_party_models: Vec<CatalogModelInput>,
 ) -> Result<ModelRouteSettings, AppError> {
+    let official_models = official_models
+        .into_iter()
+        .filter(|model| !is_managed_virtual_model(&model.model, model.display_name.as_deref()))
+        .collect::<Vec<_>>();
     if official_models.is_empty() {
         return Err(AppError::InvalidInput(
             "Official Codex model list is required for coexistence mode".to_string(),
@@ -168,6 +177,9 @@ pub fn augment_settings(db: &Database, base: &Value) -> Result<Value, AppError> 
     }
     let mut combined = Vec::new();
     for model in settings.official_models {
+        if is_managed_virtual_model(&model.model, model.display_name.as_deref()) {
+            continue;
+        }
         combined.push(serde_json::json!({
             "model": model.model,
             "displayName": model.display_name,
@@ -268,5 +280,39 @@ mod tests {
         assert_eq!(models[0]["model"], "gpt-5.6");
         assert_eq!(models[1]["model"], settings.routes[0].alias);
         assert_eq!(models[1]["displayName"], "Third · GLM");
+    }
+
+    #[test]
+    fn excludes_auto_review_and_stale_managed_aliases_from_official_catalog() {
+        let settings = build_settings(
+            "provider",
+            "Third",
+            vec![
+                CatalogModelInput {
+                    model: "gpt-5.6".into(),
+                    display_name: Some("GPT-5.6".into()),
+                    context_window: None,
+                },
+                CatalogModelInput {
+                    model: super::super::auto_review::AUTO_REVIEW_MODEL.into(),
+                    display_name: Some("Codex Auto Review".into()),
+                    context_window: None,
+                },
+                CatalogModelInput {
+                    model: "ccs-old-alias".into(),
+                    display_name: Some("Old injected model".into()),
+                    context_window: None,
+                },
+            ],
+            vec![CatalogModelInput {
+                model: "glm".into(),
+                display_name: Some("GLM".into()),
+                context_window: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(settings.official_models.len(), 1);
+        assert_eq!(settings.official_models[0].model, "gpt-5.6");
     }
 }

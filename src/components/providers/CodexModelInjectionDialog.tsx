@@ -122,7 +122,9 @@ export function CodexModelInjectionDialog({
       .filter((entry) => selected.has(entry.id))
       .map((entry) => ({
         model: entry.id,
-        displayName: entry.ownedBy || entry.id,
+        // `owned_by` identifies the API vendor (often just "openai"), not the
+        // model's user-facing name. Keep the exact upstream model ID visible.
+        displayName: entry.id,
       }));
     if (selectedModels.length === 0) {
       toast.error("請至少選擇一個第三方模型");
