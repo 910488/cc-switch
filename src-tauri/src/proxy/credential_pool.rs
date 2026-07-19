@@ -8,8 +8,10 @@ use super::secret_vault::{
 };
 use crate::database::{CredentialQuotaSnapshotRow, Database, ProviderCredentialRow};
 use crate::error::AppError;
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use http::HeaderMap;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use serde_json::Value;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -286,6 +288,91 @@ impl CredentialPool {
             })
     }
 
+    /// Persist standard OpenAI/Anthropic rate-limit response headers for the
+    /// account that actually served the request. This turns ordinary traffic
+    /// into proactive routing data without storing response bodies or secrets.
+    pub(crate) fn record_response_quotas(
+        &self,
+        credential_id: &str,
+        headers: &HeaderMap,
+    ) -> Result<usize, AppError> {
+        const WINDOWS: &[(&str, &str, &str, &str)] = &[
+            (
+                "requests",
+                "x-ratelimit-limit-requests",
+                "x-ratelimit-remaining-requests",
+                "x-ratelimit-reset-requests",
+            ),
+            (
+                "tokens",
+                "x-ratelimit-limit-tokens",
+                "x-ratelimit-remaining-tokens",
+                "x-ratelimit-reset-tokens",
+            ),
+            (
+                "requests",
+                "anthropic-ratelimit-requests-limit",
+                "anthropic-ratelimit-requests-remaining",
+                "anthropic-ratelimit-requests-reset",
+            ),
+            (
+                "tokens",
+                "anthropic-ratelimit-tokens-limit",
+                "anthropic-ratelimit-tokens-remaining",
+                "anthropic-ratelimit-tokens-reset",
+            ),
+            (
+                "input_tokens",
+                "anthropic-ratelimit-input-tokens-limit",
+                "anthropic-ratelimit-input-tokens-remaining",
+                "anthropic-ratelimit-input-tokens-reset",
+            ),
+            (
+                "output_tokens",
+                "anthropic-ratelimit-output-tokens-limit",
+                "anthropic-ratelimit-output-tokens-remaining",
+                "anthropic-ratelimit-output-tokens-reset",
+            ),
+        ];
+
+        let queried_at = now_iso();
+        let mut recorded = 0;
+        for (kind, limit_header, remaining_header, reset_header) in WINDOWS {
+            let Some(limit) = header_number(headers, limit_header) else {
+                continue;
+            };
+            let Some(remaining) = header_number(headers, remaining_header) else {
+                continue;
+            };
+            if limit <= 0.0 || remaining < 0.0 {
+                continue;
+            }
+            let remaining_ratio = (remaining / limit).clamp(0.0, 1.0);
+            let reset_raw = header_text(headers, reset_header);
+            let reset_at = reset_raw
+                .as_deref()
+                .and_then(normalize_reset_at)
+                .or_else(|| {
+                    (remaining_ratio == 0.0).then(|| {
+                        (Utc::now() + Duration::minutes(5))
+                            .to_rfc3339_opts(SecondsFormat::Millis, true)
+                    })
+                });
+            self.db
+                .upsert_credential_quota_snapshot(&CredentialQuotaSnapshotRow {
+                    credential_id: credential_id.to_string(),
+                    quota_kind: (*kind).to_string(),
+                    remaining_ratio: Some(remaining_ratio),
+                    used_ratio: Some(1.0 - remaining_ratio),
+                    reset_at,
+                    detail_json: json!({"limit": limit, "remaining": remaining}).to_string(),
+                    queried_at: queried_at.clone(),
+                })?;
+            recorded += 1;
+        }
+        Ok(recorded)
+    }
+
     pub(crate) fn resolve(
         &self,
         app_type: &str,
@@ -428,6 +515,51 @@ fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn header_number(headers: &HeaderMap, name: &str) -> Option<f64> {
+    header_text(headers, name)?.parse().ok()
+}
+
+fn normalize_reset_at(raw: &str) -> Option<String> {
+    if let Ok(value) = DateTime::parse_from_rfc3339(raw) {
+        return Some(
+            value
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
+        );
+    }
+    let seconds = parse_duration_seconds(raw)?;
+    Some(
+        (Utc::now() + Duration::milliseconds((seconds * 1000.0) as i64))
+            .to_rfc3339_opts(SecondsFormat::Millis, true),
+    )
+}
+
+fn parse_duration_seconds(raw: &str) -> Option<f64> {
+    let raw = raw.trim();
+    let split = raw
+        .find(|character: char| !character.is_ascii_digit() && character != '.')
+        .unwrap_or(raw.len());
+    let value: f64 = raw[..split].parse().ok()?;
+    let multiplier = match raw[split..].trim().to_ascii_lowercase().as_str() {
+        "" | "s" | "sec" | "secs" => 1.0,
+        "ms" => 0.001,
+        "m" | "min" | "mins" => 60.0,
+        "h" | "hr" | "hrs" => 3600.0,
+        "d" | "day" | "days" => 86_400.0,
+        _ => return None,
+    };
+    Some(value * multiplier)
+}
+
 fn sanitize_error(value: &str) -> String {
     value.chars().take(300).collect()
 }
@@ -523,5 +655,65 @@ mod tests {
         );
         assert!(pool.delete(&saved.id).unwrap());
         assert!(pool.list("codex", "provider-a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn response_rate_limit_headers_become_routing_snapshots() {
+        let db = Arc::new(Database::memory().unwrap());
+        db.save_provider(
+            "codex",
+            &Provider::with_id(
+                "provider-a".to_string(),
+                "Provider A".to_string(),
+                serde_json::json!({"base_url":"https://example.invalid/v1"}),
+                None,
+            ),
+        )
+        .unwrap();
+        let pool = CredentialPool::with_vault(db, Arc::new(MemoryVault::default()));
+        let saved = pool
+            .save(SaveProviderCredentialRequest {
+                id: None,
+                app_type: "codex".to_string(),
+                provider_id: "provider-a".to_string(),
+                kind: CredentialKind::ApiKey,
+                label: "Work".to_string(),
+                secret: Some("sk-test".to_string()),
+                enabled: true,
+                priority: 10,
+                auth_header: None,
+                auth_prefix: None,
+                public_metadata: serde_json::json!({}),
+            })
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-limit-requests", "100".parse().unwrap());
+        headers.insert("x-ratelimit-remaining-requests", "25".parse().unwrap());
+        headers.insert("x-ratelimit-reset-requests", "5m".parse().unwrap());
+        headers.insert(
+            "anthropic-ratelimit-input-tokens-limit",
+            "2000".parse().unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-input-tokens-remaining",
+            "1500".parse().unwrap(),
+        );
+
+        assert_eq!(pool.record_response_quotas(&saved.id, &headers).unwrap(), 2);
+        let refreshed = pool.list("codex", "provider-a").unwrap().remove(0);
+        assert_eq!(refreshed.quotas.len(), 2);
+        let requests = refreshed
+            .quotas
+            .iter()
+            .find(|quota| quota.quota_kind == "requests")
+            .unwrap();
+        assert_eq!(requests.remaining_ratio, Some(0.25));
+        assert!(requests.reset_at.is_some());
+        let input = refreshed
+            .quotas
+            .iter()
+            .find(|quota| quota.quota_kind == "input_tokens")
+            .unwrap();
+        assert_eq!(input.remaining_ratio, Some(0.75));
     }
 }

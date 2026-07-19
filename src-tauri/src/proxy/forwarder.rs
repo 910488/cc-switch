@@ -550,6 +550,7 @@ impl RequestForwarder {
                 .await
             {
                 Ok((response, claude_api_format, outbound_model)) => {
+                    self.record_credential_quota_headers(credential.as_ref(), response.headers());
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
@@ -657,6 +658,10 @@ impl RequestForwarder {
                                 .await
                             {
                                 Ok((response, claude_api_format, outbound_model)) => {
+                                    self.record_credential_quota_headers(
+                                        credential.as_ref(),
+                                        response.headers(),
+                                    );
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
                                     );
@@ -804,6 +809,10 @@ impl RequestForwarder {
                                     .await
                                 {
                                     Ok((response, claude_api_format, outbound_model)) => {
+                                        self.record_credential_quota_headers(
+                                            credential.as_ref(),
+                                            response.headers(),
+                                        );
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
                                         self.record_success_result(
                                             &provider.id,
@@ -971,6 +980,10 @@ impl RequestForwarder {
                                 .await
                             {
                                 Ok((response, claude_api_format, outbound_model)) => {
+                                    self.record_credential_quota_headers(
+                                        credential.as_ref(),
+                                        response.headers(),
+                                    );
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
                                     self.record_success_result(
                                         &provider.id,
@@ -2724,6 +2737,26 @@ impl RequestForwarder {
                 );
                 false
             }
+        }
+    }
+
+    fn record_credential_quota_headers(
+        &self,
+        credential: Option<&ResolvedCredential>,
+        headers: &http::HeaderMap,
+    ) {
+        let Some(credential) = credential else {
+            return;
+        };
+        if let Err(error) = self
+            .credential_pool
+            .record_response_quotas(&credential.id, headers)
+        {
+            log::warn!(
+                "failed to persist response quota metadata for credential {}: {}",
+                credential.id,
+                error
+            );
         }
     }
 
