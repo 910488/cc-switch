@@ -471,6 +471,13 @@ fn codex_catalog_model_entry(
     entry_obj.insert("availability_nux".to_string(), Value::Null);
     entry_obj.insert("upgrade".to_string(), Value::Null);
 
+    if let Some(level) = spec.default_reasoning_level.as_deref() {
+        entry_obj.insert("default_reasoning_level".to_string(), json!(level));
+    }
+    if let Some(levels) = spec.supported_reasoning_levels.as_ref() {
+        entry_obj.insert("supported_reasoning_levels".to_string(), levels.clone());
+    }
+
     // Image support is a model capability, not a tool-profile capability.
     // Trust hidden preset metadata first, then the confirmed text-only registry;
     // every unknown model fails open so GPT/relay aliases are never declared
@@ -538,6 +545,10 @@ struct CodexCatalogModelSpec {
     /// back to the template default when absent. Only consulted for
     /// `NativeResponses`.
     base_instructions: Option<String>,
+    /// Coexistence routes preserve the official catalog's effort menu and can
+    /// provide an explicit effort surface for injected third-party aliases.
+    default_reasoning_level: Option<String>,
+    supported_reasoning_levels: Option<Value>,
 }
 
 fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCatalogModelSpec> {
@@ -606,6 +617,18 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(str::to_string);
+        let default_reasoning_level = model_config
+            .get("defaultReasoningLevel")
+            .or_else(|| model_config.get("default_reasoning_level"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|level| !level.is_empty())
+            .map(str::to_string);
+        let supported_reasoning_levels = model_config
+            .get("supportedReasoningLevels")
+            .or_else(|| model_config.get("supported_reasoning_levels"))
+            .filter(|levels| levels.as_array().is_some_and(|levels| !levels.is_empty()))
+            .cloned();
 
         specs.push(CodexCatalogModelSpec {
             model: model.to_string(),
@@ -614,6 +637,8 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
             supports_parallel_tool_calls,
             input_modalities,
             base_instructions,
+            default_reasoning_level,
+            supported_reasoning_levels,
         });
     }
 
@@ -2819,6 +2844,42 @@ base_url = "https://production.api/v1"
     }
 
     #[test]
+    fn catalog_model_can_override_reasoning_levels_for_coexistence_routes() {
+        let settings = json!({
+            "modelCatalog": {"models": [{
+                "model": "ccs-provider-0-GLM-5.2p",
+                "defaultReasoningLevel": "high",
+                "supportedReasoningLevels": [
+                    {"effort":"low","description":"Low"},
+                    {"effort":"medium","description":"Medium"},
+                    {"effort":"high","description":"High"},
+                    {"effort":"xhigh","description":"Extra high"}
+                ]
+            }]}
+        });
+
+        let catalog = codex_model_catalog_from_settings(
+            &settings,
+            "",
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .unwrap()
+        .unwrap();
+        let entry = &catalog["models"][0];
+
+        assert_eq!(entry["default_reasoning_level"], "high");
+        assert_eq!(
+            entry["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|level| level["effort"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh"]
+        );
+    }
+
+    #[test]
     fn catalog_infers_image_input_independently_of_tool_profile() {
         // Start from a deliberately text-only template to prove that every
         // profile overwrites template defaults with shared capability logic.
@@ -2834,6 +2895,8 @@ base_url = "https://production.api/v1"
                 supports_parallel_tool_calls: None,
                 input_modalities: None,
                 base_instructions: None,
+                default_reasoning_level: None,
+                supported_reasoning_levels: None,
             },
             CodexCatalogModelSpec {
                 model: "deepseek/deepseek-v4-pro".to_string(),
@@ -2842,6 +2905,8 @@ base_url = "https://production.api/v1"
                 supports_parallel_tool_calls: None,
                 input_modalities: None,
                 base_instructions: None,
+                default_reasoning_level: None,
+                supported_reasoning_levels: None,
             },
             CodexCatalogModelSpec {
                 model: "glm-5.2v".to_string(),
@@ -2850,6 +2915,8 @@ base_url = "https://production.api/v1"
                 supports_parallel_tool_calls: None,
                 input_modalities: None,
                 base_instructions: None,
+                default_reasoning_level: None,
+                supported_reasoning_levels: None,
             },
             CodexCatalogModelSpec {
                 model: "deepseek-v4-flash".to_string(),
@@ -2858,6 +2925,8 @@ base_url = "https://production.api/v1"
                 supports_parallel_tool_calls: None,
                 input_modalities: Some(vec!["text".to_string(), "image".to_string()]),
                 base_instructions: None,
+                default_reasoning_level: None,
+                supported_reasoning_levels: None,
             },
             CodexCatalogModelSpec {
                 model: "custom-text-alias".to_string(),
@@ -2866,6 +2935,8 @@ base_url = "https://production.api/v1"
                 supports_parallel_tool_calls: None,
                 input_modalities: Some(vec!["text".to_string()]),
                 base_instructions: None,
+                default_reasoning_level: None,
+                supported_reasoning_levels: None,
             },
         ];
 
@@ -2937,6 +3008,8 @@ base_url = "https://production.api/v1"
             supports_parallel_tool_calls: None,
             input_modalities: None,
             base_instructions: None,
+            default_reasoning_level: None,
+            supported_reasoning_levels: None,
         }];
         // Using a gpt-5.5-shaped template under ProxyChat must NOT strip
         // apply_patch_tool_type. (The native template lacks it, so synthesize

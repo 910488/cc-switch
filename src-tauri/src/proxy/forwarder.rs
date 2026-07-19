@@ -1726,16 +1726,6 @@ impl RequestForwarder {
             mapped_body
         };
 
-        // Bridge responses are replayed by Codex as input on the next turn. Older
-        // CC Switch builds generated message item ids such as `resp_*_msg`, while
-        // the official Responses endpoint requires message ids to begin with
-        // `msg`. Dropping only an invalid message id is lossless (the message
-        // content remains intact) and lets existing third-party conversations
-        // switch back to OpenAI Official without starting a new task.
-        if is_codex_official {
-            sanitize_official_responses_input_items(&mut request_body);
-        }
-
         if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
             self.apply_media_prevention(&mut request_body, provider);
         }
@@ -1752,6 +1742,17 @@ impl RequestForwarder {
                 if apply_local_proxy_body_overrides(&mut filtered_body, overrides) {
                     filtered_body = prepare_upstream_request_body(filtered_body);
                 }
+            }
+        }
+        // Apply bridge-history cleanup to the final body, after every provider
+        // override, so no later merge can reintroduce an invalid reference.
+        if is_codex_official {
+            let (message_ids, reasoning_items) =
+                sanitize_official_responses_input_items(&mut filtered_body);
+            if message_ids > 0 || reasoning_items > 0 {
+                log::info!(
+                    "[Codex] sanitized official resume input: message_ids={message_ids}, reasoning_items={reasoning_items}"
+                );
             }
         }
         // 出站 body 定稿后刷新真值（覆盖 Codex chat 上游模型覆写、转换层模型改写）
@@ -3654,20 +3655,31 @@ fn prepare_upstream_request_body(request_body: Value) -> Value {
     canonicalize_value(filter_private_params_with_whitelist(request_body, &[]))
 }
 
-fn sanitize_official_responses_input_items(body: &mut Value) {
+fn sanitize_official_responses_input_items(body: &mut Value) -> (usize, usize) {
     let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return;
+        return (0, 0);
     };
 
+    let mut removed_message_ids = 0;
+    let mut removed_reasoning_items = 0;
     input.retain_mut(|item| {
         // A bridge can expose visible reasoning summaries, but it cannot mint
         // OpenAI's encrypted reasoning payload. Sending an `rs_*` id without
         // encrypted_content makes the official store try to resolve an item
         // that never existed there (and store:false then returns 404). The
         // adjacent assistant message/tool calls retain the actual conversation.
+        let has_encrypted_content = item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| !content.trim().is_empty());
+        let is_bridge_reasoning_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("rs_resp_"));
         if item.get("type").and_then(Value::as_str) == Some("reasoning")
-            && item.get("encrypted_content").is_none()
+            && (is_bridge_reasoning_id || !has_encrypted_content)
         {
+            removed_reasoning_items += 1;
             return false;
         }
 
@@ -3683,10 +3695,12 @@ fn sanitize_official_responses_input_items(body: &mut Value) {
         if invalid_id {
             if let Some(object) = item.as_object_mut() {
                 object.remove("id");
+                removed_message_ids += 1;
             }
         }
         true
     });
+    (removed_message_ids, removed_reasoning_items)
 }
 
 fn log_prompt_cache_trace(
@@ -4000,14 +4014,17 @@ mod tests {
             "input": [
                 {"type":"message","id":"resp_20260719225020_msg","role":"assistant","content":[]},
                 {"type":"message","id":"msg_official","role":"assistant","content":[]},
-                {"type":"reasoning","id":"rs_resp_bridge","summary":[{"type":"summary_text","text":"bridge"}]},
+                {"type":"reasoning","id":"rs_resp_bridge","summary":[{"type":"summary_text","text":"bridge"}],"encrypted_content":null},
+                {"type":"reasoning","id":"rs_resp_empty","summary":[],"encrypted_content":""},
+                {"type":"reasoning","id":"rs_resp_fake_cipher","summary":[],"encrypted_content":"not-from-openai"},
                 {"type":"reasoning","id":"rs_official","summary":[],"encrypted_content":"ciphertext"},
                 {"type":"function_call","id":"fc_1","call_id":"call_1","name":"run","arguments":"{}"}
             ]
         });
 
-        sanitize_official_responses_input_items(&mut body);
+        let removed = sanitize_official_responses_input_items(&mut body);
 
+        assert_eq!(removed, (1, 3));
         assert!(body["input"][0].get("id").is_none());
         assert_eq!(body["input"][1]["id"], "msg_official");
         assert_eq!(body["input"][2]["id"], "rs_official");

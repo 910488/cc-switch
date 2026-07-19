@@ -11,7 +11,14 @@ fn is_managed_virtual_model(model: &str, display_name: Option<&str>) -> bool {
         || display_name.is_some_and(|name| name.trim().eq_ignore_ascii_case("Codex Auto Review"))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogReasoningLevel {
+    pub effort: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogModelInput {
     pub model: String,
@@ -19,6 +26,10 @@ pub struct CatalogModelInput {
     pub display_name: Option<String>,
     #[serde(default)]
     pub context_window: Option<u64>,
+    #[serde(default)]
+    pub default_reasoning_level: Option<String>,
+    #[serde(default)]
+    pub supported_reasoning_levels: Vec<CatalogReasoningLevel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,6 +41,24 @@ pub struct ModelRoute {
     pub display_name: String,
     #[serde(default)]
     pub context_window: Option<u64>,
+}
+
+fn standard_reasoning_levels() -> Vec<CatalogReasoningLevel> {
+    [
+        ("low", "Fast responses with lighter reasoning"),
+        (
+            "medium",
+            "Balances speed and reasoning depth for everyday tasks",
+        ),
+        ("high", "Greater reasoning depth for complex problems"),
+        ("xhigh", "Extra high reasoning depth for complex problems"),
+    ]
+    .into_iter()
+    .map(|(effort, description)| CatalogReasoningLevel {
+        effort: effort.to_string(),
+        description: description.to_string(),
+    })
+    .collect()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +116,26 @@ pub fn cached_official_models() -> Result<Vec<CatalogModelInput>, AppError> {
                 model: model.to_string(),
                 display_name: display_name.map(str::to_string),
                 context_window: entry.get("context_window").and_then(Value::as_u64),
+                default_reasoning_level: entry
+                    .get("default_reasoning_level")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                supported_reasoning_levels: entry
+                    .get("supported_reasoning_levels")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|level| {
+                        Some(CatalogReasoningLevel {
+                            effort: level.get("effort")?.as_str()?.to_string(),
+                            description: level
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                        })
+                    })
+                    .collect(),
             })
         })
         .collect();
@@ -180,10 +229,17 @@ pub fn augment_settings(db: &Database, base: &Value) -> Result<Value, AppError> 
         if is_managed_virtual_model(&model.model, model.display_name.as_deref()) {
             continue;
         }
+        let levels = if model.supported_reasoning_levels.is_empty() {
+            standard_reasoning_levels()
+        } else {
+            model.supported_reasoning_levels
+        };
         combined.push(serde_json::json!({
             "model": model.model,
             "displayName": model.display_name,
             "contextWindow": model.context_window,
+            "defaultReasoningLevel": model.default_reasoning_level.unwrap_or_else(|| "medium".to_string()),
+            "supportedReasoningLevels": levels,
         }));
     }
     for route in settings.routes {
@@ -191,6 +247,8 @@ pub fn augment_settings(db: &Database, base: &Value) -> Result<Value, AppError> 
             "model": route.alias,
             "displayName": route.display_name,
             "contextWindow": route.context_window,
+            "defaultReasoningLevel": "high",
+            "supportedReasoningLevels": standard_reasoning_levels(),
         }));
     }
     let mut output = base.clone();
@@ -211,11 +269,13 @@ mod tests {
                 model: "gpt-5.6".into(),
                 display_name: None,
                 context_window: None,
+                ..Default::default()
             }],
             vec![CatalogModelInput {
                 model: "GLM-5.2p".into(),
                 display_name: None,
                 context_window: Some(200_000),
+                ..Default::default()
             }],
         )
         .unwrap();
@@ -234,11 +294,13 @@ mod tests {
                 model: "gpt-5.6".into(),
                 display_name: None,
                 context_window: None,
+                ..Default::default()
             }],
             vec![CatalogModelInput {
                 model: "glm".into(),
                 display_name: None,
                 context_window: None,
+                ..Default::default()
             }],
         )
         .unwrap();
@@ -263,11 +325,13 @@ mod tests {
                 model: "gpt-5.6".into(),
                 display_name: Some("GPT-5.6".into()),
                 context_window: Some(272_000),
+                ..Default::default()
             }],
             vec![CatalogModelInput {
                 model: "glm".into(),
                 display_name: Some("GLM".into()),
                 context_window: Some(200_000),
+                ..Default::default()
             }],
         )
         .unwrap();
@@ -280,6 +344,17 @@ mod tests {
         assert_eq!(models[0]["model"], "gpt-5.6");
         assert_eq!(models[1]["model"], settings.routes[0].alias);
         assert_eq!(models[1]["displayName"], "Third · GLM");
+        assert_eq!(models[0]["defaultReasoningLevel"], "medium");
+        assert_eq!(models[1]["defaultReasoningLevel"], "high");
+        assert_eq!(
+            models[1]["supportedReasoningLevels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|level| level["effort"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh"]
+        );
     }
 
     #[test]
@@ -292,22 +367,26 @@ mod tests {
                     model: "gpt-5.6".into(),
                     display_name: Some("GPT-5.6".into()),
                     context_window: None,
+                    ..Default::default()
                 },
                 CatalogModelInput {
                     model: super::super::auto_review::AUTO_REVIEW_MODEL.into(),
                     display_name: Some("Codex Auto Review".into()),
                     context_window: None,
+                    ..Default::default()
                 },
                 CatalogModelInput {
                     model: "ccs-old-alias".into(),
                     display_name: Some("Old injected model".into()),
                     context_window: None,
+                    ..Default::default()
                 },
             ],
             vec![CatalogModelInput {
                 model: "glm".into(),
                 display_name: Some("GLM".into()),
                 context_window: None,
+                ..Default::default()
             }],
         )
         .unwrap();

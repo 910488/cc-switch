@@ -4,6 +4,11 @@ export interface CatalogModelInput {
   model: string;
   displayName?: string;
   contextWindow?: number;
+  defaultReasoningLevel?: string;
+  supportedReasoningLevels?: Array<{
+    effort: string;
+    description: string;
+  }>;
 }
 
 export interface CodexModelRoute {
