@@ -116,10 +116,10 @@ export function CodexOfficialAccountControl({
 
   return (
     <div className="relative mt-3 border-t border-border/70 pt-3">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div className="flex min-w-0 flex-1 items-center gap-2">
+      <div className="flex flex-col gap-3">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
           <ShieldCheck className="h-4 w-4 flex-shrink-0 text-sky-500" />
-          <span className="text-xs font-medium text-muted-foreground">
+          <span className="whitespace-nowrap text-xs font-medium text-muted-foreground">
             帳號
           </span>
           <Select
@@ -127,7 +127,7 @@ export function CodexOfficialAccountControl({
             onValueChange={(value) => void saveSelection(value)}
             disabled={updateProvider.isPending}
           >
-            <SelectTrigger className="h-8 max-w-sm text-xs">
+            <SelectTrigger className="h-8 w-full min-w-[220px] text-xs sm:w-[360px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -158,71 +158,81 @@ export function CodexOfficialAccountControl({
           )}
         </div>
 
-        <div className="flex min-w-0 items-center gap-2">
-          {effectiveMode === CODEX_OFFICIAL_NATIVE ? (
-            <SubscriptionQuotaFooter
-              appId="codex"
-              inline={true}
-              isCurrent={isCurrent}
-              autoQueryInterval={0}
-              autoQueryIntervalSeconds={refreshSeconds}
-            />
-          ) : (
-            <>
-              <CodexOauthQuotaFooter
-                meta={{
-                  authBinding: {
-                    source: "managed_account",
-                    authProvider: "codex_oauth",
-                    ...(effectiveAccountId
-                      ? { accountId: effectiveAccountId }
-                      : {}),
-                  },
-                }}
-                inline={true}
-                isCurrent={isCurrent}
-                refreshIntervalSeconds={refreshSeconds}
-              />
-              <span className="whitespace-nowrap text-[11px] text-amber-600">
-                Reset {resetCredits.data?.availableCount ?? 0}
-              </span>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                className="h-7 border-amber-500/50 px-2 text-[11px] text-amber-600"
-                disabled={!firstCredit || consumeReset.isPending}
-                onClick={() => void useReset()}
-              >
-                <RotateCcw className="mr-1 h-3 w-3" />
-                使用 Reset
-              </Button>
-            </>
-          )}
-          <div className="flex items-center gap-1.5 whitespace-nowrap">
-            <Clock3 className="h-3.5 w-3.5 text-muted-foreground" />
-            <span className="text-[11px] text-muted-foreground">額度查詢</span>
-            <Select
-              value={String(refreshSeconds)}
-              onValueChange={(value) => void saveRefreshSeconds(value)}
-              disabled={updateProvider.isPending}
-            >
-              <SelectTrigger
-                className="h-7 w-[108px] text-[11px]"
-                aria-label="額度查詢間隔"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="0">關閉</SelectItem>
-                <SelectItem value="5">每 5 秒</SelectItem>
-                <SelectItem value="15">每 15 秒</SelectItem>
-                <SelectItem value="30">每 30 秒</SelectItem>
-                <SelectItem value="60">每 1 分鐘</SelectItem>
-                <SelectItem value="300">每 5 分鐘</SelectItem>
-                <SelectItem value="900">每 15 分鐘</SelectItem>
-              </SelectContent>
-            </Select>
+        <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
+          <div className="flex min-w-0 flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+            <div className="min-w-0 flex-1">
+              {effectiveMode === CODEX_OFFICIAL_NATIVE ? (
+                <SubscriptionQuotaFooter
+                  appId="codex"
+                  inline={true}
+                  isCurrent={isCurrent}
+                  autoQueryInterval={0}
+                  autoQueryIntervalSeconds={refreshSeconds}
+                />
+              ) : (
+                <CodexOauthQuotaFooter
+                  meta={{
+                    authBinding: {
+                      source: "managed_account",
+                      authProvider: "codex_oauth",
+                      ...(effectiveAccountId
+                        ? { accountId: effectiveAccountId }
+                        : {}),
+                    },
+                  }}
+                  inline={true}
+                  isCurrent={isCurrent}
+                  refreshIntervalSeconds={refreshSeconds}
+                />
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {effectiveMode !== CODEX_OFFICIAL_NATIVE && (
+                <>
+                  <span className="whitespace-nowrap text-[11px] text-amber-600">
+                    Reset {resetCredits.data?.availableCount ?? 0}
+                  </span>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-7 border-amber-500/50 px-2 text-[11px] text-amber-600"
+                    disabled={!firstCredit || consumeReset.isPending}
+                    onClick={() => void useReset()}
+                  >
+                    <RotateCcw className="mr-1 h-3 w-3" />
+                    使用 Reset
+                  </Button>
+                </>
+              )}
+              <div className="flex items-center gap-1.5 whitespace-nowrap">
+                <Clock3 className="h-3.5 w-3.5 text-muted-foreground" />
+                <span className="text-[11px] text-muted-foreground">
+                  額度查詢
+                </span>
+                <Select
+                  value={String(refreshSeconds)}
+                  onValueChange={(value) => void saveRefreshSeconds(value)}
+                  disabled={updateProvider.isPending}
+                >
+                  <SelectTrigger
+                    className="h-7 w-[108px] text-[11px]"
+                    aria-label="額度查詢間隔"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="0">關閉</SelectItem>
+                    <SelectItem value="5">每 5 秒</SelectItem>
+                    <SelectItem value="15">每 15 秒</SelectItem>
+                    <SelectItem value="30">每 30 秒</SelectItem>
+                    <SelectItem value="60">每 1 分鐘</SelectItem>
+                    <SelectItem value="300">每 5 分鐘</SelectItem>
+                    <SelectItem value="900">每 15 分鐘</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
           </div>
         </div>
       </div>

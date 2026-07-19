@@ -1733,7 +1733,7 @@ impl RequestForwarder {
         // content remains intact) and lets existing third-party conversations
         // switch back to OpenAI Official without starting a new task.
         if is_codex_official {
-            sanitize_official_responses_message_ids(&mut request_body);
+            sanitize_official_responses_input_items(&mut request_body);
         }
 
         if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
@@ -3654,15 +3654,26 @@ fn prepare_upstream_request_body(request_body: Value) -> Value {
     canonicalize_value(filter_private_params_with_whitelist(request_body, &[]))
 }
 
-fn sanitize_official_responses_message_ids(body: &mut Value) {
+fn sanitize_official_responses_input_items(body: &mut Value) {
     let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
 
-    for item in input {
+    input.retain_mut(|item| {
+        // A bridge can expose visible reasoning summaries, but it cannot mint
+        // OpenAI's encrypted reasoning payload. Sending an `rs_*` id without
+        // encrypted_content makes the official store try to resolve an item
+        // that never existed there (and store:false then returns 404). The
+        // adjacent assistant message/tool calls retain the actual conversation.
+        if item.get("type").and_then(Value::as_str) == Some("reasoning")
+            && item.get("encrypted_content").is_none()
+        {
+            return false;
+        }
+
         let is_message = item.get("type").and_then(Value::as_str) == Some("message");
         if !is_message {
-            continue;
+            return true;
         }
 
         let invalid_id = item
@@ -3674,7 +3685,8 @@ fn sanitize_official_responses_message_ids(body: &mut Value) {
                 object.remove("id");
             }
         }
-    }
+        true
+    });
 }
 
 fn log_prompt_cache_trace(
@@ -3983,22 +3995,25 @@ mod tests {
     }
 
     #[test]
-    fn official_responses_drops_legacy_bridge_message_ids_only() {
+    fn official_responses_sanitizes_legacy_bridge_items() {
         let mut body = json!({
             "input": [
                 {"type":"message","id":"resp_20260719225020_msg","role":"assistant","content":[]},
                 {"type":"message","id":"msg_official","role":"assistant","content":[]},
-                {"type":"reasoning","id":"rs_resp_1","summary":[]},
+                {"type":"reasoning","id":"rs_resp_bridge","summary":[{"type":"summary_text","text":"bridge"}]},
+                {"type":"reasoning","id":"rs_official","summary":[],"encrypted_content":"ciphertext"},
                 {"type":"function_call","id":"fc_1","call_id":"call_1","name":"run","arguments":"{}"}
             ]
         });
 
-        sanitize_official_responses_message_ids(&mut body);
+        sanitize_official_responses_input_items(&mut body);
 
         assert!(body["input"][0].get("id").is_none());
         assert_eq!(body["input"][1]["id"], "msg_official");
-        assert_eq!(body["input"][2]["id"], "rs_resp_1");
+        assert_eq!(body["input"][2]["id"], "rs_official");
+        assert_eq!(body["input"][2]["encrypted_content"], "ciphertext");
         assert_eq!(body["input"][3]["id"], "fc_1");
+        assert_eq!(body["input"].as_array().unwrap().len(), 4);
         assert_eq!(body["input"][0]["role"], "assistant");
     }
 

@@ -644,7 +644,7 @@ export function ProviderCard({
             isProxyTakeover={isProxyTakeover}
           />
           <Dialog open={officialUsageOpen} onOpenChange={setOfficialUsageOpen}>
-            <DialogContent className="max-w-2xl">
+            <DialogContent className="max-w-3xl">
               <DialogHeader>
                 <DialogTitle>OpenAI Official 用量與 Reset</DialogTitle>
                 <DialogDescription>
@@ -652,7 +652,7 @@ export function ProviderCard({
                   usage script。
                 </DialogDescription>
               </DialogHeader>
-              <div className="px-6 pb-5">
+              <div className="pb-2">
                 <CodexOfficialAccountControl
                   provider={provider}
                   isCurrent={isCurrent}
