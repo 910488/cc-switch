@@ -36,7 +36,6 @@ import type { CompactionRolloutMode, ProxyStatus } from "@/types/proxy";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
 import { extractErrorMessage } from "@/utils/errorUtils";
-import { CodexAccountDashboard } from "./CodexAccountDashboard";
 import { UsageDashboard } from "@/components/usage/UsageDashboard";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
@@ -557,15 +556,11 @@ export function ProxyPanel({
                 value={formatUptime(status.uptime_seconds)}
               />
             </div>
-            <Tabs defaultValue="accounts" className="space-y-4">
-              <TabsList className="grid h-auto w-full grid-cols-3">
-                <TabsTrigger value="accounts">帳號與額度</TabsTrigger>
+            <Tabs defaultValue="continuity" className="space-y-4">
+              <TabsList className="grid h-auto w-full grid-cols-2">
                 <TabsTrigger value="continuity">Context Continuity</TabsTrigger>
                 <TabsTrigger value="requests">請求與用量</TabsTrigger>
               </TabsList>
-              <TabsContent value="accounts" className="mt-0">
-                <CodexAccountDashboard />
-              </TabsContent>
               <TabsContent value="continuity" className="mt-0">
                 <div className="rounded-lg border border-border bg-card/60 p-4">
                   <div className="flex items-start justify-between gap-4">

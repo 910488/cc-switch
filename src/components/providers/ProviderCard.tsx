@@ -14,6 +14,7 @@ import UsageFooter from "@/components/UsageFooter";
 import SubscriptionQuotaFooter from "@/components/SubscriptionQuotaFooter";
 import CopilotQuotaFooter from "@/components/CopilotQuotaFooter";
 import CodexOauthQuotaFooter from "@/components/CodexOauthQuotaFooter";
+import { CodexOfficialAccountControl } from "@/components/providers/CodexOfficialAccountControl";
 import { PROVIDER_TYPES, TEMPLATE_TYPES } from "@/config/constants";
 import { isHermesReadOnlyProvider } from "@/config/hermesProviderPresets";
 import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
@@ -214,6 +215,7 @@ export function ProviderCard({
     appId,
     provider,
   );
+  const isFixedCodexOfficial = appId === "codex" && supportsOfficialRouting;
   const isOfficialBlockedByProxy =
     isProxyTakeover &&
     provider.category === "official" &&
@@ -512,7 +514,7 @@ export function ProviderCard({
                   inline={true}
                   isCurrent={isCurrent}
                 />
-              ) : isOfficial ? (
+              ) : isOfficial && !isFixedCodexOfficial ? (
                 officialSubscriptionEnabled ? (
                   <SubscriptionQuotaFooter
                     appId={appId}
@@ -616,6 +618,14 @@ export function ProviderCard({
           </div>
         </div>
       </div>
+
+      {isFixedCodexOfficial && (
+        <CodexOfficialAccountControl
+          provider={provider}
+          isCurrent={isCurrent}
+          isProxyTakeover={isProxyTakeover}
+        />
+      )}
 
       {isExpanded && hasMultiplePlans && (
         <div className="mt-4 pt-4 border-t border-border-default">

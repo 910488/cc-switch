@@ -1209,8 +1209,17 @@ impl RequestForwarder {
             && super::providers::should_convert_codex_responses_to_chat(provider, endpoint);
         let codex_responses_to_anthropic = matches!(app_type, AppType::Codex | AppType::GrokBuild)
             && super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint);
-        let codex_official_auth_passthrough = matches!(app_type, AppType::Codex)
+        let is_codex_official = matches!(app_type, AppType::Codex)
             && super::providers::is_codex_official_provider(provider);
+        let codex_official_auth_mode = provider
+            .meta
+            .as_ref()
+            .map(|meta| meta.codex_official_auth_mode())
+            .unwrap_or_default();
+        let codex_official_auth_passthrough = is_codex_official
+            && codex_official_auth_mode == crate::provider::CodexOfficialAuthMode::Native;
+        let codex_official_managed_auth = is_codex_official
+            && codex_official_auth_mode != crate::provider::CodexOfficialAuthMode::Native;
 
         if codex_official_auth_passthrough {
             validate_codex_official_authorization(headers)?;
@@ -1790,6 +1799,61 @@ impl RequestForwarder {
             Vec::new()
         };
 
+        // The fixed OpenAI Official provider normally forwards Codex's native
+        // Authorization header. In an explicitly selected managed mode, replace
+        // it with the chosen CC Switch account instead. The token remains in the
+        // OAuth manager and is never persisted in provider configuration.
+        if codex_official_managed_auth {
+            let app_handle = self.app_handle.as_ref().ok_or_else(|| {
+                ProxyError::AuthError("Codex OAuth authentication is unavailable".to_string())
+            })?;
+            let codex_state = app_handle.state::<CodexOAuthState>();
+            let codex_auth: tokio::sync::RwLockReadGuard<'_, CodexOAuthManager> =
+                codex_state.0.read().await;
+            let bound_account_id = provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.managed_account_id_for("codex_oauth"));
+
+            if codex_official_auth_mode == crate::provider::CodexOfficialAuthMode::ManagedAccount
+                && bound_account_id.is_none()
+            {
+                return Err(ProxyError::AuthError(
+                    "OpenAI Official is set to a fixed managed account, but no account is bound"
+                        .to_string(),
+                ));
+            }
+
+            let token = match bound_account_id.as_deref() {
+                Some(account_id) => codex_auth
+                    .get_valid_token_for_account(account_id)
+                    .await
+                    .map_err(|error| {
+                        ProxyError::AuthError(format!(
+                            "Unable to authenticate the selected ChatGPT account: {error}"
+                        ))
+                    })?,
+                None => codex_auth.get_valid_token().await.map_err(|error| {
+                    ProxyError::AuthError(format!(
+                        "Unable to authenticate the default ChatGPT account: {error}"
+                    ))
+                })?,
+            };
+
+            codex_oauth_account_id = match bound_account_id {
+                Some(account_id) => Some(account_id),
+                None => codex_auth.default_account_id().await,
+            };
+            if codex_oauth_account_id.is_none() {
+                return Err(ProxyError::AuthError(
+                    "No default ChatGPT account is configured in CC Switch".to_string(),
+                ));
+            }
+            auth_headers =
+                adapter.get_auth_headers(&AuthInfo::new(token, AuthStrategy::CodexOAuth))?;
+            should_send_codex_oauth_session_headers = true;
+        }
+
         // 注入 Codex OAuth 的 ChatGPT-Account-Id header（如果有 account_id）
         if let Some(ref account_id) = codex_oauth_account_id {
             if let Ok(hv) = http::HeaderValue::from_str(account_id) {
@@ -1981,6 +2045,12 @@ impl RequestForwarder {
                     | "traceparent"
                     | "tracestate"
             ) {
+                continue;
+            }
+
+            // A managed official route owns the account identity. Never allow
+            // the calling Codex client's native account id to leak or conflict.
+            if codex_official_managed_auth && key_str.eq_ignore_ascii_case("chatgpt-account-id") {
                 continue;
             }
 
