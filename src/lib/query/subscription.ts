@@ -86,11 +86,16 @@ export function useSubscriptionQuota(
   enabled: boolean,
   autoQuery = false,
   autoQueryIntervalMinutes = 5,
+  explicitIntervalMs?: number,
 ) {
   const refetchInterval =
-    autoQuery && autoQueryIntervalMinutes > 0
-      ? Math.max(autoQueryIntervalMinutes, 1) * 60 * 1000
-      : false;
+    autoQuery && explicitIntervalMs !== undefined
+      ? explicitIntervalMs > 0
+        ? Math.max(explicitIntervalMs, 1_000)
+        : false
+      : autoQuery && autoQueryIntervalMinutes > 0
+        ? Math.max(autoQueryIntervalMinutes, 1) * 60 * 1000
+        : false;
 
   const query = useQuery({
     queryKey: subscriptionKeys.quota(appId),
@@ -99,10 +104,7 @@ export function useSubscriptionQuota(
     refetchInterval,
     refetchIntervalInBackground: Boolean(refetchInterval),
     refetchOnWindowFocus: Boolean(refetchInterval),
-    staleTime:
-      autoQueryIntervalMinutes > 0
-        ? Math.max(autoQueryIntervalMinutes, 1) * 60 * 1000
-        : REFETCH_INTERVAL,
+    staleTime: refetchInterval || REFETCH_INTERVAL,
     retry: 1,
   });
 
@@ -113,6 +115,18 @@ export interface UseCodexOauthQuotaOptions {
   enabled?: boolean;
   /** 是否启用自动轮询（5 分钟）与窗口 focus 重取 */
   autoQuery?: boolean;
+  /** Explicit polling interval. Supports short diagnostic intervals such as 5 seconds. */
+  autoQueryIntervalMs?: number;
+}
+
+export function resolveQuotaRefreshIntervalMs(
+  autoQuery: boolean,
+  explicitIntervalMs?: number,
+): number | false {
+  if (!autoQuery) return false;
+  if (explicitIntervalMs === undefined) return REFETCH_INTERVAL;
+  if (explicitIntervalMs <= 0) return false;
+  return Math.max(1_000, explicitIntervalMs);
 }
 
 /**
@@ -128,18 +142,22 @@ export function useCodexOauthQuota(
   meta: ProviderMeta | undefined,
   options: UseCodexOauthQuotaOptions = {},
 ) {
-  const { enabled = true, autoQuery = false } = options;
+  const { enabled = true, autoQuery = false, autoQueryIntervalMs } = options;
   const accountId = resolveManagedAccountId(meta, PROVIDER_TYPES.CODEX_OAUTH);
   const queryClient = useQueryClient();
   const queryKey = ["codex_oauth", "quota", accountId ?? "default"] as const;
+  const refetchInterval = resolveQuotaRefreshIntervalMs(
+    autoQuery,
+    autoQueryIntervalMs,
+  );
   const query = useQuery({
     queryKey,
     queryFn: () => subscriptionApi.getCodexOauthQuota(accountId, false),
     enabled,
-    refetchInterval: autoQuery ? REFETCH_INTERVAL : false,
-    refetchIntervalInBackground: autoQuery,
-    refetchOnWindowFocus: autoQuery,
-    staleTime: REFETCH_INTERVAL,
+    refetchInterval,
+    refetchIntervalInBackground: Boolean(refetchInterval),
+    refetchOnWindowFocus: Boolean(refetchInterval),
+    staleTime: refetchInterval || REFETCH_INTERVAL,
     retry: 1,
   });
 

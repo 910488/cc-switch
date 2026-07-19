@@ -210,6 +210,8 @@ export interface ProviderMeta {
   // Authentication source for the fixed OpenAI Official provider.
   // Missing means native Codex auth for backward compatibility.
   codexOfficialAuthMode?: CodexOfficialAuthMode;
+  // OpenAI Official quota polling interval in seconds. Zero disables polling.
+  codexOfficialQuotaRefreshSeconds?: number;
   // Claude 认证字段名
   apiKeyField?: ClaudeApiKeyField;
   // 是否将 base_url 视为完整 API 端点（代理直接使用此 URL，不拼接路径）

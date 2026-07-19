@@ -468,6 +468,12 @@ pub struct ProviderMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub codex_official_auth_mode: Option<CodexOfficialAuthMode>,
+    /// OpenAI Official quota polling interval in seconds. Zero disables polling.
+    #[serde(
+        rename = "codexOfficialQuotaRefreshSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub codex_official_quota_refresh_seconds: Option<u64>,
     /// Claude 认证字段名（"ANTHROPIC_AUTH_TOKEN" 或 "ANTHROPIC_API_KEY"）
     #[serde(rename = "apiKeyField", skip_serializing_if = "Option::is_none")]
     pub api_key_field: Option<String>,

@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { RotateCcw, ShieldCheck } from "lucide-react";
+import { Clock3, RotateCcw, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 import type { CodexOfficialAuthMode, Provider } from "@/types";
 import { useUpdateProviderMutation } from "@/lib/query";
@@ -47,6 +47,7 @@ export function CodexOfficialAccountControl({
       ? provider.meta.authBinding.accountId
       : undefined;
   const selectedValue = resolveCodexOfficialSelection(provider.meta);
+  const refreshSeconds = provider.meta?.codexOfficialQuotaRefreshSeconds ?? 300;
   const effectiveMode = isProxyTakeover
     ? configuredMode
     : CODEX_OFFICIAL_NATIVE;
@@ -73,6 +74,20 @@ export function CodexOfficialAccountControl({
       provider: {
         ...provider,
         meta: updateCodexOfficialAuthMeta(provider.meta, value),
+      },
+    });
+  };
+
+  const saveRefreshSeconds = async (value: string) => {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds) || seconds < 0) return;
+    await updateProvider.mutateAsync({
+      provider: {
+        ...provider,
+        meta: {
+          ...provider.meta,
+          codexOfficialQuotaRefreshSeconds: seconds,
+        },
       },
     });
   };
@@ -150,6 +165,7 @@ export function CodexOfficialAccountControl({
               inline={true}
               isCurrent={isCurrent}
               autoQueryInterval={0}
+              autoQueryIntervalSeconds={refreshSeconds}
             />
           ) : (
             <>
@@ -165,6 +181,7 @@ export function CodexOfficialAccountControl({
                 }}
                 inline={true}
                 isCurrent={isCurrent}
+                refreshIntervalSeconds={refreshSeconds}
               />
               <span className="whitespace-nowrap text-[11px] text-amber-600">
                 Reset {resetCredits.data?.availableCount ?? 0}
@@ -182,6 +199,31 @@ export function CodexOfficialAccountControl({
               </Button>
             </>
           )}
+          <div className="flex items-center gap-1.5 whitespace-nowrap">
+            <Clock3 className="h-3.5 w-3.5 text-muted-foreground" />
+            <span className="text-[11px] text-muted-foreground">額度查詢</span>
+            <Select
+              value={String(refreshSeconds)}
+              onValueChange={(value) => void saveRefreshSeconds(value)}
+              disabled={updateProvider.isPending}
+            >
+              <SelectTrigger
+                className="h-7 w-[108px] text-[11px]"
+                aria-label="額度查詢間隔"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="0">關閉</SelectItem>
+                <SelectItem value="5">每 5 秒</SelectItem>
+                <SelectItem value="15">每 15 秒</SelectItem>
+                <SelectItem value="30">每 30 秒</SelectItem>
+                <SelectItem value="60">每 1 分鐘</SelectItem>
+                <SelectItem value="300">每 5 分鐘</SelectItem>
+                <SelectItem value="900">每 15 分鐘</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
         </div>
       </div>
       {!hasAnyAccount && configuredMode === CODEX_OFFICIAL_NATIVE && (

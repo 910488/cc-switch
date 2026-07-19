@@ -3,6 +3,7 @@ import {
   remainingColor,
   remainingPercent,
 } from "@/components/SubscriptionQuotaFooter";
+import { resolveQuotaRefreshIntervalMs } from "@/lib/query/subscription";
 
 describe("subscription remaining quota", () => {
   it("shows remaining percentage instead of utilization", () => {
@@ -16,5 +17,11 @@ describe("subscription remaining quota", () => {
     expect(remainingColor(9)).toContain("red");
     expect(remainingColor(25)).toContain("orange");
     expect(remainingColor(93)).toContain("green");
+  });
+
+  it("supports a five-second official quota refresh interval", () => {
+    expect(resolveQuotaRefreshIntervalMs(true, 5_000)).toBe(5_000);
+    expect(resolveQuotaRefreshIntervalMs(true, 0)).toBe(false);
+    expect(resolveQuotaRefreshIntervalMs(false, 5_000)).toBe(false);
   });
 });
