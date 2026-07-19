@@ -15,6 +15,7 @@ import SubscriptionQuotaFooter from "@/components/SubscriptionQuotaFooter";
 import CopilotQuotaFooter from "@/components/CopilotQuotaFooter";
 import CodexOauthQuotaFooter from "@/components/CodexOauthQuotaFooter";
 import { CodexOfficialAccountControl } from "@/components/providers/CodexOfficialAccountControl";
+import { CodexModelInjectionDialog } from "@/components/providers/CodexModelInjectionDialog";
 import { PROVIDER_TYPES, TEMPLATE_TYPES } from "@/config/constants";
 import { isHermesReadOnlyProvider } from "@/config/hermesProviderPresets";
 import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
@@ -168,6 +169,7 @@ export function ProviderCard({
   onSetAsDefault,
 }: ProviderCardProps) {
   const { t } = useTranslation();
+  const [modelInjectionOpen, setModelInjectionOpen] = useState(false);
 
   // OMO and OMO Slim share the same card behavior
   const isAnyOmo = isOmo || isOmoSlim;
@@ -514,7 +516,7 @@ export function ProviderCard({
                   inline={true}
                   isCurrent={isCurrent}
                 />
-              ) : isOfficial && !isFixedCodexOfficial ? (
+              ) : isFixedCodexOfficial ? null : isOfficial ? (
                 officialSubscriptionEnabled ? (
                   <SubscriptionQuotaFooter
                     appId={appId}
@@ -592,11 +594,17 @@ export function ProviderCard({
                   : undefined
               }
               onConfigureUsage={
+                isFixedCodexOfficial ||
                 (isOfficial && !supportsOfficialSubscription) ||
                 isCopilot ||
                 isCodexOauth
                   ? undefined
                   : () => onConfigureUsage(provider)
+              }
+              onConfigureModels={
+                appId === "codex" && provider.category !== "official"
+                  ? () => setModelInjectionOpen(true)
+                  : undefined
               }
               onDelete={() => onDelete(provider)}
               onRemoveFromConfig={
@@ -639,6 +647,14 @@ export function ProviderCard({
             inline={false}
           />
         </div>
+      )}
+
+      {appId === "codex" && provider.category !== "official" && (
+        <CodexModelInjectionDialog
+          open={modelInjectionOpen}
+          onOpenChange={setModelInjectionOpen}
+          provider={provider}
+        />
       )}
     </div>
   );

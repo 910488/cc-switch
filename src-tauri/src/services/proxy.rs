@@ -2872,6 +2872,9 @@ impl ProxyService {
         config: &Value,
         provider: Option<&Provider>,
     ) -> Result<(), String> {
+        let routed_config = crate::proxy::model_routes::augment_settings(&self.db, config)
+            .map_err(|error| format!("Unable to build combined Codex model catalog: {error}"))?;
+        let config = &routed_config;
         let official_passthrough =
             provider.is_some_and(crate::proxy::providers::is_codex_official_provider);
         let placeholder_auth = config

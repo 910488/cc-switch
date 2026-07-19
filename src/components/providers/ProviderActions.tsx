@@ -5,6 +5,7 @@ import {
   Copy,
   Edit,
   Loader2,
+  ListPlus,
   Minus,
   Play,
   Plus,
@@ -29,6 +30,7 @@ interface ProviderActionsProps {
   onDuplicate: () => void;
   onTest?: () => void;
   onConfigureUsage?: () => void;
+  onConfigureModels?: () => void;
   onDelete: () => void;
   onRemoveFromConfig?: () => void;
   onDisableOmo?: () => void;
@@ -68,6 +70,7 @@ export function ProviderActions({
   onDuplicate,
   onTest,
   onConfigureUsage,
+  onConfigureModels,
   onDelete,
   onRemoveFromConfig,
   onDisableOmo,
@@ -336,6 +339,18 @@ export function ProviderActions({
         >
           <BarChart3 className="h-4 w-4" />
         </Button>
+
+        {onConfigureModels && (
+          <Button
+            size="icon"
+            variant="ghost"
+            onClick={onConfigureModels}
+            title="設定並注入 Codex 模型"
+            className={cn(iconButtonClass, "hover:text-sky-500")}
+          >
+            <ListPlus className="h-4 w-4" />
+          </Button>
+        )}
 
         {onOpenTerminal && (
           <Button

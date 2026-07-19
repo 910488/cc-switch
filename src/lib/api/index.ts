@@ -14,6 +14,7 @@ export { autoReviewApi } from "./autoReview";
 export { openclawApi } from "./openclaw";
 export { sessionsApi } from "./sessions";
 export { workspaceApi } from "./workspace";
+export { codexModelRoutesApi } from "./codexModelRoutes";
 export * as configApi from "./config";
 export * as authApi from "./auth";
 export * as copilotApi from "./copilot";

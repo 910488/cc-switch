@@ -73,6 +73,11 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
+    pub(crate) fn pin_provider(&mut self, provider: Provider) {
+        self.provider = provider.clone();
+        self.providers = vec![provider];
+    }
+
     /// 创建请求上下文
     ///
     /// # Arguments

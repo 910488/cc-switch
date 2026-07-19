@@ -111,6 +111,98 @@ pub async fn get_auto_review_stats(
 }
 
 #[tauri::command]
+pub fn get_codex_model_routes(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::proxy::model_routes::ModelRouteSettings, String> {
+    crate::proxy::model_routes::load(&state.db).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn get_codex_cached_official_models(
+) -> Result<Vec<crate::proxy::model_routes::CatalogModelInput>, String> {
+    crate::proxy::model_routes::cached_official_models().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn apply_codex_model_routes(
+    state: tauri::State<'_, AppState>,
+    provider_id: String,
+    official_models: Vec<crate::proxy::model_routes::CatalogModelInput>,
+    third_party_models: Vec<crate::proxy::model_routes::CatalogModelInput>,
+) -> Result<crate::proxy::model_routes::ModelRouteSettings, String> {
+    let provider = state
+        .db
+        .get_provider_by_id(&provider_id, "codex")
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Provider not found: {provider_id}"))?;
+    if provider.category.as_deref() == Some("official") {
+        return Err("Model injection requires a third-party provider".to_string());
+    }
+    let next = crate::proxy::model_routes::build_settings(
+        &provider.id,
+        &provider.name,
+        official_models,
+        third_party_models,
+    )
+    .map_err(|error| error.to_string())?;
+    let previous =
+        crate::proxy::model_routes::load(&state.db).map_err(|error| error.to_string())?;
+    crate::proxy::model_routes::save(&state.db, &next).map_err(|error| error.to_string())?;
+
+    let result: Result<(), String> = async {
+        let takeover = state.proxy_service.get_takeover_status().await?.codex;
+        if takeover {
+            state
+                .proxy_service
+                .switch_proxy_target("codex", crate::database::CODEX_OFFICIAL_PROVIDER_ID)
+                .await?;
+        } else {
+            crate::services::ProviderService::switch(
+                state.inner(),
+                crate::app_config::AppType::Codex,
+                crate::database::CODEX_OFFICIAL_PROVIDER_ID,
+            )
+            .map_err(|error| error.to_string())?;
+            state
+                .proxy_service
+                .set_takeover_for_app("codex", true)
+                .await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = crate::proxy::model_routes::save(&state.db, &previous);
+        return Err(error);
+    }
+    Ok(next)
+}
+
+#[tauri::command]
+pub async fn rollback_codex_model_routes(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    crate::proxy::model_routes::clear(&state.db).map_err(|error| error.to_string())?;
+    let takeover = state.proxy_service.get_takeover_status().await?.codex;
+    if takeover {
+        state
+            .proxy_service
+            .switch_proxy_target("codex", crate::database::CODEX_OFFICIAL_PROVIDER_ID)
+            .await?;
+        state
+            .proxy_service
+            .set_takeover_for_app("codex", false)
+            .await?;
+    } else {
+        crate::services::ProviderService::switch(
+            state.inner(),
+            crate::app_config::AppType::Codex,
+            crate::database::CODEX_OFFICIAL_PROVIDER_ID,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn get_continuity_summary_targets(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<crate::proxy::compaction::CompactionSummaryTarget>, String> {

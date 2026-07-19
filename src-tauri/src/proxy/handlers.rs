@@ -28,6 +28,7 @@ use super::{
         CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
     handler_context::RequestContext,
+    model_routes::{self, ResolvedModelRoute},
     providers::{
         codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::record_responses_sse_stream,
@@ -827,6 +828,10 @@ async fn handle_responses_for_app(
         }
     }
 
+    if app_type == AppType::Codex {
+        apply_codex_model_route(&state, &mut body, &mut headers, &mut ctx)?;
+    }
+
     let is_compaction = CompactionService::is_compaction_request(&body);
     let continuity_context =
         CompactionService::context_from_request(&headers, &body, &ctx.session_id);
@@ -1056,6 +1061,54 @@ async fn handle_responses_for_app(
 }
 
 /// 处理 /v1/responses/compact 请求（OpenAI Responses Compact API - Codex CLI 透传）
+fn apply_codex_model_route(
+    state: &ProxyState,
+    body: &mut Value,
+    headers: &mut axum::http::HeaderMap,
+    ctx: &mut RequestContext,
+) -> Result<(), ProxyError> {
+    let requested_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(route) = model_routes::resolve(&state.db, requested_model)
+        .map_err(|error| ProxyError::ConfigError(error.to_string()))?
+    else {
+        return Ok(());
+    };
+
+    match route {
+        ResolvedModelRoute::Official => {
+            ctx.pin_provider(auto_review::resolve_official_provider(&state.db)?);
+        }
+        ResolvedModelRoute::ThirdParty(route) => {
+            let provider = state
+                .db
+                .get_provider_by_id(&route.provider_id, "codex")
+                .map_err(|error| ProxyError::DatabaseError(error.to_string()))?
+                .ok_or_else(|| {
+                    ProxyError::ConfigError(format!(
+                        "Injected model provider '{}' no longer exists",
+                        route.provider_id
+                    ))
+                })?;
+            if provider.category.as_deref() == Some("official") {
+                return Err(ProxyError::ConfigError(
+                    "Injected third-party model points to an official provider".to_string(),
+                ));
+            }
+            body["model"] = Value::String(route.upstream_model.clone());
+            body[INTERNAL_MODEL_OVERRIDE_FIELD] = Value::String(route.upstream_model);
+            headers.insert(
+                INTERNAL_MODEL_OVERRIDE_HEADER,
+                http::HeaderValue::from_static("1"),
+            );
+            ctx.pin_provider(provider);
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_auto_review_request(
     state: &ProxyState,
@@ -1284,12 +1337,16 @@ async fn handle_responses_compact_for_app(
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
+
+    if app_type == AppType::Codex {
+        apply_codex_model_route(&state, &mut body, &mut headers, &mut ctx)?;
+    }
 
     let continuity_context =
         CompactionService::context_from_request(&headers, &body, &ctx.session_id);
