@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
 import type { UsageRangeSelection, UsageScopeFilters } from "@/types/usage";
 import { formatTokensShort, getResolvedLang } from "./format";
 
-type HeatmapView = "daily" | "weekly" | "cumulative";
+export type HeatmapView = "daily" | "weekly" | "cumulative";
 
 interface UsageHeatmapProps extends UsageScopeFilters {
   refreshIntervalMs: number;
@@ -30,6 +30,17 @@ function levelFor(value: number, maximum: number): number {
   if (fraction > 0.5) return 3;
   if (fraction > 0.25) return 2;
   return 1;
+}
+
+export function heatmapValueForView(
+  view: HeatmapView,
+  dailyValue: number,
+  weeklyValue: number,
+  cumulativeValue: number,
+): number {
+  if (view === "weekly") return weeklyValue;
+  if (view === "cumulative") return cumulativeValue;
+  return dailyValue;
 }
 
 const LEVEL_CLASS = [
@@ -85,7 +96,8 @@ export function UsageHeatmap({
   const metrics = useMemo(() => {
     const daily = new Map<string, number>();
     for (const row of trends) {
-      daily.set(row.date.slice(0, 10), row.totalTokens || 0);
+      const date = row.date.slice(0, 10);
+      daily.set(date, (daily.get(date) ?? 0) + (row.totalTokens || 0));
     }
     const weekTotals = weeks.map((column) =>
       column.reduce(
@@ -168,8 +180,14 @@ export function UsageHeatmap({
               key={mode}
               type="button"
               size="sm"
-              variant={view === mode ? "secondary" : "ghost"}
-              className="h-7 px-2.5 text-xs"
+              variant="ghost"
+              aria-pressed={view === mode}
+              data-state={view === mode ? "active" : "inactive"}
+              className={cn(
+                "h-7 px-2.5 text-xs transition-colors",
+                view === mode &&
+                  "bg-emerald-500 text-white shadow-sm hover:bg-emerald-500 hover:text-white",
+              )}
               onClick={() => setView(mode)}
             >
               {t(`usage.heatmapView.${mode}`, {
@@ -220,6 +238,8 @@ export function UsageHeatmap({
             ))}
           </div>
           <div
+            key={view}
+            data-heatmap-view={view}
             className="grid gap-1"
             style={{
               gridAutoFlow: "column",
@@ -231,24 +251,25 @@ export function UsageHeatmap({
               column.map((date) => {
                 const future = date.getTime() > today.getTime();
                 const dailyValue = metrics.daily.get(localDateKey(date)) ?? 0;
-                const value =
-                  view === "daily"
-                    ? dailyValue
-                    : view === "weekly"
-                      ? metrics.weekTotals[weekIndex]
-                      : metrics.cumulative[weekIndex];
+                const value = heatmapValueForView(
+                  view,
+                  dailyValue,
+                  metrics.weekTotals[weekIndex],
+                  metrics.cumulative[weekIndex],
+                );
                 const maximum =
                   view === "daily"
                     ? metrics.maxDaily
                     : view === "weekly"
                       ? metrics.maxWeekly
                       : metrics.total;
+                const weekStart = column[0].toLocaleDateString(locale);
                 const periodLabel =
                   view === "daily"
                     ? date.toLocaleDateString(locale)
                     : view === "weekly"
-                      ? `${column[0].toLocaleDateString(locale)} 當週`
-                      : `截至 ${column[0].toLocaleDateString(locale)} 當週`;
+                      ? `${weekStart} 當週`
+                      : `截至 ${weekStart} 當週累計`;
                 return (
                   <div
                     key={localDateKey(date)}

@@ -1,5 +1,6 @@
 param(
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot "..\local-installers")
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot "..\local-installers"),
+    [switch]$SkipInstall
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,9 +67,13 @@ $locationPushed = $false
 try {
     Push-Location $buildRoot
     $locationPushed = $true
-    & corepack "pnpm@$pnpmVersion" install --frozen-lockfile
-    if ($LASTEXITCODE -ne 0) {
-        throw "pnpm install failed with exit code $LASTEXITCODE."
+    if (-not $SkipInstall) {
+        & corepack "pnpm@$pnpmVersion" install --frozen-lockfile
+        if ($LASTEXITCODE -ne 0) {
+            throw "pnpm install failed with exit code $LASTEXITCODE."
+        }
+    } elseif (-not (Test-Path -LiteralPath ".\node_modules\.bin\tauri.cmd")) {
+        throw "-SkipInstall requires an existing node_modules directory. Run once without it."
     }
 
     & .\node_modules\.bin\tauri.cmd build --ci --bundles msi --config $temporaryConfig
