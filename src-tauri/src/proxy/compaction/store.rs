@@ -35,6 +35,7 @@ impl CompactionStore {
         self.cipher.protection()
     }
 
+    #[cfg(test)]
     pub(crate) fn database(&self) -> Arc<Database> {
         self.db.clone()
     }
