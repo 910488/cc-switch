@@ -6,6 +6,11 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repository = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$resolvedOutputDirectory = if ([System.IO.Path]::IsPathRooted($OutputDirectory)) {
+    [System.IO.Path]::GetFullPath($OutputDirectory)
+} else {
+    [System.IO.Path]::GetFullPath((Join-Path $repository $OutputDirectory))
+}
 $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path -LiteralPath $vswhere)) {
     throw "Visual Studio Installer (vswhere.exe) was not found."
@@ -90,9 +95,9 @@ try {
         throw "Tauri completed without producing an MSI."
     }
 
-    New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
+    New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory | Out-Null
     $shortSha = (& git rev-parse --short=7 HEAD).Trim()
-    $destination = Join-Path $OutputDirectory "CC-Switch-Continuity-$shortSha-Windows-x64-local.msi"
+    $destination = Join-Path $resolvedOutputDirectory "CC-Switch-Continuity-$shortSha-Windows-x64-local.msi"
     Copy-Item -LiteralPath $msi.FullName -Destination $destination -Force
 
     $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $destination
