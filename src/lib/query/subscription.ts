@@ -130,9 +130,11 @@ export function useCodexOauthQuota(
 ) {
   const { enabled = true, autoQuery = false } = options;
   const accountId = resolveManagedAccountId(meta, PROVIDER_TYPES.CODEX_OAUTH);
+  const queryClient = useQueryClient();
+  const queryKey = ["codex_oauth", "quota", accountId ?? "default"] as const;
   const query = useQuery({
-    queryKey: ["codex_oauth", "quota", accountId ?? "default"],
-    queryFn: () => subscriptionApi.getCodexOauthQuota(accountId),
+    queryKey,
+    queryFn: () => subscriptionApi.getCodexOauthQuota(accountId, false),
     enabled,
     refetchInterval: autoQuery ? REFETCH_INTERVAL : false,
     refetchIntervalInBackground: autoQuery,
@@ -141,7 +143,16 @@ export function useCodexOauthQuota(
     retry: 1,
   });
 
-  return useQuotaKeepLastGood(query, accountId ?? "default");
+  const manualRefresh = useMutation({
+    mutationFn: () => subscriptionApi.getCodexOauthQuota(accountId, true),
+    onSuccess: (quota) => queryClient.setQueryData(queryKey, quota),
+  });
+
+  return {
+    ...useQuotaKeepLastGood(query, accountId ?? "default"),
+    refreshNow: manualRefresh.mutateAsync,
+    isRefreshing: query.isFetching || manualRefresh.isPending,
+  };
 }
 
 export function useCodexOauthQuotaByAccount(

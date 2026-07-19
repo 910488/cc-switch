@@ -204,6 +204,7 @@ mod reset_credit_tests {
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_codex_oauth_quota(
     account_id: Option<String>,
+    force_refresh: Option<bool>,
     state: State<'_, CodexOAuthState>,
 ) -> Result<SubscriptionQuota, String> {
     let manager = state.0.read().await;
@@ -235,6 +236,7 @@ pub async fn get_codex_oauth_quota(
         Some(&id),
         "codex_oauth",
         "Codex OAuth access token expired or rejected. Please re-login via cc-switch.",
+        force_refresh.unwrap_or(false),
     )
     .await
 }

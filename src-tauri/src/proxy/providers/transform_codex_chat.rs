@@ -409,6 +409,9 @@ fn apply_reasoning_options(
         // 不会走到这里，故只有上游「显式」表达关闭才透传 none。
         if effort_param == "reasoning.effort" {
             result["reasoning"] = json!({ "effort": "none" });
+        } else if config.effort_value_mode.as_deref() == Some("glm_litellm") {
+            result["reasoning_effort"] = json!("none");
+            result["allowed_openai_params"] = json!(["reasoning_effort"]);
         }
         return;
     }
@@ -428,6 +431,9 @@ fn apply_reasoning_options(
         // OpenAI 风格顶层字段（DeepSeek 官方、OpenAI o-series 等）。
         "reasoning_effort" => {
             result["reasoning_effort"] = json!(mapped);
+            if config.effort_value_mode.as_deref() == Some("glm_litellm") {
+                result["allowed_openai_params"] = json!(["reasoning_effort"]);
+            }
         }
         // OpenRouter 原生归一化对象：reasoning.effort 会被 OpenRouter 翻译成各底层模型
         // （OpenAI/Grok/Gemini/Anthropic）的正确推理参数，覆盖面比顶层 OpenAI 别名更全。
@@ -476,6 +482,12 @@ fn map_reasoning_effort(effort: &str, mode: Option<&str>) -> Option<&'static str
             "medium" => Some("medium"),
             "low" => Some("low"),
             "minimal" => Some("minimal"),
+            _ => None,
+        },
+        "glm_litellm" => match effort.as_str() {
+            "minimal" => Some("none"),
+            "low" | "medium" | "high" => Some("high"),
+            "xhigh" | "max" => Some("max"),
             _ => None,
         },
         _ => match effort.as_str() {
@@ -2303,6 +2315,49 @@ mod tests {
 
         assert_eq!(result["enable_thinking"], true);
         assert!(result.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_maps_weikuwu_glm_effort_for_litellm() {
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(false),
+            supports_effort: Some(true),
+            thinking_param: Some("none".to_string()),
+            effort_param: Some("reasoning_effort".to_string()),
+            effort_value_mode: Some("glm_litellm".to_string()),
+            output_format: Some("reasoning_content".to_string()),
+        };
+
+        for (requested, expected) in [
+            ("minimal", "none"),
+            ("low", "high"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("xhigh", "max"),
+            ("max", "max"),
+        ] {
+            let input = json!({
+                "model": "GLM-5.2p",
+                "input": "hello",
+                "reasoning": {"effort": requested}
+            });
+            let result =
+                responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
+
+            assert_eq!(result["reasoning_effort"], expected);
+            assert_eq!(result["allowed_openai_params"], json!(["reasoning_effort"]));
+            assert!(result.get("thinking").is_none());
+        }
+
+        let disabled = json!({
+            "model": "GLM-5.2p",
+            "input": "hello",
+            "reasoning": {"effort": "none"}
+        });
+        let result = responses_to_chat_completions_with_reasoning(disabled, Some(&config)).unwrap();
+        assert_eq!(result["reasoning_effort"], "none");
+        assert_eq!(result["allowed_openai_params"], json!(["reasoning_effort"]));
+        assert!(result.get("thinking").is_none());
     }
 
     #[test]

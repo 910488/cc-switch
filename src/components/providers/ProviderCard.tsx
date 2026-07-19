@@ -16,6 +16,13 @@ import CopilotQuotaFooter from "@/components/CopilotQuotaFooter";
 import CodexOauthQuotaFooter from "@/components/CodexOauthQuotaFooter";
 import { CodexOfficialAccountControl } from "@/components/providers/CodexOfficialAccountControl";
 import { CodexModelInjectionDialog } from "@/components/providers/CodexModelInjectionDialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { PROVIDER_TYPES, TEMPLATE_TYPES } from "@/config/constants";
 import { isHermesReadOnlyProvider } from "@/config/hermesProviderPresets";
 import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
@@ -170,6 +177,7 @@ export function ProviderCard({
 }: ProviderCardProps) {
   const { t } = useTranslation();
   const [modelInjectionOpen, setModelInjectionOpen] = useState(false);
+  const [officialUsageOpen, setOfficialUsageOpen] = useState(false);
 
   // OMO and OMO Slim share the same card behavior
   const isAnyOmo = isOmo || isOmoSlim;
@@ -594,12 +602,13 @@ export function ProviderCard({
                   : undefined
               }
               onConfigureUsage={
-                isFixedCodexOfficial ||
-                (isOfficial && !supportsOfficialSubscription) ||
-                isCopilot ||
-                isCodexOauth
-                  ? undefined
-                  : () => onConfigureUsage(provider)
+                isFixedCodexOfficial
+                  ? () => setOfficialUsageOpen(true)
+                  : (isOfficial && !supportsOfficialSubscription) ||
+                      isCopilot ||
+                      isCodexOauth
+                    ? undefined
+                    : () => onConfigureUsage(provider)
               }
               onConfigureModels={
                 appId === "codex" && provider.category !== "official"
@@ -628,11 +637,31 @@ export function ProviderCard({
       </div>
 
       {isFixedCodexOfficial && (
-        <CodexOfficialAccountControl
-          provider={provider}
-          isCurrent={isCurrent}
-          isProxyTakeover={isProxyTakeover}
-        />
+        <>
+          <CodexOfficialAccountControl
+            provider={provider}
+            isCurrent={isCurrent}
+            isProxyTakeover={isProxyTakeover}
+          />
+          <Dialog open={officialUsageOpen} onOpenChange={setOfficialUsageOpen}>
+            <DialogContent className="max-w-2xl">
+              <DialogHeader>
+                <DialogTitle>OpenAI Official 用量與 Reset</DialogTitle>
+                <DialogDescription>
+                  使用 CC Switch 管理的 ChatGPT 帳號直接查詢官方額度；此處不使用
+                  usage script。
+                </DialogDescription>
+              </DialogHeader>
+              <div className="px-6 pb-5">
+                <CodexOfficialAccountControl
+                  provider={provider}
+                  isCurrent={isCurrent}
+                  isProxyTakeover={isProxyTakeover}
+                />
+              </div>
+            </DialogContent>
+          </Dialog>
+        </>
       )}
 
       {isExpanded && hasMultiplePlans && (

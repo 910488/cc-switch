@@ -674,6 +674,7 @@ pub(crate) async fn query_codex_quota(
     account_id: Option<&str>,
     tool_label: &str,
     expired_message: &str,
+    force_refresh: bool,
 ) -> Result<SubscriptionQuota, String> {
     let client = crate::proxy::http_client::get();
 
@@ -682,6 +683,13 @@ pub(crate) async fn query_codex_quota(
         .header("Authorization", format!("Bearer {access_token}"))
         .header("User-Agent", "codex-cli")
         .header("Accept", "application/json");
+
+    if force_refresh {
+        req = req
+            .header(reqwest::header::CACHE_CONTROL, "no-cache, no-store")
+            .header(reqwest::header::PRAGMA, "no-cache")
+            .query(&[("_ccs_refresh", now_millis().to_string())]);
+    }
 
     if let Some(id) = account_id {
         req = req.header("ChatGPT-Account-Id", id);
@@ -1280,6 +1288,7 @@ pub async fn get_subscription_quota(tool: &str) -> Result<SubscriptionQuota, Str
                             account_id.as_deref(),
                             "codex",
                             "Authentication failed. Please re-login with Codex CLI.",
+                            false,
                         )
                         .await?;
                         if result.success {
@@ -1299,6 +1308,7 @@ pub async fn get_subscription_quota(tool: &str) -> Result<SubscriptionQuota, Str
                         account_id.as_deref(),
                         "codex",
                         "Authentication failed. Please re-login with Codex CLI.",
+                        false,
                     )
                     .await
                 }
