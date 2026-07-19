@@ -7,7 +7,6 @@ use super::{
     body_filter::filter_private_params_with_whitelist,
     compaction::{CompactionService, MaterializationTarget, ProviderRealm},
     content_encoding::{decompress_body, get_content_encoding},
-    credential_pool::{CredentialPool, ResolvedCredential},
     error::*,
     failover_switch::FailoverSwitchManager,
     json_canonical::{canonicalize_value, short_value_hash},
@@ -123,7 +122,6 @@ pub struct RequestForwarder {
     gemini_shadow: Arc<GeminiShadowStore>,
     codex_chat_history: Arc<CodexChatHistoryStore>,
     compaction_service: Arc<CompactionService>,
-    credential_pool: Arc<CredentialPool>,
     /// 故障转移切换管理器
     failover_manager: Arc<FailoverSwitchManager>,
     /// AppHandle，用于发射事件和更新托盘
@@ -207,7 +205,6 @@ impl RequestForwarder {
         gemini_shadow: Arc<GeminiShadowStore>,
         codex_chat_history: Arc<CodexChatHistoryStore>,
         compaction_service: Arc<CompactionService>,
-        credential_pool: Arc<CredentialPool>,
         failover_manager: Arc<FailoverSwitchManager>,
         app_handle: Option<tauri::AppHandle>,
         current_provider_id_at_start: String,
@@ -230,7 +227,6 @@ impl RequestForwarder {
             gemini_shadow,
             codex_chat_history,
             compaction_service,
-            credential_pool,
             failover_manager,
             app_handle,
             current_provider_id_at_start,
@@ -413,27 +409,7 @@ impl RequestForwarder {
             });
         }
 
-        // One provider may have several OS-vault-backed credentials. Expand it
-        // into logical attempts so quota/auth failure can rotate accounts before
-        // moving to another provider. Legacy providers remain one attempt.
-        let mut expanded_providers = Vec::new();
-        let mut largest_pool = 1usize;
-        for provider in providers {
-            let credential_count = self
-                .credential_pool
-                .enabled_count(app_type_str, &provider.id)
-                .map_err(|error| ForwardError {
-                    error: ProxyError::ConfigError(error.to_string()),
-                    provider: Some(provider.clone()),
-                })?;
-            let attempts = credential_count.max(1);
-            largest_pool = largest_pool.max(attempts);
-            for _ in 0..attempts {
-                expanded_providers.push(provider.clone());
-            }
-        }
-        let providers = expanded_providers;
-        let max_attempts = self.max_attempts.max(largest_pool);
+        let max_attempts = self.max_attempts;
 
         let mut last_error = None;
         let mut last_provider = None;
@@ -522,18 +498,6 @@ impl RequestForwarder {
                 status.current_provider_id = Some(provider.id.clone());
             }
 
-            let credential = match self.credential_pool.resolve(app_type_str, &provider.id) {
-                Ok(credential) => credential,
-                Err(error) => {
-                    self.router
-                        .release_permit_neutral(&provider.id, app_type_str, used_half_open_permit)
-                        .await;
-                    last_error = Some(ProxyError::AuthError(error.to_string()));
-                    last_provider = Some(provider.clone());
-                    continue;
-                }
-            };
-
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
             match self
                 .forward(
@@ -545,12 +509,10 @@ impl RequestForwarder {
                     &headers,
                     &extensions,
                     adapter.as_ref(),
-                    credential.as_ref(),
                 )
                 .await
             {
                 Ok((response, claude_api_format, outbound_model)) => {
-                    self.record_credential_quota_headers(credential.as_ref(), response.headers());
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
@@ -653,15 +615,10 @@ impl RequestForwarder {
                                     &headers,
                                     &extensions,
                                     adapter.as_ref(),
-                                    credential.as_ref(),
                                 )
                                 .await
                             {
                                 Ok((response, claude_api_format, outbound_model)) => {
-                                    self.record_credential_quota_headers(
-                                        credential.as_ref(),
-                                        response.headers(),
-                                    );
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
                                     );
@@ -804,15 +761,10 @@ impl RequestForwarder {
                                         &headers,
                                         &extensions,
                                         adapter.as_ref(),
-                                        credential.as_ref(),
                                     )
                                     .await
                                 {
                                     Ok((response, claude_api_format, outbound_model)) => {
-                                        self.record_credential_quota_headers(
-                                            credential.as_ref(),
-                                            response.headers(),
-                                        );
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
                                         self.record_success_result(
                                             &provider.id,
@@ -975,15 +927,10 @@ impl RequestForwarder {
                                     &headers,
                                     &extensions,
                                     adapter.as_ref(),
-                                    credential.as_ref(),
                                 )
                                 .await
                             {
                                 Ok((response, claude_api_format, outbound_model)) => {
-                                    self.record_credential_quota_headers(
-                                        credential.as_ref(),
-                                        response.headers(),
-                                    );
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
                                     self.record_success_result(
                                         &provider.id,
@@ -1087,7 +1034,7 @@ impl RequestForwarder {
                             app_type_str,
                             provider,
                             &e,
-                            credential.as_ref().map(|value| value.id.as_str()),
+                            None,
                         ) {
                             Ok(Some(latch)) => log::warn!(
                                 "[{app_type_str}] provider {} quota-latched until {} ({})",
@@ -1237,7 +1184,6 @@ impl RequestForwarder {
         headers: &axum::http::HeaderMap,
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
-        credential_override: Option<&ResolvedCredential>,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
@@ -1844,36 +1790,6 @@ impl RequestForwarder {
             Vec::new()
         };
 
-        if let Some(credential) = credential_override {
-            let header_name = http::HeaderName::from_bytes(credential.header_name.as_bytes())
-                .map_err(|_| {
-                    ProxyError::ConfigError(format!(
-                        "credential {} has an invalid header name",
-                        credential.id
-                    ))
-                })?;
-            let header_value = http::HeaderValue::from_bytes(credential.header_value.as_slice())
-                .map_err(|_| {
-                    ProxyError::ConfigError(format!(
-                        "credential {} cannot be represented as an HTTP header",
-                        credential.id
-                    ))
-                })?;
-            auth_headers.retain(|(name, _)| {
-                !name.as_str().eq_ignore_ascii_case("authorization")
-                    && !name.as_str().eq_ignore_ascii_case("x-api-key")
-                    && !name.as_str().eq_ignore_ascii_case("x-goog-api-key")
-                    && name != header_name
-            });
-            auth_headers.push((header_name, header_value));
-            log::debug!(
-                "[{}] using credential {} for provider {}",
-                app_type.as_str(),
-                credential.id,
-                provider.id
-            );
-        }
-
         // 注入 Codex OAuth 的 ChatGPT-Account-Id header（如果有 account_id）
         if let Some(ref account_id) = codex_oauth_account_id {
             if let Ok(hv) = http::HeaderValue::from_str(account_id) {
@@ -2072,8 +1988,6 @@ impl RequestForwarder {
             if key_str.eq_ignore_ascii_case("authorization")
                 || key_str.eq_ignore_ascii_case("x-api-key")
                 || key_str.eq_ignore_ascii_case("x-goog-api-key")
-                || credential_override
-                    .is_some_and(|credential| key_str.eq_ignore_ascii_case(&credential.header_name))
             {
                 // The built-in Codex official provider deliberately has no
                 // credential in CC Switch. `requires_openai_auth = true` makes
@@ -2737,26 +2651,6 @@ impl RequestForwarder {
                 );
                 false
             }
-        }
-    }
-
-    fn record_credential_quota_headers(
-        &self,
-        credential: Option<&ResolvedCredential>,
-        headers: &http::HeaderMap,
-    ) {
-        let Some(credential) = credential else {
-            return;
-        };
-        if let Err(error) = self
-            .credential_pool
-            .record_response_quotas(&credential.id, headers)
-        {
-            log::warn!(
-                "failed to persist response quota metadata for credential {}: {}",
-                credential.id,
-                error
-            );
         }
     }
 
@@ -3743,7 +3637,6 @@ mod tests {
                 crate::proxy::compaction::CompactionStore::with_key(db.clone(), vec![13; 32])
                     .expect("test compaction store"),
             )),
-            credential_pool: Arc::new(CredentialPool::new(db.clone())),
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
             app_handle: None,
             current_provider_id_at_start: String::new(),

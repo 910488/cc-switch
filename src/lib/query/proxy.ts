@@ -6,7 +6,6 @@ import type {
   GlobalProxyConfig,
   AppProxyConfig,
   CompactionSettings,
-  SaveProviderCredentialRequest,
 } from "@/types/proxy";
 
 // ========== 代理服务器状态 Hooks ==========
@@ -57,47 +56,6 @@ export function useDeleteContinuityThread() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["continuityTasks"] });
       queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
-    },
-  });
-}
-
-export function useProviderCredentials(appType: string, providerId?: string) {
-  return useQuery({
-    queryKey: ["providerCredentials", appType, providerId],
-    queryFn: () => proxyApi.listProviderCredentials(appType, providerId!),
-    enabled: Boolean(providerId),
-  });
-}
-
-export function useSaveProviderCredential() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (request: SaveProviderCredentialRequest) =>
-      proxyApi.saveProviderCredential(request),
-    onSuccess: (credential) => {
-      queryClient.invalidateQueries({
-        queryKey: [
-          "providerCredentials",
-          credential.appType,
-          credential.providerId,
-        ],
-      });
-    },
-  });
-}
-
-export function useDeleteProviderCredential() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (input: {
-      appType: string;
-      providerId: string;
-      credentialId: string;
-    }) => proxyApi.deleteProviderCredential(input.credentialId),
-    onSuccess: (_deleted, input) => {
-      queryClient.invalidateQueries({
-        queryKey: ["providerCredentials", input.appType, input.providerId],
-      });
     },
   });
 }

@@ -946,9 +946,6 @@ mod tests {
                 crate::proxy::compaction::CompactionStore::with_key(db.clone(), vec![11; 32])
                     .expect("test compaction store"),
             )),
-            credential_pool: Arc::new(crate::proxy::credential_pool::CredentialPool::new(
-                db.clone(),
-            )),
             app_handle: None,
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
         }

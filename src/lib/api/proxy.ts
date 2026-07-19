@@ -8,10 +8,6 @@ import type {
   AppProxyConfig,
   CompactionSettings,
   ContinuityTaskState,
-  ProviderCredential,
-  ProviderCredentialPool,
-  SaveProviderCredentialQuotaRequest,
-  SaveProviderCredentialRequest,
 } from "@/types/proxy";
 
 export const proxyApi = {
@@ -46,43 +42,6 @@ export const proxyApi = {
 
   async deleteContinuityThread(threadId: string): Promise<number> {
     return invoke("delete_continuity_thread", { threadId });
-  },
-
-  async listProviderCredentials(
-    appType: string,
-    providerId: string,
-  ): Promise<ProviderCredentialPool> {
-    return invoke("list_provider_credentials", { appType, providerId });
-  },
-
-  async saveProviderCredential(
-    request: SaveProviderCredentialRequest,
-  ): Promise<ProviderCredential> {
-    return invoke("save_provider_credential", { request });
-  },
-
-  async deleteProviderCredential(credentialId: string): Promise<boolean> {
-    return invoke("delete_provider_credential", { credentialId });
-  },
-
-  async updateProviderCredentialStatus(
-    credentialId: string,
-    enabled: boolean,
-    status: ProviderCredential["status"],
-    errorCode?: string,
-  ): Promise<void> {
-    return invoke("update_provider_credential_status", {
-      credentialId,
-      enabled,
-      status,
-      errorCode,
-    });
-  },
-
-  async updateProviderCredentialQuota(
-    request: SaveProviderCredentialQuotaRequest,
-  ): Promise<void> {
-    return invoke("update_provider_credential_quota", { request });
   },
 
   // 检查代理服务器是否正在运行

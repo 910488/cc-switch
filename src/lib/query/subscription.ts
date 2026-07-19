@@ -1,5 +1,10 @@
 import { useRef } from "react";
-import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type UseQueryResult,
+} from "@tanstack/react-query";
 import { subscriptionApi } from "@/lib/api/subscription";
 import type { AppId } from "@/lib/api/types";
 import type { ProviderMeta } from "@/types";
@@ -137,4 +142,49 @@ export function useCodexOauthQuota(
   });
 
   return useQuotaKeepLastGood(query, accountId ?? "default");
+}
+
+export function useCodexOauthQuotaByAccount(
+  accountId: string,
+  options: UseCodexOauthQuotaOptions = {},
+) {
+  const { enabled = true, autoQuery = false } = options;
+  const query = useQuery({
+    queryKey: ["codex_oauth", "quota", accountId],
+    queryFn: () => subscriptionApi.getCodexOauthQuota(accountId),
+    enabled: enabled && Boolean(accountId),
+    refetchInterval: autoQuery ? REFETCH_INTERVAL : false,
+    refetchIntervalInBackground: autoQuery,
+    refetchOnWindowFocus: autoQuery,
+    staleTime: REFETCH_INTERVAL,
+    retry: 1,
+  });
+  return useQuotaKeepLastGood(query, accountId);
+}
+
+export function useCodexOauthResetCredits(accountId: string, enabled = true) {
+  return useQuery({
+    queryKey: ["codex_oauth", "reset-credits", accountId],
+    queryFn: () => subscriptionApi.getCodexOauthResetCredits(accountId),
+    enabled: enabled && Boolean(accountId),
+    staleTime: 30_000,
+    refetchOnWindowFocus: true,
+    retry: 1,
+  });
+}
+
+export function useConsumeCodexOauthReset() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { accountId: string; creditId: string }) =>
+      subscriptionApi.consumeCodexOauthReset(input.accountId, input.creditId),
+    onSuccess: (_result, input) => {
+      queryClient.invalidateQueries({
+        queryKey: ["codex_oauth", "quota", input.accountId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["codex_oauth", "reset-credits", input.accountId],
+      });
+    },
+  });
 }

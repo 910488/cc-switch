@@ -1002,7 +1002,10 @@ pub fn run() {
 
                 let app_config_dir = crate::config::get_app_config_dir();
                 let codex_oauth_manager = CodexOAuthManager::new(app_config_dir);
-                app.manage(CodexOAuthState(Arc::new(RwLock::new(codex_oauth_manager))));
+                app.manage(CodexOAuthState(
+                    Arc::new(RwLock::new(codex_oauth_manager)),
+                    Arc::new(tokio::sync::Mutex::new(())),
+                ));
                 log::info!("✓ CodexOAuthManager initialized");
             }
 
@@ -1268,6 +1271,8 @@ pub fn run() {
             commands::get_subscription_quota,
             commands::get_codex_oauth_quota,
             commands::get_codex_oauth_models,
+            commands::get_codex_oauth_reset_credits,
+            commands::consume_codex_oauth_reset,
             commands::get_coding_plan_quota,
             commands::get_balance,
             // New MCP via config.json (SSOT)
@@ -1380,11 +1385,6 @@ pub fn run() {
             commands::update_continuity_settings,
             commands::get_continuity_tasks,
             commands::delete_continuity_thread,
-            commands::list_provider_credentials,
-            commands::save_provider_credential,
-            commands::delete_provider_credential,
-            commands::update_provider_credential_status,
-            commands::update_provider_credential_quota,
             commands::get_proxy_config,
             commands::update_proxy_config,
             // Global & Per-App Config

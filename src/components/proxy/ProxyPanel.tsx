@@ -36,6 +36,9 @@ import type { CompactionRolloutMode, ProxyStatus } from "@/types/proxy";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import { CodexAccountDashboard } from "./CodexAccountDashboard";
+import { UsageDashboard } from "@/components/usage/UsageDashboard";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 interface ProxyPanelProps {
   enableLocalProxy: boolean;
@@ -554,173 +557,250 @@ export function ProxyPanel({
                 value={formatUptime(status.uptime_seconds)}
               />
             </div>
-            <div className="rounded-lg border border-border bg-card/60 p-4">
-              <div className="flex items-start justify-between gap-4">
-                <div className="flex gap-3">
-                  <ShieldCheck
-                    className={`mt-0.5 h-5 w-5 ${
-                      status.continuity?.available
-                        ? "text-green-500"
-                        : "text-destructive"
-                    }`}
-                  />
-                  <div>
-                    <h4 className="text-sm font-semibold">
-                      {t("proxy.continuity.title", {
-                        defaultValue: "Codex context continuity",
-                      })}
-                    </h4>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      {status.continuity?.available
-                        ? t("proxy.continuity.ready", {
-                            protection:
-                              status.continuity.key_protection ?? "encrypted",
-                            defaultValue:
-                              "Encrypted journal ready ({{protection}})",
-                          })
-                        : status.continuity?.error ||
-                          t("proxy.continuity.unavailable", {
-                            defaultValue: "Continuity journal unavailable",
+            <Tabs defaultValue="accounts" className="space-y-4">
+              <TabsList className="grid h-auto w-full grid-cols-3">
+                <TabsTrigger value="accounts">帳號與額度</TabsTrigger>
+                <TabsTrigger value="continuity">Context Continuity</TabsTrigger>
+                <TabsTrigger value="requests">請求與用量</TabsTrigger>
+              </TabsList>
+              <TabsContent value="accounts" className="mt-0">
+                <CodexAccountDashboard />
+              </TabsContent>
+              <TabsContent value="continuity" className="mt-0">
+                <div className="rounded-lg border border-border bg-card/60 p-4">
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="flex gap-3">
+                      <ShieldCheck
+                        className={`mt-0.5 h-5 w-5 ${
+                          status.continuity?.available
+                            ? "text-green-500"
+                            : "text-destructive"
+                        }`}
+                      />
+                      <div>
+                        <h4 className="text-sm font-semibold">
+                          {t("proxy.continuity.title", {
+                            defaultValue: "Codex context continuity",
                           })}
-                    </p>
-                  </div>
-                </div>
-                <div className="text-right text-xs text-muted-foreground">
-                  <div>
-                    {status.continuity?.snapshots ?? 0}{" "}
-                    {t("proxy.continuity.snapshots", {
-                      defaultValue: "snapshots",
-                    })}
-                  </div>
-                  <div>
-                    {status.continuity?.compactions ?? 0}{" "}
-                    {t("proxy.continuity.compactions", {
-                      defaultValue: "compactions",
-                    })}
-                  </div>
-                </div>
-              </div>
-              <div className="mt-4 grid gap-3 border-t border-border pt-3 md:grid-cols-2">
-                <div className="space-y-1">
-                  <Label htmlFor="continuity-rollout" className="text-xs">
-                    {t("proxy.continuity.rolloutMode", {
-                      defaultValue: "Rollout mode",
-                    })}
-                  </Label>
-                  <select
-                    id="continuity-rollout"
-                    className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
-                    value={
-                      continuitySettings?.rolloutMode ??
-                      status.continuity?.rollout_mode ??
-                      "full-switching"
-                    }
-                    disabled={updateContinuitySettings.isPending}
-                    onChange={(event) =>
-                      void handleRolloutModeChange(
-                        event.target.value as CompactionRolloutMode,
-                      )
-                    }
-                  >
-                    <option value="off">Off</option>
-                    <option value="observe-only">Observe only</option>
-                    <option value="third-party-only">Third-party only</option>
-                    <option value="full-switching">Full switching</option>
-                  </select>
-                </div>
-                <ToggleRow
-                  icon={<ShieldCheck className="h-4 w-4" />}
-                  title={t("proxy.continuity.officialFallback", {
-                    defaultValue: "Safe official compact fallback",
-                  })}
-                  description={t("proxy.continuity.officialFallbackHint", {
-                    defaultValue:
-                      "Materialize canonical context if the official compact endpoint fails.",
-                  })}
-                  checked={continuitySettings?.officialCompactFallback ?? true}
-                  disabled={updateContinuitySettings.isPending}
-                  onCheckedChange={(checked) => {
-                    if (!continuitySettings) return;
-                    void updateContinuitySettings.mutateAsync({
-                      ...continuitySettings,
-                      officialCompactFallback: checked,
-                    });
-                  }}
-                />
-              </div>
-              <div className="mt-4 space-y-2 border-t border-border pt-3">
-                <div className="flex items-center justify-between">
-                  <Label className="text-xs">Recent compaction tasks</Label>
-                  <span className="text-[11px] text-muted-foreground">
-                    {continuityTasks.length} loaded
-                  </span>
-                </div>
-                {continuityTasks.slice(0, 8).map((task) => (
-                  <div
-                    key={`${task.threadId}:${task.sessionId}`}
-                    className="flex items-start justify-between gap-3 rounded-md border border-border/70 p-3 text-xs"
-                  >
-                    <div className="min-w-0 space-y-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span
-                          className={`rounded px-1.5 py-0.5 font-medium ${
-                            task.state === "healthy"
-                              ? "bg-green-500/10 text-green-600"
-                              : task.state === "error"
-                                ? "bg-destructive/10 text-destructive"
-                                : "bg-amber-500/10 text-amber-600"
-                          }`}
-                        >
-                          {task.state}
-                        </span>
-                        <span className="font-medium">{task.phase}</span>
-                        <span className="text-muted-foreground">
-                          {task.strategy ?? task.realm}
-                        </span>
-                      </div>
-                      <div className="truncate text-muted-foreground">
-                        {task.model} · {task.providerId ?? "provider unknown"} ·
-                        thread {task.threadId.slice(0, 12)}
-                      </div>
-                      <div className="flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground">
-                        <span>
-                          tokens {task.inputTokensBefore.toLocaleString()} →{" "}
-                          {task.summaryTokens.toLocaleString()}
-                        </span>
-                        <span>
-                          chunks {task.chunksCompleted}/{task.chunksTotal}
-                        </span>
-                        <span>
-                          retries {task.retryCount} (overflow{" "}
-                          {task.overflowRetryCount})
-                        </span>
-                        <span>
-                          resume {task.resumeVerified ? "verified" : "pending"}
-                        </span>
+                        </h4>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {status.continuity?.available
+                            ? t("proxy.continuity.ready", {
+                                protection:
+                                  status.continuity.key_protection ??
+                                  "encrypted",
+                                defaultValue:
+                                  "Encrypted journal ready ({{protection}})",
+                              })
+                            : status.continuity?.error ||
+                              t("proxy.continuity.unavailable", {
+                                defaultValue: "Continuity journal unavailable",
+                              })}
+                        </p>
                       </div>
                     </div>
-                    <Button
-                      type="button"
-                      size="icon"
-                      variant="ghost"
-                      disabled={deleteContinuityThread.isPending}
-                      onClick={() =>
-                        void handleDeleteContinuityThread(task.threadId)
-                      }
-                      aria-label="Delete continuity task"
-                    >
-                      <Trash2 className="h-4 w-4 text-destructive" />
-                    </Button>
+                    <div className="text-right text-xs text-muted-foreground">
+                      <div>
+                        {status.continuity?.snapshots ?? 0}{" "}
+                        {t("proxy.continuity.snapshots", {
+                          defaultValue: "snapshots",
+                        })}
+                      </div>
+                      <div>
+                        {status.continuity?.compactions ?? 0}{" "}
+                        {t("proxy.continuity.compactions", {
+                          defaultValue: "compactions",
+                        })}
+                      </div>
+                    </div>
                   </div>
-                ))}
-                {continuityTasks.length === 0 && (
-                  <p className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
-                    尚無 compaction task。第一次 compact 後會在這裡顯示
-                    journal、summary、resume、token 與 retry 狀態。
-                  </p>
-                )}
-              </div>
-            </div>
+                  <div className="mt-4 grid gap-3 border-t border-border pt-3 md:grid-cols-2">
+                    <div className="space-y-1">
+                      <Label htmlFor="continuity-rollout" className="text-xs">
+                        {t("proxy.continuity.rolloutMode", {
+                          defaultValue: "Rollout mode",
+                        })}
+                      </Label>
+                      <select
+                        id="continuity-rollout"
+                        className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+                        value={
+                          continuitySettings?.rolloutMode ??
+                          status.continuity?.rollout_mode ??
+                          "full-switching"
+                        }
+                        disabled={updateContinuitySettings.isPending}
+                        onChange={(event) =>
+                          void handleRolloutModeChange(
+                            event.target.value as CompactionRolloutMode,
+                          )
+                        }
+                      >
+                        <option value="off">Off</option>
+                        <option value="observe-only">Observe only</option>
+                        <option value="third-party-only">
+                          Third-party only
+                        </option>
+                        <option value="full-switching">Full switching</option>
+                      </select>
+                    </div>
+                    <ToggleRow
+                      icon={<ShieldCheck className="h-4 w-4" />}
+                      title={t("proxy.continuity.officialFallback", {
+                        defaultValue: "Safe official compact fallback",
+                      })}
+                      description={t("proxy.continuity.officialFallbackHint", {
+                        defaultValue:
+                          "Materialize canonical context if the official compact endpoint fails.",
+                      })}
+                      checked={
+                        continuitySettings?.officialCompactFallback ?? true
+                      }
+                      disabled={updateContinuitySettings.isPending}
+                      onCheckedChange={(checked) => {
+                        if (!continuitySettings) return;
+                        void updateContinuitySettings.mutateAsync({
+                          ...continuitySettings,
+                          officialCompactFallback: checked,
+                        });
+                      }}
+                    />
+                  </div>
+                  <div className="mt-4 space-y-2 border-t border-border pt-3">
+                    <div className="flex items-center justify-between">
+                      <Label className="text-xs">Recent compaction tasks</Label>
+                      <span className="text-[11px] text-muted-foreground">
+                        {continuityTasks.length} loaded
+                      </span>
+                    </div>
+                    {continuityTasks.slice(0, 8).map((task) => (
+                      <div
+                        key={`${task.threadId}:${task.sessionId}`}
+                        className="flex items-start justify-between gap-3 rounded-md border border-border/70 p-3 text-xs"
+                      >
+                        <div className="min-w-0 space-y-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span
+                              className={`rounded px-1.5 py-0.5 font-medium ${
+                                task.state === "healthy"
+                                  ? "bg-green-500/10 text-green-600"
+                                  : task.state === "error"
+                                    ? "bg-destructive/10 text-destructive"
+                                    : "bg-amber-500/10 text-amber-600"
+                              }`}
+                            >
+                              {task.state}
+                            </span>
+                            <span className="font-medium">{task.phase}</span>
+                            <span className="text-muted-foreground">
+                              {task.strategy ?? task.realm}
+                            </span>
+                          </div>
+                          <div className="truncate text-muted-foreground">
+                            {task.model} ·{" "}
+                            {task.providerId ?? "provider unknown"} · thread{" "}
+                            {task.threadId.slice(0, 12)}
+                          </div>
+                          <div className="flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground">
+                            <span
+                              className={
+                                task.journalSaved
+                                  ? "text-green-600"
+                                  : "text-amber-600"
+                              }
+                            >
+                              journal {task.journalSaved ? "saved" : "pending"}
+                            </span>
+                            <span
+                              className={
+                                task.summaryCreated
+                                  ? "text-green-600"
+                                  : "text-amber-600"
+                              }
+                            >
+                              summary{" "}
+                              {task.summaryCreated ? "created" : "pending"}
+                            </span>
+                            <span>
+                              tokens {task.inputTokensBefore.toLocaleString()} →{" "}
+                              {task.summaryTokens.toLocaleString()}
+                            </span>
+                            <span>
+                              reduction{" "}
+                              {task.inputTokensBefore > 0
+                                ? `${Math.max(
+                                    0,
+                                    100 -
+                                      (task.summaryTokens /
+                                        task.inputTokensBefore) *
+                                        100,
+                                  ).toFixed(0)}%`
+                                : "–"}
+                            </span>
+                            <span>
+                              chunks {task.chunksCompleted}/{task.chunksTotal}
+                            </span>
+                            <span>
+                              retries {task.retryCount} (overflow{" "}
+                              {task.overflowRetryCount})
+                            </span>
+                            <span>
+                              resume{" "}
+                              <span
+                                className={
+                                  task.resumeVerified
+                                    ? "text-green-600"
+                                    : "text-amber-600"
+                                }
+                              >
+                                {task.resumeVerified ? "verified" : "pending"}
+                              </span>
+                            </span>
+                            <span>
+                              model tokens {task.promptTokens.toLocaleString()}{" "}
+                              + {task.completionTokens.toLocaleString()} ={" "}
+                              {task.totalTokens.toLocaleString()}
+                            </span>
+                            {task.errorCode && (
+                              <span className="text-destructive">
+                                error {task.errorCode}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        <Button
+                          type="button"
+                          size="icon"
+                          variant="ghost"
+                          disabled={deleteContinuityThread.isPending}
+                          onClick={() =>
+                            void handleDeleteContinuityThread(task.threadId)
+                          }
+                          aria-label="Delete continuity task"
+                        >
+                          <Trash2 className="h-4 w-4 text-destructive" />
+                        </Button>
+                      </div>
+                    ))}
+                    {continuityTasks.length === 0 && (
+                      <p className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
+                        尚無 compaction task。第一次 compact 後會在這裡顯示
+                        journal、summary、resume、token 與 retry 狀態。
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </TabsContent>
+              <TabsContent value="requests" className="mt-0">
+                <UsageDashboard
+                  initialAppType="codex"
+                  showPricing={false}
+                  showHeatmap={false}
+                  title="Codex Proxy Dashboard"
+                  subtitle="請求、token、延遲、成功率、Provider 與模型統計"
+                />
+              </TabsContent>
+            </Tabs>
           </div>
         ) : (
           <div className="space-y-6">

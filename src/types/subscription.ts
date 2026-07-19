@@ -31,3 +31,22 @@ export interface SubscriptionQuota {
   error: string | null;
   queriedAt: number | null;
 }
+
+export interface CodexResetCredit {
+  id: string;
+  resetType: string | null;
+  status: string;
+  expiresAt: string | null;
+  title: string | null;
+  description: string | null;
+}
+
+export interface CodexResetCredits {
+  availableCount: number;
+  credits: CodexResetCredit[];
+}
+
+export interface CodexResetResult {
+  code: string;
+  windowsReset: number | null;
+}

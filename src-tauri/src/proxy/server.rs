@@ -10,7 +10,6 @@
 
 use super::{
     compaction::CompactionService,
-    credential_pool::CredentialPool,
     failover_switch::FailoverSwitchManager,
     handlers,
     log_codes::srv as log_srv,
@@ -48,8 +47,6 @@ pub struct ProxyState {
     pub codex_chat_history: Arc<CodexChatHistoryStore>,
     /// Durable encrypted journal used to keep Codex context valid while providers change.
     pub compaction_service: Arc<CompactionService>,
-    /// Secure per-provider credential pools and quota-aware account selection.
-    pub credential_pool: Arc<CredentialPool>,
     /// AppHandle，用于发射事件和更新托盘菜单
     pub app_handle: Option<tauri::AppHandle>,
     /// 故障转移切换管理器
@@ -77,7 +74,6 @@ impl ProxyServer {
         let failover_manager = Arc::new(FailoverSwitchManager::new(db.clone()));
 
         let compaction_service = Arc::new(CompactionService::new(db.clone()));
-        let credential_pool = Arc::new(CredentialPool::new(db.clone()));
         let state = ProxyState {
             db,
             config: Arc::new(RwLock::new(config.clone())),
@@ -88,7 +84,6 @@ impl ProxyServer {
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             compaction_service,
-            credential_pool,
             app_handle,
             failover_manager,
         };
@@ -471,59 +466,6 @@ mod continuity_e2e_tests {
         }
     }
 
-    #[derive(Default)]
-    struct TestCredentialVault {
-        secrets: Mutex<HashMap<String, Vec<u8>>>,
-    }
-
-    impl crate::proxy::secret_vault::SecretVault for TestCredentialVault {
-        fn backend_name(&self) -> &'static str {
-            "e2e-memory"
-        }
-
-        fn store(
-            &self,
-            provider_id: &str,
-            credential_id: &str,
-            secret: &zeroize::Zeroizing<Vec<u8>>,
-        ) -> Result<crate::proxy::secret_vault::SecretReference, crate::error::AppError> {
-            let handle = format!("{provider_id}/{credential_id}");
-            self.secrets
-                .lock()
-                .unwrap()
-                .insert(handle.clone(), secret.to_vec());
-            Ok(crate::proxy::secret_vault::SecretReference::new(
-                self.backend_name(),
-                handle,
-            ))
-        }
-
-        fn load(
-            &self,
-            reference: &crate::proxy::secret_vault::SecretReference,
-        ) -> Result<zeroize::Zeroizing<Vec<u8>>, crate::error::AppError> {
-            self.secrets
-                .lock()
-                .unwrap()
-                .get(&reference.handle)
-                .cloned()
-                .map(zeroize::Zeroizing::new)
-                .ok_or_else(|| crate::error::AppError::Message("missing e2e secret".to_string()))
-        }
-
-        fn delete(
-            &self,
-            reference: &crate::proxy::secret_vault::SecretReference,
-        ) -> Result<(), crate::error::AppError> {
-            self.secrets.lock().unwrap().remove(&reference.handle);
-            Ok(())
-        }
-
-        fn available(&self) -> bool {
-            true
-        }
-    }
-
     async fn mock_chat(
         State(captured): State<Arc<Mutex<Vec<Value>>>>,
         Json(body): Json<Value>,
@@ -634,76 +576,6 @@ mod continuity_e2e_tests {
                 .expect("quota upstream server");
         });
         (format!("http://{address}"), state, shutdown_tx, task)
-    }
-
-    #[derive(Default)]
-    struct CredentialQuotaMockState {
-        authorization: Vec<String>,
-    }
-
-    async fn credential_quota_route(
-        State(state): State<Arc<Mutex<CredentialQuotaMockState>>>,
-        headers: axum::http::HeaderMap,
-        Json(_body): Json<Value>,
-    ) -> axum::response::Response {
-        let authorization = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        state
-            .lock()
-            .expect("credential quota state")
-            .authorization
-            .push(authorization.clone());
-        if authorization == "Bearer pool-a" {
-            return (
-                axum::http::StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({
-                    "error": {"code": "insufficient_quota"},
-                    "retry_after": 600
-                })),
-            )
-                .into_response();
-        }
-        Json(json!({
-            "id": "chatcmpl-pool",
-            "object": "chat.completion",
-            "model": "pool-chat",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "pool fallback succeeded"},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
-        }))
-        .into_response()
-    }
-
-    async fn start_credential_quota_upstream() -> (
-        String,
-        Arc<Mutex<CredentialQuotaMockState>>,
-        oneshot::Sender<()>,
-        JoinHandle<()>,
-    ) {
-        let state = Arc::new(Mutex::new(CredentialQuotaMockState::default()));
-        let app = Router::new()
-            .route("/v1/chat/completions", post(credential_quota_route))
-            .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind credential quota upstream");
-        let address = listener.local_addr().expect("credential quota address");
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .expect("credential quota upstream server");
-        });
-        (format!("http://{address}/v1"), state, shutdown_tx, task)
     }
 
     #[derive(Default)]
@@ -1052,89 +924,6 @@ mod continuity_e2e_tests {
 
         let _ = shutdown_tx.send(());
         upstream_task.await.expect("join quota upstream");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial]
-    async fn quota_429_rotates_credentials_inside_one_provider_end_to_end() {
-        let _environment = TestEnvironment::new();
-        let (upstream_url, captured, shutdown_tx, upstream_task) =
-            start_credential_quota_upstream().await;
-        let db = Arc::new(Database::init().expect("credential pool e2e database"));
-        let provider = crate::provider::Provider::with_id(
-            "credential-pool-provider".to_string(),
-            "Credential Pool Provider".to_string(),
-            json!({
-                "base_url": upstream_url,
-                "api_format": "openai_chat",
-                "auth": {"OPENAI_API_KEY": "legacy-must-not-be-used"}
-            }),
-            None,
-        );
-        db.save_provider("codex", &provider).unwrap();
-        select_codex_provider(&db, &provider.id);
-        let vault = Arc::new(TestCredentialVault::default());
-        let pool = Arc::new(crate::proxy::credential_pool::CredentialPool::with_vault(
-            db.clone(),
-            vault,
-        ));
-        for (label, secret, priority) in [("Pool A", "pool-a", 1), ("Pool B", "pool-b", 2)] {
-            pool.save(
-                crate::proxy::credential_pool::SaveProviderCredentialRequest {
-                    id: None,
-                    app_type: "codex".to_string(),
-                    provider_id: provider.id.clone(),
-                    kind: crate::proxy::secret_vault::CredentialKind::ApiKey,
-                    label: label.to_string(),
-                    secret: Some(secret.to_string()),
-                    enabled: true,
-                    priority,
-                    auth_header: Some("authorization".to_string()),
-                    auth_prefix: Some("Bearer ".to_string()),
-                    public_metadata: json!({}),
-                },
-            )
-            .unwrap();
-        }
-
-        let mut server = ProxyServer::new(test_proxy_config(), db.clone(), None);
-        server.state.credential_pool = pool;
-        let info = server.start().await.expect("start credential pool proxy");
-        let client = reqwest::Client::new();
-        for request_id in ["credential-pool-1", "credential-pool-2"] {
-            let response = client
-                .post(format!("http://127.0.0.1:{}/v1/responses", info.port))
-                .header("session-id", "credential-pool-session")
-                .header("x-client-request-id", request_id)
-                .json(&json!({
-                    "model": "pool-model",
-                    "stream": false,
-                    "input": [{"type":"message","role":"user","content":"review this"}]
-                }))
-                .send()
-                .await
-                .expect("credential pool request");
-            assert_eq!(response.status(), reqwest::StatusCode::OK);
-        }
-        server.stop().await.expect("stop credential pool proxy");
-
-        assert_eq!(
-            captured.lock().unwrap().authorization,
-            vec![
-                "Bearer pool-a".to_string(),
-                "Bearer pool-b".to_string(),
-                "Bearer pool-b".to_string()
-            ]
-        );
-        let latches = db
-            .active_quota_latches("codex", &chrono::Utc::now().to_rfc3339())
-            .unwrap();
-        assert_eq!(latches.len(), 1);
-        assert!(!latches[0].account_id.is_empty());
-        assert_ne!(latches[0].account_id, provider.id);
-
-        let _ = shutdown_tx.send(());
-        upstream_task.await.expect("join credential quota upstream");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

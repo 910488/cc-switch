@@ -1,4 +1,4 @@
-use crate::database::{CredentialQuotaSnapshotRow, Database, QuotaLatchRow};
+use crate::database::{Database, QuotaLatchRow};
 use crate::error::AppError;
 use crate::provider::Provider;
 use crate::proxy::ProxyError;
@@ -97,18 +97,6 @@ impl QuotaPolicy {
             detail_blob: None,
             updated_at: iso(now),
         })?;
-        if account_override.is_some() && self.db.provider_credential(&latch.account_id)?.is_some() {
-            self.db
-                .upsert_credential_quota_snapshot(&CredentialQuotaSnapshotRow {
-                    credential_id: latch.account_id.clone(),
-                    quota_kind: quota_kind.to_string(),
-                    remaining_ratio: Some(0.0),
-                    used_ratio: Some(1.0),
-                    reset_at: Some(iso(blocked_until)),
-                    detail_json: "{}".to_string(),
-                    queried_at: iso(now),
-                })?;
-        }
         Ok(Some(latch))
     }
 
