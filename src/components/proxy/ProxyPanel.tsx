@@ -616,9 +616,7 @@ export function ProxyPanel({
                     defaultValue:
                       "Materialize canonical context if the official compact endpoint fails.",
                   })}
-                  checked={
-                    continuitySettings?.officialCompactFallback ?? true
-                  }
+                  checked={continuitySettings?.officialCompactFallback ?? true}
                   disabled={updateContinuitySettings.isPending}
                   onCheckedChange={(checked) => {
                     if (!continuitySettings) return;

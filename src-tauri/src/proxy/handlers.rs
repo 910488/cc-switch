@@ -857,6 +857,7 @@ async fn handle_responses_for_app(
         .unwrap_or(false);
     let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
     let forwarder = ctx.create_forwarder(&state);
+    let all_providers = ctx.get_providers();
     if initial_realm == Some(ProviderRealm::Bridge) {
         if let Some(snapshot) = snapshot.as_ref() {
             return execute_local_compaction(
@@ -865,7 +866,7 @@ async fn handle_responses_for_app(
                 method.clone(),
                 &endpoint,
                 headers.clone(),
-                ctx.get_providers(),
+                all_providers,
                 tag,
                 ctx.app_config.non_streaming_timeout,
                 &state,
@@ -899,20 +900,56 @@ async fn handle_responses_for_app(
         )
         .await?;
     }
+    let (forward_providers, bridge_providers) = if is_compaction {
+        partition_compaction_providers(all_providers, &endpoint)
+    } else {
+        (all_providers, Vec::new())
+    };
     let mut result = match forwarder
         .forward_with_retry(
             &app_type,
-            method,
+            method.clone(),
             &endpoint,
             body.clone(),
-            headers,
+            headers.clone(),
             extensions,
-            ctx.get_providers(),
+            forward_providers,
         )
         .await
     {
         Ok(result) => result,
         Err(mut err) => {
+            if is_compaction
+                && rollout_mode.allows_cross_realm()
+                && !bridge_providers.is_empty()
+                && forwarder.can_fail_over_after(&err)
+            {
+                let snapshot = snapshot.as_ref().ok_or_else(|| {
+                    ProxyError::Internal(
+                        "official compaction fallback has no durable snapshot".to_string(),
+                    )
+                })?;
+                log::warn!(
+                    "[Compaction] official providers failed; continuing through hierarchical bridge execution"
+                );
+                return execute_local_compaction(
+                    &forwarder,
+                    &app_type,
+                    method.clone(),
+                    &endpoint,
+                    headers.clone(),
+                    bridge_providers,
+                    tag,
+                    ctx.app_config.non_streaming_timeout,
+                    &state,
+                    &continuity_context,
+                    snapshot,
+                    &body,
+                    false,
+                    is_stream,
+                )
+                .await;
+            }
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
@@ -1087,6 +1124,7 @@ async fn handle_responses_compact_for_app(
         .unwrap_or(false);
 
     let forwarder = ctx.create_forwarder(&state);
+    let all_providers = ctx.get_providers();
     if initial_realm == ProviderRealm::Bridge {
         let snapshot = snapshot.as_ref().ok_or_else(|| {
             ProxyError::Internal("bridge compaction journal was not captured".to_string())
@@ -1097,7 +1135,7 @@ async fn handle_responses_compact_for_app(
             method.clone(),
             &endpoint,
             headers.clone(),
-            ctx.get_providers(),
+            all_providers,
             tag,
             ctx.app_config.non_streaming_timeout,
             &state,
@@ -1109,20 +1147,52 @@ async fn handle_responses_compact_for_app(
         )
         .await;
     }
+    let (official_providers, bridge_providers) =
+        partition_compaction_providers(all_providers, &endpoint);
     let mut result = match forwarder
         .forward_with_retry(
             &app_type,
-            method,
+            method.clone(),
             &endpoint,
             body.clone(),
-            headers,
+            headers.clone(),
             extensions,
-            ctx.get_providers(),
+            official_providers,
         )
         .await
     {
         Ok(result) => result,
         Err(mut err) => {
+            if rollout_mode.allows_cross_realm()
+                && !bridge_providers.is_empty()
+                && forwarder.can_fail_over_after(&err)
+            {
+                let snapshot = snapshot.as_ref().ok_or_else(|| {
+                    ProxyError::Internal(
+                        "official compaction fallback has no durable snapshot".to_string(),
+                    )
+                })?;
+                log::warn!(
+                    "[Compaction] official compact endpoint failed; continuing through hierarchical bridge execution"
+                );
+                return execute_local_compaction(
+                    &forwarder,
+                    &app_type,
+                    method.clone(),
+                    &endpoint,
+                    headers.clone(),
+                    bridge_providers,
+                    tag,
+                    ctx.app_config.non_streaming_timeout,
+                    &state,
+                    &continuity_context,
+                    snapshot,
+                    &body,
+                    true,
+                    is_stream,
+                )
+                .await;
+            }
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
@@ -1312,6 +1382,16 @@ fn official_recompact_fallback(
             body: Some(error),
         })
     }
+}
+
+fn partition_compaction_providers(
+    providers: Vec<Provider>,
+    endpoint: &str,
+) -> (Vec<Provider>, Vec<Provider>) {
+    providers.into_iter().partition(|provider| {
+        !super::providers::should_convert_codex_responses_to_chat(provider, endpoint)
+            && !super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

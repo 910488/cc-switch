@@ -18,7 +18,7 @@ pub enum CompactionRolloutMode {
 
 impl CompactionRolloutMode {
     pub(crate) fn allows_bridge_compaction(self) -> bool {
-        matches!(Self::ThirdPartyOnly | Self::FullSwitching, self)
+        matches!(self, Self::ThirdPartyOnly | Self::FullSwitching)
     }
 
     pub(crate) fn allows_cross_realm(self) -> bool {

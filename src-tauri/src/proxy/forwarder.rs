@@ -1291,7 +1291,10 @@ impl RequestForwarder {
                     .is_some_and(|path| path.ends_with("/responses/compact"))
                     || CompactionService::is_compaction_request(body))
             {
-                mapped_body = CompactionService::prepare_local_summary_request(&mapped_body);
+                return Err(ProxyError::TransformError(
+                    "third-party compaction reached the forwarder without hierarchical execution"
+                        .to_string(),
+                ));
             }
         }
 
@@ -2641,6 +2644,18 @@ impl RequestForwarder {
                 );
                 false
             }
+        }
+    }
+
+    pub(crate) fn can_fail_over_after(&self, failure: &ForwardError) -> bool {
+        match failure.provider.as_ref() {
+            Some(provider) => {
+                self.categorize_proxy_error(&failure.error, provider) == ErrorCategory::Retryable
+            }
+            None => matches!(
+                &failure.error,
+                ProxyError::NoAvailableProvider | ProxyError::MaxRetriesExceeded
+            ),
         }
     }
 

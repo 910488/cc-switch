@@ -581,6 +581,7 @@ mod continuity_e2e_tests {
     struct RealmMockState {
         chat_requests: Vec<Value>,
         native_requests: Vec<Value>,
+        failed_native_requests: usize,
     }
 
     async fn realm_chat(
@@ -644,6 +645,25 @@ mod continuity_e2e_tests {
         }))
     }
 
+    async fn realm_native_compact_unavailable(
+        State(state): State<Arc<Mutex<RealmMockState>>>,
+        Json(body): Json<Value>,
+    ) -> (axum::http::StatusCode, Json<Value>) {
+        let mut state = state.lock().expect("realm state");
+        state.failed_native_requests += 1;
+        state.native_requests.push(body);
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": {
+                    "type": "insufficient_quota",
+                    "code": "usage_limit_reached",
+                    "message": "official compaction quota exhausted"
+                }
+            })),
+        )
+    }
+
     async fn streaming_native_compact(Json(_body): Json<Value>) -> axum::response::Response {
         let frames = vec![
             (
@@ -682,6 +702,10 @@ mod continuity_e2e_tests {
             .route("/chat/v1/chat/completions", post(realm_chat))
             .route("/native/v1/responses/compact", post(realm_native_compact))
             .route("/native/v1/responses", post(realm_native_response))
+            .route(
+                "/failing-native/v1/responses/compact",
+                post(realm_native_compact_unavailable),
+            )
             .route(
                 "/stream/v1/responses/compact",
                 post(streaming_native_compact),
@@ -1020,6 +1044,92 @@ mod continuity_e2e_tests {
 
         let _ = shutdown_tx.send(());
         upstream_task.await.expect("join realm upstream");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn official_compact_failure_uses_hierarchical_bridge_executor_end_to_end() {
+        let _environment = TestEnvironment::new();
+        let (origin, captured, shutdown_tx, upstream_task) = start_realm_upstream().await;
+        let db = Arc::new(Database::init().expect("hierarchical failover database"));
+        for (id, suffix, api_format, order) in [
+            (
+                "hierarchical-native",
+                "failing-native",
+                "openai_responses",
+                1,
+            ),
+            ("hierarchical-chat", "chat", "openai_chat", 2),
+        ] {
+            let mut provider = crate::provider::Provider::with_id(
+                id.to_string(),
+                id.to_string(),
+                json!({
+                    "base_url": format!("{origin}/{suffix}/v1"),
+                    "api_format": api_format,
+                    "auth": {"OPENAI_API_KEY": "hierarchical-e2e-key"}
+                }),
+                None,
+            );
+            provider.sort_index = Some(order);
+            db.save_provider("codex", &provider).unwrap();
+            db.add_to_failover_queue("codex", id).unwrap();
+        }
+        select_codex_provider(&db, "hierarchical-native");
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+
+        let server = ProxyServer::new(test_proxy_config(), db, None);
+        let info = server.start().await.expect("start hierarchical proxy");
+        let client = reqwest::Client::new();
+        let input = (0..6)
+            .map(|index| {
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": format!("HIERARCHICAL_SEGMENT_{index}_{}", "x".repeat(220_000))
+                    }]
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/responses/compact",
+                info.port
+            ))
+            .header("thread-id", "hierarchical-failover-thread")
+            .header("session-id", "hierarchical-failover-session")
+            .json(&json!({
+                "model": "large-context-model",
+                "stream": false,
+                "input": input
+            }))
+            .send()
+            .await
+            .expect("hierarchical compact request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let response_body: Value = response.json().await.expect("hierarchical compact json");
+        assert!(response_body["output"][0]["encrypted_content"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("bcmp1.")));
+        server.stop().await.expect("stop hierarchical proxy");
+
+        let state = captured.lock().expect("hierarchical captured state");
+        assert_eq!(state.failed_native_requests, 1);
+        assert!(
+            state.chat_requests.len() >= 2,
+            "large context must make chunk calls followed by a final handoff call"
+        );
+        let final_request = state.chat_requests.last().unwrap().to_string();
+        assert!(final_request.contains("Earlier chronological checkpoint"));
+        assert!(!final_request.contains("Older chronological segment"));
+        drop(state);
+
+        let _ = shutdown_tx.send(());
+        upstream_task.await.expect("join hierarchical upstream");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

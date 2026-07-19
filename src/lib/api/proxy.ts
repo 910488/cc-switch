@@ -31,9 +31,7 @@ export const proxyApi = {
     return invoke("get_continuity_settings");
   },
 
-  async updateContinuitySettings(
-    settings: CompactionSettings,
-  ): Promise<void> {
+  async updateContinuitySettings(settings: CompactionSettings): Promise<void> {
     return invoke("update_continuity_settings", { settings });
   },
 

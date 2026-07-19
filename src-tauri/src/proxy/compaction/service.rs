@@ -194,12 +194,6 @@ impl CompactionService {
             })
     }
 
-    pub(crate) fn prepare_local_summary_request(body: &Value) -> Value {
-        let canonical = canonical_snapshot_body(body);
-        let prepared = super::planner::prepare_single_summary_body(&canonical);
-        Self::prepare_local_summary_request_with(&prepared, COMPACTION_SUMMARY_INSTRUCTIONS, 8_000)
-    }
-
     pub(crate) fn prepare_local_summary_request_with(
         body: &Value,
         prompt: &str,
