@@ -234,6 +234,7 @@ impl RequestContext {
             state.gemini_shadow.clone(),
             state.codex_chat_history.clone(),
             state.compaction_service.clone(),
+            state.credential_pool.clone(),
             state.failover_manager.clone(),
             state.app_handle.clone(),
             self.current_provider_id.clone(),

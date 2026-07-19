@@ -136,14 +136,15 @@ impl ProviderRouter {
         self.quota_policy.is_provider_latched(app_type, provider_id)
     }
 
-    pub(crate) fn record_quota_error(
+    pub(crate) fn record_quota_error_for_account(
         &self,
         app_type: &str,
         provider: &Provider,
         error: &ProxyError,
+        account_id: Option<&str>,
     ) -> Result<Option<QuotaLatch>, AppError> {
         self.quota_policy
-            .record_from_error(app_type, provider, error)
+            .record_from_error_for_account(app_type, provider, error, account_id)
     }
 
     /// 请求执行前获取熔断器“放行许可”
@@ -492,13 +493,14 @@ mod tests {
 
         let router = ProviderRouter::new(db.clone());
         router
-            .record_quota_error(
+            .record_quota_error_for_account(
                 "codex",
                 &provider_a,
                 &ProxyError::UpstreamError {
                     status: 429,
                     body: Some("{\"error\":{\"code\":\"insufficient_quota\"}}".to_string()),
                 },
+                None,
             )
             .unwrap();
 

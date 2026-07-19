@@ -86,6 +86,7 @@ import {
   ProviderAdvancedConfig,
   type PricingModelSourceOption,
 } from "./ProviderAdvancedConfig";
+import { CredentialPoolSection } from "./CredentialPoolSection";
 import {
   useProviderCategory,
   useApiKeyState,
@@ -2489,6 +2490,10 @@ function ProviderFormFull({
                 onPricingConfigChange={setPricingConfig}
               />
             )}
+
+          {isEditMode && providerId && (
+            <CredentialPoolSection appType={appId} providerId={providerId} />
+          )}
 
           {showButtons && (
             <div className="flex justify-end gap-2">

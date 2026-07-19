@@ -8,6 +8,7 @@ pub mod circuit_breaker;
 pub(crate) mod compaction;
 pub(crate) mod content_encoding;
 pub mod copilot_optimizer;
+pub(crate) mod credential_pool;
 pub mod error;
 pub mod error_mapper;
 pub(crate) mod failover_switch;

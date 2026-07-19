@@ -27,6 +27,8 @@ const SYNC_SKIP_TABLES: &[&str] = &[
     "compaction_migrations",
     "compaction_task_states",
     "quota_latches",
+    "provider_credentials",
+    "credential_quota_snapshots",
 ];
 
 /// Tables whose local data is preserved (restored from local snapshot) during WebDAV import.
@@ -41,6 +43,8 @@ const SYNC_PRESERVE_TABLES: &[&str] = &[
     "compaction_migrations",
     "compaction_task_states",
     "quota_latches",
+    "provider_credentials",
+    "credential_quota_snapshots",
 ];
 
 /// A database backup entry for the UI

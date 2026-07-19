@@ -52,6 +52,65 @@ export interface CompactionSettings {
   officialCompactFallback: boolean;
 }
 
+export type ProviderCredentialKind = "oauth" | "api_key" | "token";
+
+export interface ProviderCredentialQuota {
+  quotaKind: string;
+  remainingRatio: number | null;
+  usedRatio: number | null;
+  resetAt: string | null;
+  detail: Record<string, unknown> | null;
+  queriedAt: string;
+}
+
+export interface ProviderCredential {
+  id: string;
+  appType: string;
+  providerId: string;
+  kind: ProviderCredentialKind;
+  label: string;
+  maskedHint: string;
+  enabled: boolean;
+  priority: number;
+  authHeader: string;
+  authPrefix: string;
+  publicMetadata: Record<string, unknown> | null;
+  status: "unknown" | "valid" | "invalid" | "warning";
+  lastErrorCode: string | null;
+  lastUsedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  quotas: ProviderCredentialQuota[];
+}
+
+export interface ProviderCredentialPool {
+  vaultAvailable: boolean;
+  credentials: ProviderCredential[];
+}
+
+export interface SaveProviderCredentialRequest {
+  id?: string;
+  appType: string;
+  providerId: string;
+  kind: ProviderCredentialKind;
+  label: string;
+  secret?: string;
+  enabled: boolean;
+  priority: number;
+  authHeader?: string;
+  authPrefix?: string;
+  publicMetadata?: Record<string, unknown>;
+}
+
+export interface SaveProviderCredentialQuotaRequest {
+  credentialId: string;
+  quotaKind: string;
+  remainingRatio: number | null;
+  usedRatio: number | null;
+  resetAt: string | null;
+  detail?: Record<string, unknown>;
+}
+
 export interface ActiveTarget {
   app_type: string;
   provider_name: string;

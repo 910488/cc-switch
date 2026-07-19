@@ -6,6 +6,7 @@ use crate::error::AppError;
 use crate::proxy::types::*;
 use crate::proxy::{CircuitBreakerConfig, CircuitBreakerStats};
 use crate::store::AppState;
+use serde::Serialize;
 use std::str::FromStr;
 
 /// 启动代理服务器（仅启动服务，不接管 Live 配置）
@@ -84,6 +85,71 @@ pub async fn update_continuity_settings(
 ) -> Result<(), String> {
     crate::proxy::compaction::CompactionService::new(state.db.clone())
         .update_settings(&settings)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCredentialPoolResponse {
+    vault_available: bool,
+    credentials: Vec<crate::proxy::credential_pool::ProviderCredentialView>,
+}
+
+#[tauri::command]
+pub async fn list_provider_credentials(
+    state: tauri::State<'_, AppState>,
+    app_type: String,
+    provider_id: String,
+) -> Result<ProviderCredentialPoolResponse, String> {
+    let pool = crate::proxy::credential_pool::CredentialPool::new(state.db.clone());
+    Ok(ProviderCredentialPoolResponse {
+        vault_available: pool.vault_available(),
+        credentials: pool
+            .list(&app_type, &provider_id)
+            .map_err(|error| error.to_string())?,
+    })
+}
+
+#[tauri::command]
+pub async fn save_provider_credential(
+    state: tauri::State<'_, AppState>,
+    request: crate::proxy::credential_pool::SaveProviderCredentialRequest,
+) -> Result<crate::proxy::credential_pool::ProviderCredentialView, String> {
+    crate::proxy::credential_pool::CredentialPool::new(state.db.clone())
+        .save(request)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_provider_credential(
+    state: tauri::State<'_, AppState>,
+    credential_id: String,
+) -> Result<bool, String> {
+    crate::proxy::credential_pool::CredentialPool::new(state.db.clone())
+        .delete(&credential_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn update_provider_credential_status(
+    state: tauri::State<'_, AppState>,
+    credential_id: String,
+    enabled: bool,
+    status: String,
+    error_code: Option<String>,
+) -> Result<(), String> {
+    crate::proxy::credential_pool::CredentialPool::new(state.db.clone())
+        .set_status(&credential_id, enabled, &status, error_code.as_deref())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn update_provider_credential_quota(
+    state: tauri::State<'_, AppState>,
+    request: crate::proxy::credential_pool::SaveCredentialQuotaRequest,
+) -> Result<(), String> {
+    crate::proxy::credential_pool::CredentialPool::new(state.db.clone())
+        .save_quota(request)
         .map_err(|error| error.to_string())
 }
 

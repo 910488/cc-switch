@@ -30,13 +30,22 @@ impl CompactionRolloutMode {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionSettings {
     #[serde(default)]
     pub rollout_mode: CompactionRolloutMode,
     #[serde(default = "default_true")]
     pub official_compact_fallback: bool,
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        Self {
+            rollout_mode: CompactionRolloutMode::FullSwitching,
+            official_compact_fallback: true,
+        }
+    }
 }
 
 fn default_true() -> bool {

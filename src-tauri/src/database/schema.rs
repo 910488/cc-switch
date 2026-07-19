@@ -328,6 +328,7 @@ impl Database {
         // queryable. Keep these table names compatible with the standalone bridge
         // so its behavioral fixtures can be reused during the migration.
         Self::create_compaction_tables(conn)?;
+        Self::create_credential_pool_tables(conn)?;
 
         // 修复跑过未发布开发版的库：current 标记曾是全局 key，现按应用分组
         // （随 v12 定稿为 current_profile_id_<scope>，不单独 bump 版本）
@@ -516,6 +517,13 @@ impl Database {
                         log::info!("迁移数据库从 v15 到 v16（添加 Codex continuity journal）");
                         Self::migrate_v15_to_v16(conn)?;
                         Self::set_user_version(conn, 16)?;
+                    }
+                    16 => {
+                        log::info!(
+                            "Migrating database from v16 to v17 (provider credential pools)"
+                        );
+                        Self::migrate_v16_to_v17(conn)?;
+                        Self::set_user_version(conn, 17)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1525,6 +1533,10 @@ impl Database {
         Self::create_compaction_tables(conn)
     }
 
+    fn migrate_v16_to_v17(conn: &Connection) -> Result<(), AppError> {
+        Self::create_credential_pool_tables(conn)
+    }
+
     fn create_compaction_tables(conn: &Connection) -> Result<(), AppError> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS compaction_snapshots (
@@ -1601,6 +1613,51 @@ impl Database {
                 ON quota_latches(app_type, blocked_until);",
         )
         .map_err(|e| AppError::Database(format!("创建 Codex continuity tables 失败: {e}")))
+    }
+
+    fn create_credential_pool_tables(conn: &Connection) -> Result<(), AppError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS provider_credentials (
+                id TEXT PRIMARY KEY,
+                app_type TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('oauth', 'api_key', 'token')),
+                label TEXT NOT NULL,
+                masked_hint TEXT NOT NULL,
+                secret_backend TEXT NOT NULL,
+                secret_handle TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                priority INTEGER NOT NULL DEFAULT 100,
+                auth_header TEXT NOT NULL DEFAULT 'authorization',
+                auth_prefix TEXT NOT NULL DEFAULT 'Bearer ',
+                public_metadata TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'unknown',
+                last_error_code TEXT,
+                last_used_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(provider_id, app_type) REFERENCES providers(id, app_type) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_credentials_route
+                ON provider_credentials(app_type, provider_id, enabled, priority, last_used_at);
+
+            CREATE TABLE IF NOT EXISTS credential_quota_snapshots (
+                credential_id TEXT NOT NULL,
+                quota_kind TEXT NOT NULL,
+                remaining_ratio REAL,
+                used_ratio REAL,
+                reset_at TEXT,
+                detail_json TEXT NOT NULL DEFAULT '{}',
+                queried_at TEXT NOT NULL,
+                PRIMARY KEY(credential_id, quota_kind),
+                FOREIGN KEY(credential_id) REFERENCES provider_credentials(id) ON DELETE CASCADE,
+                CHECK(remaining_ratio IS NULL OR (remaining_ratio >= 0.0 AND remaining_ratio <= 1.0)),
+                CHECK(used_ratio IS NULL OR (used_ratio >= 0.0 AND used_ratio <= 1.0))
+            );
+            CREATE INDEX IF NOT EXISTS idx_credential_quota_reset
+                ON credential_quota_snapshots(reset_at, queried_at);",
+        )
+        .map_err(|e| AppError::Database(format!("failed to create credential pool tables: {e}")))
     }
 
     /// 插入默认模型定价数据
@@ -3147,6 +3204,31 @@ mod tests {
             &conn,
             "compaction_migrations",
             "prompt_version"
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v16_to_v17_creates_local_credential_pool_schema() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute("PRAGMA foreign_keys = ON", [])?;
+        Database::set_user_version(&conn, 16)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        for table in ["provider_credentials", "credential_quota_snapshots"] {
+            assert!(Database::table_exists(&conn, table)?, "missing {table}");
+        }
+        assert!(Database::has_column(
+            &conn,
+            "provider_credentials",
+            "secret_handle"
+        )?);
+        assert!(Database::has_column(
+            &conn,
+            "credential_quota_snapshots",
+            "remaining_ratio"
         )?);
         Ok(())
     }

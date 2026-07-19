@@ -1378,6 +1378,11 @@ pub fn run() {
             commands::get_proxy_status,
             commands::get_continuity_settings,
             commands::update_continuity_settings,
+            commands::list_provider_credentials,
+            commands::save_provider_credential,
+            commands::delete_provider_credential,
+            commands::update_provider_credential_status,
+            commands::update_provider_credential_quota,
             commands::get_proxy_config,
             commands::update_proxy_config,
             // Global & Per-App Config

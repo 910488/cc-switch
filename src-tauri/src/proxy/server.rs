@@ -10,6 +10,7 @@
 
 use super::{
     compaction::CompactionService,
+    credential_pool::CredentialPool,
     failover_switch::FailoverSwitchManager,
     handlers,
     log_codes::srv as log_srv,
@@ -47,6 +48,8 @@ pub struct ProxyState {
     pub codex_chat_history: Arc<CodexChatHistoryStore>,
     /// Durable encrypted journal used to keep Codex context valid while providers change.
     pub compaction_service: Arc<CompactionService>,
+    /// Secure per-provider credential pools and quota-aware account selection.
+    pub credential_pool: Arc<CredentialPool>,
     /// AppHandle，用于发射事件和更新托盘菜单
     pub app_handle: Option<tauri::AppHandle>,
     /// 故障转移切换管理器
@@ -74,6 +77,7 @@ impl ProxyServer {
         let failover_manager = Arc::new(FailoverSwitchManager::new(db.clone()));
 
         let compaction_service = Arc::new(CompactionService::new(db.clone()));
+        let credential_pool = Arc::new(CredentialPool::new(db.clone()));
         let state = ProxyState {
             db,
             config: Arc::new(RwLock::new(config.clone())),
@@ -84,6 +88,7 @@ impl ProxyServer {
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             compaction_service,
+            credential_pool,
             app_handle,
             failover_manager,
         };
@@ -606,14 +611,12 @@ mod continuity_e2e_tests {
         State(state): State<Arc<Mutex<RealmMockState>>>,
         Json(body): Json<Value>,
     ) -> Json<Value> {
-        state
-            .lock()
-            .expect("realm state")
-            .native_requests
-            .push(body);
+        let mut state = state.lock().expect("realm state");
+        state.native_requests.push(body);
+        let id = format!("cmp_native_e2e_{}", state.native_requests.len());
         Json(json!({
             "output": [{
-                "id": "cmp_native_e2e",
+                "id": id,
                 "type": "compaction",
                 "encrypted_content": "opaque-native-e2e"
             }]

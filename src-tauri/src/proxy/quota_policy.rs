@@ -1,4 +1,4 @@
-use crate::database::{Database, QuotaLatchRow};
+use crate::database::{CredentialQuotaSnapshotRow, Database, QuotaLatchRow};
 use crate::error::AppError;
 use crate::provider::Provider;
 use crate::proxy::ProxyError;
@@ -30,11 +30,12 @@ impl QuotaPolicy {
         matches!(error, ProxyError::UpstreamError { status: 429, .. })
     }
 
-    pub(crate) fn record_from_error(
+    pub(crate) fn record_from_error_for_account(
         &self,
         app_type: &str,
         provider: &Provider,
         error: &ProxyError,
+        account_override: Option<&str>,
     ) -> Result<Option<QuotaLatch>, AppError> {
         let ProxyError::UpstreamError { status: 429, body } = error else {
             return Ok(None);
@@ -63,10 +64,14 @@ impl QuotaPolicy {
         } else {
             "rate_limit"
         };
-        let account_id = provider
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+        let account_id = account_override
+            .map(ToString::to_string)
+            .or_else(|| {
+                provider
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+            })
             .or_else(|| {
                 provider
                     .meta
@@ -92,6 +97,18 @@ impl QuotaPolicy {
             detail_blob: None,
             updated_at: iso(now),
         })?;
+        if account_override.is_some() && self.db.provider_credential(&latch.account_id)?.is_some() {
+            self.db
+                .upsert_credential_quota_snapshot(&CredentialQuotaSnapshotRow {
+                    credential_id: latch.account_id.clone(),
+                    quota_kind: quota_kind.to_string(),
+                    remaining_ratio: Some(0.0),
+                    used_ratio: Some(1.0),
+                    reset_at: Some(iso(blocked_until)),
+                    detail_json: "{}".to_string(),
+                    queried_at: iso(now),
+                })?;
+        }
         Ok(Some(latch))
     }
 
@@ -102,6 +119,7 @@ impl QuotaPolicy {
             .db
             .active_quota_latches(app_type, &now)?
             .into_iter()
+            .filter(|row| row.account_id.is_empty())
             .map(|row| row.provider_id)
             .collect())
     }
@@ -198,7 +216,7 @@ mod tests {
         db.save_provider("codex", &provider).unwrap();
         let policy = QuotaPolicy::new(db.clone());
         let latch = policy
-            .record_from_error(
+            .record_from_error_for_account(
                 "codex",
                 &provider,
                 &ProxyError::UpstreamError {
@@ -208,6 +226,7 @@ mod tests {
                             .to_string(),
                     ),
                 },
+                None,
             )
             .unwrap()
             .unwrap();
@@ -215,6 +234,34 @@ mod tests {
         assert!(policy.is_provider_latched("codex", "quota-a").unwrap());
         let recreated = QuotaPolicy::new(db);
         assert!(recreated.is_provider_latched("codex", "quota-a").unwrap());
+    }
+
+    #[test]
+    fn account_latch_does_not_disable_the_whole_provider() {
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = provider("quota-pool");
+        db.save_provider("codex", &provider).unwrap();
+        let policy = QuotaPolicy::new(db.clone());
+        policy
+            .record_from_error_for_account(
+                "codex",
+                &provider,
+                &ProxyError::UpstreamError {
+                    status: 429,
+                    body: Some("{\"error\":{\"code\":\"insufficient_quota\"}}".to_string()),
+                },
+                Some("credential-a"),
+            )
+            .unwrap();
+        assert!(!policy.is_provider_latched("codex", "quota-pool").unwrap());
+        assert_eq!(
+            db.active_quota_latches("codex", &iso(Utc::now()))
+                .unwrap()
+                .first()
+                .unwrap()
+                .account_id,
+            "credential-a"
+        );
     }
 
     #[test]
