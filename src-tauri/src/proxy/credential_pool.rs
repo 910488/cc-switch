@@ -17,7 +17,7 @@ use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CredentialQuotaView {
+pub struct CredentialQuotaView {
     pub quota_kind: String,
     pub remaining_ratio: Option<f64>,
     pub used_ratio: Option<f64>,
@@ -28,7 +28,7 @@ pub(crate) struct CredentialQuotaView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ProviderCredentialView {
+pub struct ProviderCredentialView {
     pub id: String,
     pub app_type: String,
     pub provider_id: String,
@@ -50,7 +50,7 @@ pub(crate) struct ProviderCredentialView {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SaveProviderCredentialRequest {
+pub struct SaveProviderCredentialRequest {
     pub id: Option<String>,
     pub app_type: String,
     pub provider_id: String,
@@ -69,7 +69,7 @@ pub(crate) struct SaveProviderCredentialRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SaveCredentialQuotaRequest {
+pub struct SaveCredentialQuotaRequest {
     pub credential_id: String,
     pub quota_kind: String,
     pub remaining_ratio: Option<f64>,

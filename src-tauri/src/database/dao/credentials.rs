@@ -170,6 +170,13 @@ impl Database {
                        AND l.account_id = c.id
                        AND (l.blocked_until IS NULL OR l.blocked_until > ?3)
                    )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM credential_quota_snapshots exhausted
+                     WHERE exhausted.credential_id = c.id
+                       AND exhausted.remaining_ratio IS NOT NULL
+                       AND exhausted.remaining_ratio <= 0.0
+                       AND (exhausted.reset_at IS NULL OR exhausted.reset_at > ?3)
+                   )
                  ORDER BY
                    COALESCE((
                      SELECT MIN(q.remaining_ratio)
@@ -424,6 +431,67 @@ mod tests {
                 .unwrap()
                 .id,
             "cred-a"
+        );
+    }
+
+    #[test]
+    fn selection_proactively_skips_exhausted_quota_snapshots() {
+        let db = Database::memory().unwrap();
+        db.save_provider(
+            "codex",
+            &Provider::with_id(
+                "pool-provider".to_string(),
+                "Pool Provider".to_string(),
+                json!({"base_url":"https://example.invalid/v1"}),
+                None,
+            ),
+        )
+        .unwrap();
+        let now = "2026-07-19T00:00:00Z";
+        db.upsert_provider_credential(&row("exhausted", 1, now))
+            .unwrap();
+        db.upsert_provider_credential(&row("available", 2, now))
+            .unwrap();
+        db.upsert_credential_quota_snapshot(&CredentialQuotaSnapshotRow {
+            credential_id: "exhausted".to_string(),
+            quota_kind: "five_hour".to_string(),
+            remaining_ratio: Some(0.0),
+            used_ratio: Some(1.0),
+            reset_at: Some("2026-07-19T05:00:00Z".to_string()),
+            detail_json: "{}".to_string(),
+            queried_at: now.to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.available_provider_credential("codex", "pool-provider", now)
+                .unwrap()
+                .unwrap()
+                .id,
+            "available"
+        );
+
+        db.upsert_credential_quota_snapshot(&CredentialQuotaSnapshotRow {
+            credential_id: "available".to_string(),
+            quota_kind: "weekly".to_string(),
+            remaining_ratio: Some(0.0),
+            used_ratio: Some(1.0),
+            reset_at: Some("2026-07-26T00:00:00Z".to_string()),
+            detail_json: "{}".to_string(),
+            queried_at: now.to_string(),
+        })
+        .unwrap();
+        assert!(db
+            .available_provider_credential("codex", "pool-provider", now)
+            .unwrap()
+            .is_none());
+
+        assert_eq!(
+            db.available_provider_credential("codex", "pool-provider", "2026-07-27T00:00:00Z")
+                .unwrap()
+                .unwrap()
+                .id,
+            "exhausted"
         );
     }
 }

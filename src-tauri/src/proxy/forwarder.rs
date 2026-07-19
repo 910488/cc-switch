@@ -1850,7 +1850,7 @@ impl RequestForwarder {
                 !name.as_str().eq_ignore_ascii_case("authorization")
                     && !name.as_str().eq_ignore_ascii_case("x-api-key")
                     && !name.as_str().eq_ignore_ascii_case("x-goog-api-key")
-                    && name != &header_name
+                    && name != header_name
             });
             auth_headers.push((header_name, header_value));
             log::debug!(
