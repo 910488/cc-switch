@@ -99,7 +99,7 @@ impl CredentialPool {
     }
 
     #[cfg(test)]
-    fn with_vault(db: Arc<Database>, vault: Arc<dyn SecretVault>) -> Self {
+    pub(crate) fn with_vault(db: Arc<Database>, vault: Arc<dyn SecretVault>) -> Self {
         Self {
             db,
             vault: Some(vault),

@@ -118,6 +118,21 @@ impl CompactionService {
         self.db.set_setting("codex_compaction_settings", &raw)
     }
 
+    pub(crate) fn recent_tasks(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<super::model::CompactionTaskState>, AppError> {
+        self.store()?.recent_task_states(limit.clamp(1, 200))
+    }
+
+    pub(crate) fn delete_thread(&self, thread_id: &str) -> Result<usize, AppError> {
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            return Err(AppError::InvalidInput("thread id is required".to_string()));
+        }
+        self.store()?.delete_thread(thread_id)
+    }
+
     pub(crate) fn rollout_mode(&self) -> CompactionRolloutMode {
         self.settings()
             .map(|settings| settings.rollout_mode)
@@ -261,6 +276,70 @@ impl CompactionService {
             updated_at: now_iso(),
         })?;
         Ok(snapshot)
+    }
+
+    pub(crate) fn record_summary_progress(
+        &self,
+        context: &CompactionContext,
+        snapshot: &Snapshot,
+        progress: &super::executor::SummaryProgress,
+    ) -> Result<(), AppError> {
+        self.store()?.save_task_state(&CompactionTaskState {
+            thread_id: context.thread_id.clone(),
+            session_id: context.session_id.clone(),
+            compaction_id: None,
+            model: snapshot.source_model.clone(),
+            realm: "bridge".to_string(),
+            state: "working".to_string(),
+            phase: progress.phase.clone(),
+            journal_saved: true,
+            summary_created: false,
+            resume_verified: false,
+            original_context_retained: true,
+            error_code: None,
+            strategy: Some(progress.strategy.clone()),
+            input_tokens_before: snapshot.token_estimate.max(0) as usize,
+            summary_tokens: 0,
+            chunks_completed: progress.chunks_completed,
+            chunks_total: progress.chunks_total,
+            retry_count: progress.retries,
+            overflow_retry_count: progress.retries,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            provider_id: None,
+            updated_at: now_iso(),
+        })
+    }
+
+    pub(crate) fn record_summary_failure(
+        &self,
+        context: &CompactionContext,
+        snapshot: &Snapshot,
+        error: &super::executor::SummaryCallError,
+    ) -> Result<(), AppError> {
+        self.store()?.save_task_state(&CompactionTaskState {
+            thread_id: context.thread_id.clone(),
+            session_id: context.session_id.clone(),
+            compaction_id: None,
+            model: snapshot.source_model.clone(),
+            realm: "bridge".to_string(),
+            state: "error".to_string(),
+            phase: "summary_failed".to_string(),
+            journal_saved: true,
+            summary_created: false,
+            resume_verified: false,
+            original_context_retained: true,
+            error_code: Some(if error.context_overflow {
+                "context_overflow_exhausted".to_string()
+            } else {
+                "summary_upstream_failed".to_string()
+            }),
+            strategy: Some("hierarchical".to_string()),
+            input_tokens_before: snapshot.token_estimate.max(0) as usize,
+            updated_at: now_iso(),
+            ..Default::default()
+        })
     }
 
     pub(crate) fn create_bridge_compaction(
@@ -553,6 +632,44 @@ impl CompactionService {
             target.provider_id
         );
         Ok(())
+    }
+
+    pub(crate) fn record_official_recompact_failure(
+        &self,
+        plan: &OfficialRecompactPlan,
+        fallback_used: bool,
+    ) -> Result<(), AppError> {
+        self.store()?.save_task_state(&CompactionTaskState {
+            thread_id: plan.snapshot.thread_id.clone(),
+            session_id: plan.snapshot.session_id.clone(),
+            compaction_id: Some(plan.source_compaction_id.clone()),
+            model: plan.snapshot.source_model.clone(),
+            realm: "official".to_string(),
+            state: if fallback_used { "warning" } else { "error" }.to_string(),
+            phase: if fallback_used {
+                "official_recompact_fallback"
+            } else {
+                "official_recompact_failed"
+            }
+            .to_string(),
+            journal_saved: true,
+            summary_created: true,
+            resume_verified: false,
+            original_context_retained: true,
+            error_code: Some("official_compact_failed".to_string()),
+            strategy: Some(
+                if fallback_used {
+                    "canonical_fallback"
+                } else {
+                    "official_recompact"
+                }
+                .to_string(),
+            ),
+            input_tokens_before: plan.snapshot.token_estimate.max(0) as usize,
+            provider_id: None,
+            updated_at: now_iso(),
+            ..Default::default()
+        })
     }
 
     fn materialize_items(

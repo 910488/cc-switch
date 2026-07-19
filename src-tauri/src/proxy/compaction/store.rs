@@ -317,7 +317,6 @@ impl CompactionStore {
         )
     }
 
-    #[allow(dead_code)]
     pub(crate) fn recent_task_states(
         &self,
         limit: usize,
@@ -408,7 +407,6 @@ impl CompactionStore {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn delete_thread(&self, thread_id: &str) -> Result<usize, AppError> {
         self.db.delete_compaction_thread(thread_id)
     }

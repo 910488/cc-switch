@@ -7,6 +7,7 @@ import type {
   GlobalProxyConfig,
   AppProxyConfig,
   CompactionSettings,
+  ContinuityTaskState,
   ProviderCredential,
   ProviderCredentialPool,
   SaveProviderCredentialQuotaRequest,
@@ -37,6 +38,14 @@ export const proxyApi = {
 
   async updateContinuitySettings(settings: CompactionSettings): Promise<void> {
     return invoke("update_continuity_settings", { settings });
+  },
+
+  async getContinuityTasks(limit = 20): Promise<ContinuityTaskState[]> {
+    return invoke("get_continuity_tasks", { limit });
+  },
+
+  async deleteContinuityThread(threadId: string): Promise<number> {
+    return invoke("delete_continuity_thread", { threadId });
   },
 
   async listProviderCredentials(

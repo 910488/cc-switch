@@ -88,6 +88,26 @@ pub async fn update_continuity_settings(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+pub async fn get_continuity_tasks(
+    state: tauri::State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::proxy::compaction::model::CompactionTaskState>, String> {
+    crate::proxy::compaction::CompactionService::new(state.db.clone())
+        .recent_tasks(limit.unwrap_or(20))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_continuity_thread(
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+) -> Result<usize, String> {
+    crate::proxy::compaction::CompactionService::new(state.db.clone())
+        .delete_thread(&thread_id)
+        .map_err(|error| error.to_string())
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderCredentialPoolResponse {

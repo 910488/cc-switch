@@ -10,6 +10,7 @@ import {
   Zap,
   Power,
   ShieldCheck,
+  Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -28,6 +29,8 @@ import {
   useUpdateGlobalProxyConfig,
   useContinuitySettings,
   useUpdateContinuitySettings,
+  useContinuityTasks,
+  useDeleteContinuityThread,
 } from "@/lib/query/proxy";
 import type { CompactionRolloutMode, ProxyStatus } from "@/types/proxy";
 import { useTranslation } from "react-i18next";
@@ -59,6 +62,8 @@ export function ProxyPanel({
   const updateGlobalConfig = useUpdateGlobalProxyConfig();
   const { data: continuitySettings } = useContinuitySettings();
   const updateContinuitySettings = useUpdateContinuitySettings();
+  const { data: continuityTasks = [] } = useContinuityTasks(isRunning);
+  const deleteContinuityThread = useDeleteContinuityThread();
 
   // 监听地址/端口的本地状态（端口用字符串以支持完全清空）
   const [listenAddress, setListenAddress] = useState("127.0.0.1");
@@ -139,6 +144,22 @@ export function ProxyPanel({
           defaultValue: "Continuity rollout mode updated",
         }),
       );
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+    }
+  };
+
+  const handleDeleteContinuityThread = async (threadId: string) => {
+    if (
+      !window.confirm(
+        "刪除這個 task 的 encrypted journal？刪除後無法再從既有 compaction token 恢復。",
+      )
+    ) {
+      return;
+    }
+    try {
+      await deleteContinuityThread.mutateAsync(threadId);
+      toast.success("Continuity task 已刪除");
     } catch (error) {
       toast.error(extractErrorMessage(error));
     }
@@ -626,6 +647,78 @@ export function ProxyPanel({
                     });
                   }}
                 />
+              </div>
+              <div className="mt-4 space-y-2 border-t border-border pt-3">
+                <div className="flex items-center justify-between">
+                  <Label className="text-xs">Recent compaction tasks</Label>
+                  <span className="text-[11px] text-muted-foreground">
+                    {continuityTasks.length} loaded
+                  </span>
+                </div>
+                {continuityTasks.slice(0, 8).map((task) => (
+                  <div
+                    key={`${task.threadId}:${task.sessionId}`}
+                    className="flex items-start justify-between gap-3 rounded-md border border-border/70 p-3 text-xs"
+                  >
+                    <div className="min-w-0 space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span
+                          className={`rounded px-1.5 py-0.5 font-medium ${
+                            task.state === "healthy"
+                              ? "bg-green-500/10 text-green-600"
+                              : task.state === "error"
+                                ? "bg-destructive/10 text-destructive"
+                                : "bg-amber-500/10 text-amber-600"
+                          }`}
+                        >
+                          {task.state}
+                        </span>
+                        <span className="font-medium">{task.phase}</span>
+                        <span className="text-muted-foreground">
+                          {task.strategy ?? task.realm}
+                        </span>
+                      </div>
+                      <div className="truncate text-muted-foreground">
+                        {task.model} · {task.providerId ?? "provider unknown"} ·
+                        thread {task.threadId.slice(0, 12)}
+                      </div>
+                      <div className="flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground">
+                        <span>
+                          tokens {task.inputTokensBefore.toLocaleString()} →{" "}
+                          {task.summaryTokens.toLocaleString()}
+                        </span>
+                        <span>
+                          chunks {task.chunksCompleted}/{task.chunksTotal}
+                        </span>
+                        <span>
+                          retries {task.retryCount} (overflow{" "}
+                          {task.overflowRetryCount})
+                        </span>
+                        <span>
+                          resume {task.resumeVerified ? "verified" : "pending"}
+                        </span>
+                      </div>
+                    </div>
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      disabled={deleteContinuityThread.isPending}
+                      onClick={() =>
+                        void handleDeleteContinuityThread(task.threadId)
+                      }
+                      aria-label="Delete continuity task"
+                    >
+                      <Trash2 className="h-4 w-4 text-destructive" />
+                    </Button>
+                  </div>
+                ))}
+                {continuityTasks.length === 0 && (
+                  <p className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
+                    尚無 compaction task。第一次 compact 後會在這裡顯示
+                    journal、summary、resume、token 與 retry 狀態。
+                  </p>
+                )}
               </div>
             </div>
           </div>

@@ -41,6 +41,26 @@ export function useUpdateContinuitySettings() {
   });
 }
 
+export function useContinuityTasks(enabled = true) {
+  return useQuery({
+    queryKey: ["continuityTasks"],
+    queryFn: () => proxyApi.getContinuityTasks(20),
+    enabled,
+    refetchInterval: enabled ? 5000 : false,
+  });
+}
+
+export function useDeleteContinuityThread() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (threadId: string) => proxyApi.deleteContinuityThread(threadId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["continuityTasks"] });
+      queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
+    },
+  });
+}
+
 export function useProviderCredentials(appType: string, providerId?: string) {
   return useQuery({
     queryKey: ["providerCredentials", appType, providerId],

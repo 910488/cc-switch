@@ -1854,7 +1854,8 @@ impl RequestForwarder {
             });
             auth_headers.push((header_name, header_value));
             log::debug!(
-                "[{app_type_str}] using credential {} for provider {}",
+                "[{}] using credential {} for provider {}",
+                app_type.as_str(),
                 credential.id,
                 provider.id
             );

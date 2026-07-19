@@ -52,6 +52,33 @@ export interface CompactionSettings {
   officialCompactFallback: boolean;
 }
 
+export interface ContinuityTaskState {
+  threadId: string;
+  sessionId: string;
+  compactionId?: string;
+  model: string;
+  realm: string;
+  state: string;
+  phase: string;
+  journalSaved: boolean;
+  summaryCreated: boolean;
+  resumeVerified: boolean;
+  originalContextRetained: boolean;
+  errorCode?: string;
+  strategy?: string;
+  inputTokensBefore: number;
+  summaryTokens: number;
+  chunksCompleted: number;
+  chunksTotal: number;
+  retryCount: number;
+  overflowRetryCount: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  providerId?: string;
+  updatedAt: string;
+}
+
 export type ProviderCredentialKind = "oauth" | "api_key" | "token";
 
 export interface ProviderCredentialQuota {

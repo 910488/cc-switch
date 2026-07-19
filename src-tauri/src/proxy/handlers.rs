@@ -1375,8 +1375,20 @@ fn official_recompact_fallback(
         .unwrap_or(true);
     if fallback {
         log::warn!("[Compaction] {error}; using safe canonical materialization fallback");
+        if let Err(store_error) = state
+            .compaction_service
+            .record_official_recompact_failure(plan, true)
+        {
+            log::error!("[Compaction] failed to persist official fallback state: {store_error}");
+        }
         Ok(plan.fallback_body.clone())
     } else {
+        if let Err(store_error) = state
+            .compaction_service
+            .record_official_recompact_failure(plan, false)
+        {
+            log::error!("[Compaction] failed to persist official failure state: {store_error}");
+        }
         Err(ProxyError::UpstreamError {
             status: 502,
             body: Some(error),
@@ -1440,9 +1452,28 @@ async fn execute_local_compaction(
             progress.retries,
             progress.input_budget
         );
+        if let Err(error) = state.compaction_service.record_summary_progress(
+            continuity_context,
+            snapshot,
+            &progress,
+        ) {
+            log::error!("[Compaction] failed to persist summary progress: {error}");
+        }
     })
-    .await
-    .map_err(|error| ProxyError::TransformError(error.message))?;
+    .await;
+    let execution = match execution {
+        Ok(execution) => execution,
+        Err(error) => {
+            if let Err(store_error) = state.compaction_service.record_summary_failure(
+                continuity_context,
+                snapshot,
+                &error,
+            ) {
+                log::error!("[Compaction] failed to persist summary failure: {store_error}");
+            }
+            return Err(ProxyError::TransformError(error.message));
+        }
+    };
     let provider = client.last_provider.ok_or_else(|| {
         ProxyError::Internal("compaction executor completed without a provider".to_string())
     })?;

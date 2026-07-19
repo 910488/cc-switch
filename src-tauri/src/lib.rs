@@ -1378,6 +1378,8 @@ pub fn run() {
             commands::get_proxy_status,
             commands::get_continuity_settings,
             commands::update_continuity_settings,
+            commands::get_continuity_tasks,
+            commands::delete_continuity_thread,
             commands::list_provider_credentials,
             commands::save_provider_credential,
             commands::delete_provider_credential,
