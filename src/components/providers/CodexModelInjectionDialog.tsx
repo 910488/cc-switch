@@ -77,11 +77,10 @@ export function CodexModelInjectionDialog({
     }
     setFetching(true);
     try {
-      const baseLooksLikePrefix = /\/v\d+\/?$/i.test(connection.baseUrl);
       const models = await fetchModelsForConfig(
         connection.baseUrl,
         connection.apiKey,
-        connection.configuredAsFullUrl && !baseLooksLikePrefix,
+        connection.configuredAsFullUrl,
         undefined,
         provider.meta?.customUserAgent,
       );
@@ -182,9 +181,6 @@ export function CodexModelInjectionDialog({
   };
 
   const pending = fetching || updateProvider.isPending;
-  const fullUrlNeedsRepair =
-    connection.configuredAsFullUrl && /\/v\d+\/?$/i.test(connection.baseUrl);
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-2xl">
@@ -223,13 +219,6 @@ export function CodexModelInjectionDialog({
               從 API 取得模型
             </Button>
           </div>
-
-          {fullUrlNeedsRepair && (
-            <p className="rounded-md bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-400">
-              目前將 <code>{connection.baseUrl}</code> 設為完整 URL，但它其實是
-              Base URL。套用時會自動修正，並保留 <code>/v1</code> 前綴。
-            </p>
-          )}
 
           <div className="flex gap-2">
             <Input

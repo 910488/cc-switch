@@ -67,21 +67,12 @@ export function buildCodexInjectedProvider(
     typeof provider.settingsConfig?.config === "string"
       ? provider.settingsConfig.config
       : "";
-  const connection = codexProviderConnection(provider);
-  const baseLooksLikePrefix = /\/v\d+\/?$/i.test(connection.baseUrl);
-
   return {
     ...provider,
     settingsConfig: {
       ...provider.settingsConfig,
       config: setCodexModelName(configText, normalized[0].model),
       modelCatalog: { models: normalized },
-    },
-    meta: {
-      ...provider.meta,
-      // A /v1-style URL is a base prefix, not a complete Responses endpoint.
-      isFullUrl:
-        connection.configuredAsFullUrl && !baseLooksLikePrefix ? true : false,
     },
   };
 }

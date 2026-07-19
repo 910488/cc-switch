@@ -30,12 +30,12 @@ describe("Codex model injection", () => {
     ]);
   });
 
-  it("writes selected models and repairs a /v1 URL misclassified as full URL", () => {
+  it("writes selected models without changing the full URL preference", () => {
     const updated = buildCodexInjectedProvider(provider, [
       { model: "GLM-5.2p" },
       { model: "GLM-5.2" },
     ]);
-    expect(updated.meta?.isFullUrl).toBe(false);
+    expect(updated.meta?.isFullUrl).toBe(true);
     expect(updated.settingsConfig.modelCatalog.models).toHaveLength(2);
     expect(updated.settingsConfig.config).toContain('model = "GLM-5.2p"');
   });
