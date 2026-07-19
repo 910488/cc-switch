@@ -1,4 +1,5 @@
 mod crypto;
+pub(crate) mod executor;
 pub(crate) mod model;
 mod planner;
 pub(crate) mod service;

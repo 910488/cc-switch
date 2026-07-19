@@ -52,7 +52,7 @@ pub(crate) struct StoredCompaction {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BridgeEnvelope {
     pub v: i64,
@@ -64,7 +64,7 @@ pub(crate) struct BridgeEnvelope {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CompactionTaskState {
     pub thread_id: String,
@@ -85,6 +85,28 @@ pub(crate) struct CompactionTaskState {
     pub original_context_retained: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+    #[serde(default)]
+    pub input_tokens_before: usize,
+    #[serde(default)]
+    pub summary_tokens: usize,
+    #[serde(default)]
+    pub chunks_completed: usize,
+    #[serde(default)]
+    pub chunks_total: usize,
+    #[serde(default)]
+    pub retry_count: usize,
+    #[serde(default)]
+    pub overflow_retry_count: usize,
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     pub updated_at: String,
 }
 

@@ -510,6 +510,7 @@ mod tests {
                 original_context_retained: true,
                 error_code: None,
                 updated_at: Utc::now().to_rfc3339(),
+                ..Default::default()
             })
             .unwrap();
 

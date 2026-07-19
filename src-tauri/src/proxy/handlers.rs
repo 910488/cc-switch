@@ -8,10 +8,15 @@
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
 use super::{
-    compaction::{CompactionContext, CompactionService, ProviderRealm, Snapshot},
+    compaction::{
+        executor::{
+            self as compaction_executor, SummaryCall, SummaryCallError, SummaryClient, SummaryReply,
+        },
+        CompactionContext, CompactionService, ProviderRealm, Snapshot,
+    },
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
-    forwarder::ActiveConnectionGuard,
+    forwarder::{ActiveConnectionGuard, RequestForwarder, INTERNAL_SUMMARY_HEADER},
     handler_config::{
         claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
         CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
@@ -45,11 +50,13 @@ use super::{
 };
 use crate::app_config::AppType;
 use crate::database::PRICING_SOURCE_REQUEST;
+use crate::provider::Provider;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::pin::Pin;
 
 // ============================================================================
 // 健康检查和状态查询（简单端点）
@@ -806,22 +813,27 @@ async fn handle_responses_for_app(
     let is_compaction = CompactionService::is_compaction_request(&body);
     let continuity_context =
         CompactionService::context_from_request(&headers, &body, &ctx.session_id);
+    let initial_realm = is_compaction.then(|| {
+        if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint)
+            || super::providers::should_convert_codex_responses_to_anthropic(
+                &ctx.provider,
+                &endpoint,
+            )
+        {
+            ProviderRealm::Bridge
+        } else {
+            ProviderRealm::Official
+        }
+    });
     let snapshot = if is_compaction {
-        let initial_realm =
-            if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint)
-                || super::providers::should_convert_codex_responses_to_anthropic(
-                    &ctx.provider,
-                    &endpoint,
-                )
-            {
-                ProviderRealm::Bridge
-            } else {
-                ProviderRealm::Official
-            };
         Some(
             state
                 .compaction_service
-                .save_snapshot(&continuity_context, &body, initial_realm)
+                .save_snapshot(
+                    &continuity_context,
+                    &body,
+                    initial_realm.unwrap_or(ProviderRealm::Official),
+                )
                 .map_err(|error| ProxyError::Internal(error.to_string()))?,
         )
     } else {
@@ -834,6 +846,27 @@ async fn handle_responses_for_app(
         .unwrap_or(false);
     let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
     let forwarder = ctx.create_forwarder(&state);
+    if initial_realm == Some(ProviderRealm::Bridge) {
+        if let Some(snapshot) = snapshot.as_ref() {
+            return execute_local_compaction(
+                &forwarder,
+                &app_type,
+                method.clone(),
+                &endpoint,
+                headers.clone(),
+                ctx.get_providers(),
+                tag,
+                ctx.app_config.non_streaming_timeout,
+                &state,
+                &continuity_context,
+                snapshot,
+                &body,
+                false,
+                is_stream,
+            )
+            .await;
+        }
+    }
     let mut result = match forwarder
         .forward_with_retry(
             &app_type,
@@ -1010,6 +1043,25 @@ async fn handle_responses_compact_for_app(
         .unwrap_or(false);
 
     let forwarder = ctx.create_forwarder(&state);
+    if initial_realm == ProviderRealm::Bridge {
+        return execute_local_compaction(
+            &forwarder,
+            &app_type,
+            method.clone(),
+            &endpoint,
+            headers.clone(),
+            ctx.get_providers(),
+            tag,
+            ctx.app_config.non_streaming_timeout,
+            &state,
+            &continuity_context,
+            &snapshot,
+            &body,
+            true,
+            is_stream,
+        )
+        .await;
+    }
     let mut result = match forwarder
         .forward_with_retry(
             &app_type,
@@ -1084,6 +1136,241 @@ async fn handle_responses_compact_for_app(
 enum LocalSummaryProtocol {
     Chat,
     Anthropic,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_local_compaction(
+    forwarder: &RequestForwarder,
+    app_type: &AppType,
+    method: http::Method,
+    endpoint: &str,
+    headers: axum::http::HeaderMap,
+    mut providers: Vec<Provider>,
+    tag: &'static str,
+    non_streaming_timeout: u32,
+    state: &ProxyState,
+    continuity_context: &CompactionContext,
+    snapshot: &Snapshot,
+    original_body: &Value,
+    compact_endpoint: bool,
+    original_stream: bool,
+) -> Result<axum::response::Response, ProxyError> {
+    providers.retain(|provider| {
+        super::providers::should_convert_codex_responses_to_chat(provider, endpoint)
+            || super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint)
+    });
+    if providers.is_empty() {
+        return Err(ProxyError::NoAvailableProvider);
+    }
+
+    let mut client = ForwarderSummaryClient {
+        forwarder,
+        app_type,
+        method,
+        endpoint,
+        headers,
+        providers,
+        tag,
+        non_streaming_timeout,
+        last_provider: None,
+    };
+    let execution = compaction_executor::execute(&mut client, original_body, |progress| {
+        log::info!(
+            "[Compaction] strategy={} phase={} chunks={}/{} retries={} budget={}",
+            progress.strategy,
+            progress.phase,
+            progress.chunks_completed,
+            progress.chunks_total,
+            progress.retries,
+            progress.input_budget
+        );
+    })
+    .await
+    .map_err(|error| ProxyError::TransformError(error.message))?;
+    let provider = client.last_provider.ok_or_else(|| {
+        ProxyError::Internal("compaction executor completed without a provider".to_string())
+    })?;
+    let item = state
+        .compaction_service
+        .create_bridge_compaction_with_execution(
+            continuity_context,
+            snapshot,
+            &provider.id,
+            &execution.summary,
+            Some(&execution),
+        )
+        .map_err(|error| ProxyError::Internal(error.to_string()))?;
+    build_local_compaction_response(original_body, item, compact_endpoint, original_stream)
+}
+
+struct ForwarderSummaryClient<'a> {
+    forwarder: &'a RequestForwarder,
+    app_type: &'a AppType,
+    method: http::Method,
+    endpoint: &'a str,
+    headers: axum::http::HeaderMap,
+    providers: Vec<Provider>,
+    tag: &'static str,
+    non_streaming_timeout: u32,
+    last_provider: Option<Provider>,
+}
+
+impl SummaryClient for ForwarderSummaryClient<'_> {
+    fn summarize<'a>(
+        &'a mut self,
+        call: SummaryCall,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Result<SummaryReply, SummaryCallError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let prepared = CompactionService::prepare_local_summary_request_with(
+                &call.body,
+                &call.prompt,
+                call.max_output_tokens,
+            );
+            let mut headers = self.headers.clone();
+            headers.insert(INTERNAL_SUMMARY_HEADER, http::HeaderValue::from_static("1"));
+            let mut result = self
+                .forwarder
+                .forward_with_retry(
+                    self.app_type,
+                    self.method.clone(),
+                    self.endpoint,
+                    prepared,
+                    headers,
+                    http::Extensions::new(),
+                    self.providers.clone(),
+                )
+                .await
+                .map_err(|error| summary_call_error(error.error))?;
+            let protocol = if super::providers::should_convert_codex_responses_to_anthropic(
+                &result.provider,
+                self.endpoint,
+            ) {
+                LocalSummaryProtocol::Anthropic
+            } else if super::providers::should_convert_codex_responses_to_chat(
+                &result.provider,
+                self.endpoint,
+            ) {
+                LocalSummaryProtocol::Chat
+            } else {
+                return Err(SummaryCallError::new(
+                    "summary routing selected a non-bridge provider",
+                    false,
+                ));
+            };
+            let status = result.response.status();
+            if !status.is_success() {
+                return Err(SummaryCallError::new(
+                    format!("summary upstream returned HTTP {}", status.as_u16()),
+                    false,
+                ));
+            }
+            let timeout = if self.non_streaming_timeout > 0 {
+                std::time::Duration::from_secs(self.non_streaming_timeout as u64)
+            } else {
+                std::time::Duration::ZERO
+            };
+            let (_headers, _status, body_bytes) =
+                read_decoded_body(result.response, self.tag, timeout)
+                    .await
+                    .map_err(summary_call_error)?;
+            let _connection_guard = result.connection_guard.take();
+            let upstream = parse_local_summary_value(&body_bytes, protocol)
+                .map_err(|error| SummaryCallError::new(error.to_string(), false))?;
+            let summary = match protocol {
+                LocalSummaryProtocol::Chat => chat_summary_text(&upstream),
+                LocalSummaryProtocol::Anthropic => anthropic_summary_text(&upstream),
+            }
+            .filter(|summary| !summary.trim().is_empty())
+            .ok_or_else(|| {
+                SummaryCallError::new("third-party compaction returned an empty summary", false)
+            })?;
+            let usage = summary_usage(&upstream, protocol);
+            self.last_provider = Some(result.provider);
+            Ok(SummaryReply {
+                summary,
+                prompt_tokens: usage.0,
+                completion_tokens: usage.1,
+                total_tokens: usage.2,
+            })
+        })
+    }
+}
+
+fn parse_local_summary_value(
+    body_bytes: &[u8],
+    protocol: LocalSummaryProtocol,
+) -> Result<Value, ProxyError> {
+    let text = String::from_utf8_lossy(body_bytes);
+    match serde_json::from_slice(body_bytes) {
+        Ok(value) => Ok(value),
+        Err(_) if body_looks_like_sse(&text) => match protocol {
+            LocalSummaryProtocol::Chat => chat_sse_to_response_value(&text),
+            LocalSummaryProtocol::Anthropic => {
+                transform_codex_anthropic::anthropic_sse_to_message_value(&text)
+            }
+        },
+        Err(error) => Err(ProxyError::TransformError(format!(
+            "Failed to parse local compaction response: {error}"
+        ))),
+    }
+}
+
+fn summary_usage(value: &Value, protocol: LocalSummaryProtocol) -> (u64, u64, u64) {
+    let usage = value.get("usage").unwrap_or(&Value::Null);
+    let prompt = match protocol {
+        LocalSummaryProtocol::Chat => usage
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        LocalSummaryProtocol::Anthropic => usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+    };
+    let completion = match protocol {
+        LocalSummaryProtocol::Chat => usage
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        LocalSummaryProtocol::Anthropic => usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+    };
+    let total = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(prompt.saturating_add(completion));
+    (prompt, completion, total)
+}
+
+fn summary_call_error(error: ProxyError) -> SummaryCallError {
+    let overflow = match &error {
+        ProxyError::UpstreamError { status, body } if matches!(status, 400 | 413 | 422) => {
+            body.as_deref().is_some_and(is_context_overflow_detail)
+        }
+        ProxyError::TransformError(message) | ProxyError::InvalidRequest(message) => {
+            is_context_overflow_detail(message)
+        }
+        _ => false,
+    };
+    SummaryCallError::new(error.to_string(), overflow)
+}
+
+fn is_context_overflow_detail(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    [
+        "context length",
+        "context window",
+        "maximum context",
+        "too many tokens",
+        "prompt is too long",
+        "request too large",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle))
 }
 
 #[allow(clippy::too_many_arguments)]

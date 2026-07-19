@@ -39,6 +39,7 @@ use tauri::Manager;
 use tokio::sync::RwLock;
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
+pub(crate) const INTERNAL_SUMMARY_HEADER: &str = "x-cc-switch-summary-prepared";
 
 fn validate_codex_official_authorization(headers: &http::HeaderMap) -> Result<(), ProxyError> {
     let authorization = headers
@@ -1283,6 +1284,7 @@ impl RequestForwarder {
             }
             mapped_body = materialized.body;
             if target.realm == ProviderRealm::Bridge
+                && !headers.contains_key(INTERNAL_SUMMARY_HEADER)
                 && (endpoint
                     .split('?')
                     .next()
@@ -1923,6 +1925,10 @@ impl RequestForwarder {
 
         for (key, value) in headers {
             let key_str = key.as_str();
+
+            if key_str.eq_ignore_ascii_case(INTERNAL_SUMMARY_HEADER) {
+                continue;
+            }
 
             // --- host — 原位替换为上游 host（保持客户端原始位置） ---
             if key_str.eq_ignore_ascii_case("host") {

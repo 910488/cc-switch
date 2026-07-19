@@ -9,9 +9,13 @@
 //! single-credential provider remains usable, but pool secrets cannot be
 //! added until the store is repaired. We never fall back to plaintext.
 
+#![allow(dead_code)] // Removed once the credential-pool commands land.
+
 use crate::error::AppError;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+#[cfg(windows)]
 use std::path::PathBuf;
 use zeroize::Zeroizing;
 
@@ -42,9 +46,7 @@ impl CredentialKind {
 pub struct SecretReference {
     /// Backend that produced the reference, e.g. "dpapi", "keychain", "secret-service".
     pub backend: String,
-    /// Backend-specific lookup key. For DPAPI this is the on-disk blob path; for
-    /// keychain/secret-service it is the service/item name pair encoded as
-    /// `service\x1faccount`.
+    /// Backend-specific opaque lookup key. Filesystem paths are never exposed.
     pub handle: String,
 }
 
@@ -57,8 +59,8 @@ impl SecretReference {
     }
 }
 
-/// Metadata-only view of a credential. This is the only shape that ever
-/// crosses into the frontend or into logs; the secret value is never included.
+/// Metadata-only view of a credential. Secret references remain backend-only;
+/// this is the only shape that may cross into the frontend or logs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialMetadata {
@@ -129,21 +131,47 @@ pub fn mask_secret(secret: &[u8]) -> String {
     if len == 0 {
         return String::new();
     }
-    // Treat as UTF-8 when possible; otherwise mask as hex.
-    let Ok(text) = std::str::from_utf8(secret) else {
-        return format!("hex:{}", hex_short(secret));
-    };
-    let head: String = text.chars().take(4).collect();
-    let tail: String = text.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-    if len <= 12 {
-        format!("{head}…{tail}")
-    } else {
-        format!("{head}…{tail} ({len} bytes)")
+    if len <= 8 {
+        return "••••".to_string();
     }
+    let tail = secret
+        .iter()
+        .rev()
+        .take(4)
+        .copied()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+                byte as char
+            } else {
+                '•'
+            }
+        })
+        .collect::<String>();
+    format!("••••{tail} ({len} bytes)")
 }
 
-fn hex_short(bytes: &[u8]) -> String {
-    bytes.iter().take(4).map(|b| format!("{b:02x}")).collect()
+fn opaque_handle(provider_id: &str, credential_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cc-switch-credential-v1\0");
+    digest.update(provider_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(credential_id.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest.finalize())
+}
+
+fn validate_handle(handle: &str) -> Result<(), AppError> {
+    let decoded = URL_SAFE_NO_PAD
+        .decode(handle)
+        .map_err(|_| AppError::Config("invalid credential secret reference".to_string()))?;
+    if decoded.len() != 32 || handle.contains('/') || handle.contains('\\') {
+        return Err(AppError::Config(
+            "invalid credential secret reference".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -163,12 +191,19 @@ impl DpapiVault {
         Some(Self { root })
     }
 
-    fn path_for(&self, provider_id: &str, credential_id: &str) -> PathBuf {
-        // Sanitize components so they cannot escape the vault directory.
-        let safe_provider = sanitize_component(provider_id);
-        let safe_credential = sanitize_component(credential_id);
-        self.root
-            .join(format!("{safe_provider}.{safe_credential}.dpapi"))
+    fn path_for_handle(&self, handle: &str) -> Result<PathBuf, AppError> {
+        validate_handle(handle)?;
+        Ok(self.root.join(format!("{handle}.dpapi")))
+    }
+
+    fn reference_path(&self, reference: &SecretReference) -> Result<PathBuf, AppError> {
+        if reference.backend != self.backend_name() {
+            return Err(AppError::Config(format!(
+                "credential backend mismatch: expected {}",
+                self.backend_name()
+            )));
+        }
+        self.path_for_handle(&reference.handle)
     }
 }
 
@@ -184,7 +219,8 @@ impl SecretVault for DpapiVault {
         credential_id: &str,
         secret: &Zeroizing<Vec<u8>>,
     ) -> Result<SecretReference, AppError> {
-        let path = self.path_for(provider_id, credential_id);
+        let handle = opaque_handle(provider_id, credential_id);
+        let path = self.path_for_handle(&handle)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| AppError::io(&path, e))?;
         }
@@ -192,17 +228,14 @@ impl SecretVault for DpapiVault {
         let encoded = URL_SAFE_NO_PAD.encode(protected);
         // Write atomically: create a temp file then rename, so a crash never
         // leaves a half-written credential blob.
-        let tmp = path.with_extension("dpapi.tmp");
+        let tmp = path.with_extension(format!("dpapi.{}.tmp", uuid::Uuid::new_v4()));
         std::fs::write(&tmp, encoded.as_bytes()).map_err(|e| AppError::io(&tmp, e))?;
-        std::fs::rename(&tmp, &path).map_err(|e| AppError::io(&path, e))?;
-        Ok(SecretReference::new(
-            self.backend_name(),
-            path.to_string_lossy().to_string(),
-        ))
+        replace_file(&tmp, &path)?;
+        Ok(SecretReference::new(self.backend_name(), handle))
     }
 
     fn load(&self, reference: &SecretReference) -> Result<Zeroizing<Vec<u8>>, AppError> {
-        let path = PathBuf::from(&reference.handle);
+        let path = self.reference_path(reference)?;
         let encoded = std::fs::read_to_string(&path).map_err(|e| AppError::io(&path, e))?;
         let protected = URL_SAFE_NO_PAD
             .decode(encoded.trim())
@@ -212,7 +245,7 @@ impl SecretVault for DpapiVault {
     }
 
     fn delete(&self, reference: &SecretReference) -> Result<(), AppError> {
-        let path = PathBuf::from(&reference.handle);
+        let path = self.reference_path(reference)?;
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -223,6 +256,38 @@ impl SecretVault for DpapiVault {
     fn available(&self) -> bool {
         true
     }
+}
+
+#[cfg(windows)]
+fn replace_file(from: &std::path::Path, to: &std::path::Path) -> Result<(), AppError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from_wide = from
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let to_wide = to
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let ok = unsafe {
+        MoveFileExW(
+            from_wide.as_ptr(),
+            to_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = std::fs::remove_file(from);
+        return Err(AppError::io(to, error));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -327,28 +392,10 @@ impl SecretVault for KeychainVault {
         credential_id: &str,
         secret: &Zeroizing<Vec<u8>>,
     ) -> Result<SecretReference, AppError> {
-        let service = format!("cc-switch.{provider_id}");
-        let account = sanitize_component(credential_id);
-        // Use the `security` CLI to avoid a heavy FFI surface. The CLI is
-        // present on every macOS install.
-        let status = std::process::Command::new("security")
-            .args([
-                "add-generic-password",
-                "-a",
-                &account,
-                "-s",
-                &service,
-                "-w",
-                &String::from_utf8_lossy(secret.as_slice()),
-                "-U",
-            ])
-            .status()
+        let service = "cc-switch.provider-credentials";
+        let account = opaque_handle(provider_id, credential_id);
+        security_framework::passwords::set_generic_password(service, &account, secret.as_slice())
             .map_err(|e| AppError::Message(format!("keychain store failed: {e}")))?;
-        if !status.success() {
-            return Err(AppError::Message(format!(
-                "keychain add-generic-password exited {status}"
-            )));
-        }
         Ok(SecretReference::new(
             self.backend_name(),
             format!("{service}\x1f{account}"),
@@ -360,28 +407,9 @@ impl SecretVault for KeychainVault {
             .handle
             .split_once('\x1f')
             .ok_or_else(|| AppError::Config("invalid keychain reference".to_string()))?;
-        let output = std::process::Command::new("security")
-            .args([
-                "find-generic-password",
-                "-a",
-                account,
-                "-s",
-                service,
-                "-w",
-            ])
-            .output()
+        validate_handle(account)?;
+        let bytes = security_framework::passwords::get_generic_password(service, account)
             .map_err(|e| AppError::Message(format!("keychain load failed: {e}")))?;
-        if !output.status.success() {
-            return Err(AppError::Message(format!(
-                "keychain find-generic-password exited {}",
-                output.status
-            )));
-        }
-        // The CLI appends a trailing newline; trim it.
-        let mut bytes = output.stdout;
-        while matches!(bytes.last(), Some(b'\n' | b'\r')) {
-            bytes.pop();
-        }
         Ok(Zeroizing::new(bytes))
     }
 
@@ -390,15 +418,9 @@ impl SecretVault for KeychainVault {
             .handle
             .split_once('\x1f')
             .ok_or_else(|| AppError::Config("invalid keychain reference".to_string()))?;
-        let status = std::process::Command::new("security")
-            .args(["delete-generic-password", "-a", account, "-s", service])
-            .status()
-            .map_err(|e| AppError::Message(format!("keychain delete failed: {e}")))?;
-        // Deletion of a missing item is a success.
-        if !status.success() {
-            log::warn!("keychain delete exited {status}; treating as already-removed");
-        }
-        Ok(())
+        validate_handle(account)?;
+        security_framework::passwords::delete_generic_password(service, account)
+            .map_err(|e| AppError::Message(format!("keychain delete failed: {e}")))
     }
 
     fn available(&self) -> bool {
@@ -445,8 +467,8 @@ impl SecretVault for SecretServiceVault {
         credential_id: &str,
         secret: &Zeroizing<Vec<u8>>,
     ) -> Result<SecretReference, AppError> {
-        let service = format!("cc-switch.{provider_id}");
-        let account = sanitize_component(credential_id);
+        let service = "cc-switch.provider-credentials";
+        let account = opaque_handle(provider_id, credential_id);
         let mut child = std::process::Command::new("secret-tool")
             .args([
                 "store",
@@ -473,7 +495,9 @@ impl SecretVault for SecretServiceVault {
             .wait()
             .map_err(|e| AppError::Message(format!("secret-service wait failed: {e}")))?;
         if !status.success() {
-            return Err(AppError::Message(format!("secret-tool store exited {status}")));
+            return Err(AppError::Message(format!(
+                "secret-tool store exited {status}"
+            )));
         }
         Ok(SecretReference::new(
             self.backend_name(),
@@ -486,6 +510,7 @@ impl SecretVault for SecretServiceVault {
             .handle
             .split_once('\x1f')
             .ok_or_else(|| AppError::Config("invalid secret-service reference".to_string()))?;
+        validate_handle(account)?;
         let output = std::process::Command::new("secret-tool")
             .args(["lookup", "service", service, "account", account])
             .output()
@@ -508,12 +533,15 @@ impl SecretVault for SecretServiceVault {
             .handle
             .split_once('\x1f')
             .ok_or_else(|| AppError::Config("invalid secret-service reference".to_string()))?;
+        validate_handle(account)?;
         let status = std::process::Command::new("secret-tool")
             .args(["clear", "service", service, "account", account])
             .status()
             .map_err(|e| AppError::Message(format!("secret-service delete failed: {e}")))?;
         if !status.success() {
-            log::warn!("secret-tool clear exited {status}; treating as already-removed");
+            return Err(AppError::Message(format!(
+                "secret-tool clear exited {status}"
+            )));
         }
         Ok(())
     }
@@ -521,22 +549,6 @@ impl SecretVault for SecretServiceVault {
     fn available(&self) -> bool {
         true
     }
-}
-
-fn sanitize_component(value: &str) -> String {
-    // Keep only characters that are safe inside a filename / keychain account.
-    // Replace anything else with an underscore so two distinct ids cannot
-    // collide after sanitization.
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -547,22 +559,22 @@ mod tests {
     fn mask_secret_never_exposes_full_value() {
         let secret = Zeroizing::new(b"sk-abcd1234efgh5678".to_vec());
         let masked = mask_secret(secret.as_slice());
-        assert!(masked.starts_with("sk-a"));
+        assert!(masked.starts_with("••••"));
         assert!(masked.contains("5678"));
+        assert!(!masked.contains("sk-a"));
         assert!(!masked.contains("1234efgh"));
     }
 
     #[test]
     fn mask_secret_handles_short_input() {
         let masked = mask_secret(b"abc");
-        assert!(masked.contains("abc"));
-        assert!(!masked.contains("bytes"));
+        assert_eq!(masked, "••••");
     }
 
     #[test]
     fn mask_secret_handles_non_utf8() {
         let masked = mask_secret(&[0xff, 0xfe, 0xfd, 0xfc, 0xfb]);
-        assert!(masked.starts_with("hex:"));
+        assert_eq!(masked, "••••");
     }
 
     #[cfg(windows)]
@@ -571,9 +583,7 @@ mod tests {
         let vault = DpapiVault::new().expect("dpapi vault available on windows");
         assert!(vault.available());
         let secret = Zeroizing::new(b"oauth-refresh-token-12345".to_vec());
-        let reference = vault
-            .store("provider-x", "cred-1", &secret)
-            .expect("store");
+        let reference = vault.store("provider-x", "cred-1", &secret).expect("store");
         assert_eq!(reference.backend, "dpapi-current-user");
         let loaded = vault.load(&reference).expect("load");
         assert_eq!(loaded.as_slice(), secret.as_slice());
@@ -589,18 +599,55 @@ mod tests {
     fn dpapi_vault_rejects_path_escape_in_ids() {
         let vault = DpapiVault::new().expect("dpapi vault available on windows");
         let secret = Zeroizing::new(b"k".to_vec());
+        let reference = vault.store("../escape", "sub/dir", &secret).expect("store");
+        validate_handle(&reference.handle).expect("opaque handle");
+        let path = vault.reference_path(&reference).expect("resolve");
+        assert!(path.starts_with(&vault.root));
+        vault.delete(&reference).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_vault_rejects_forged_paths_and_backends() {
+        let vault = DpapiVault::new().expect("dpapi vault available on windows");
+        let path_ref = SecretReference::new(vault.backend_name(), "../outside");
+        assert!(vault.load(&path_ref).is_err());
+        assert!(vault.delete(&path_ref).is_err());
+        let backend_ref = SecretReference::new("keychain", opaque_handle("p", "c"));
+        assert!(vault.load(&backend_ref).is_err());
+        assert!(vault.delete(&backend_ref).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_vault_store_is_idempotent_and_replaces_value() {
+        let vault = DpapiVault::new().expect("dpapi vault available on windows");
+        let first = Zeroizing::new(b"first-secret".to_vec());
+        let second = Zeroizing::new(b"second-secret".to_vec());
         let reference = vault
-            .store("../escape", "sub/dir", &secret)
-            .expect("store");
-        // The stored path must stay inside the vault root.
-        let path = PathBuf::from(&reference.handle);
-        assert!(
-            path.starts_with(&vault.root),
-            "{} not inside {}",
-            path.display(),
-            vault.root.display()
+            .store("provider-repeat", "cred-repeat", &first)
+            .expect("first");
+        let second_reference = vault
+            .store("provider-repeat", "cred-repeat", &second)
+            .expect("replace");
+        assert_eq!(reference.handle, second_reference.handle);
+        assert_eq!(
+            vault.load(&reference).expect("load").as_slice(),
+            second.as_slice()
         );
         vault.delete(&reference).expect("cleanup");
+    }
+
+    #[test]
+    fn opaque_handles_do_not_collide_after_punctuation_changes() {
+        assert_ne!(
+            opaque_handle("account/a", "key"),
+            opaque_handle("account?a", "key")
+        );
+        assert_ne!(
+            opaque_handle("account", "a/key"),
+            opaque_handle("account", "a?key")
+        );
     }
 
     #[test]

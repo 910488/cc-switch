@@ -39,6 +39,10 @@ pub(crate) fn plan_summary(body: &Value, input_budget: usize) -> SummaryPlan {
     let recent_budget = DEFAULT_RECENT_BUDGET
         .min((input_budget * 30) / 100)
         .max(2_000);
+    let units = units
+        .into_iter()
+        .flat_map(|unit| split_oversized_unit(unit, recent_budget))
+        .collect();
     let (older, recent) = select_recent_units(units, recent_budget);
     let chunk_budget = DEFAULT_CHUNK_BUDGET
         .min((input_budget * 55) / 100)
@@ -156,6 +160,69 @@ fn compaction_units(items: Vec<Value>) -> Vec<Vec<Value>> {
         in_tool_unit = tool_history;
     }
     units
+}
+
+fn split_oversized_unit(unit: Vec<Value>, max_tokens: usize) -> Vec<Vec<Value>> {
+    if estimate_tokens(&Value::Array(unit.clone())) <= max_tokens || unit.len() != 1 {
+        return vec![unit];
+    }
+    let item = &unit[0];
+    let is_message =
+        item.get("type").and_then(Value::as_str) == Some("message") || item.get("role").is_some();
+    if !is_message {
+        return vec![unit];
+    }
+    let Some(text) = message_text(item) else {
+        return vec![unit];
+    };
+    let max_chars = (max_tokens * 3).max(1_000);
+    if text.chars().count() <= max_chars {
+        return vec![unit];
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    let count = chars.len().div_ceil(max_chars);
+    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+    let content_type = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    chars
+        .chunks(max_chars)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let mut segment = item.clone();
+            segment["content"] = json!([{
+                "type": content_type,
+                "text": format!(
+                    "[Long message segment {}/{}]\n{}",
+                    index + 1,
+                    count,
+                    chunk.iter().collect::<String>()
+                )
+            }]);
+            vec![segment]
+        })
+        .collect()
+}
+
+fn message_text(item: &Value) -> Option<String> {
+    match item.get("content")? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| part.get("content").and_then(Value::as_str))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
 }
 
 fn select_recent_units(
@@ -278,5 +345,21 @@ mod tests {
         assert!(estimate_tokens(&bounded) <= DEFAULT_INPUT_BUDGET);
         assert!(bounded.to_string().contains("RECENT_SUFFIX"));
         assert!(bounded.to_string().contains("encrypted journal"));
+    }
+
+    #[test]
+    fn oversized_message_is_split_before_chunking() {
+        let body = json!({"input":[
+            {"type":"message","role":"user","content":"x".repeat(80_000)},
+            {"type":"message","role":"user","content":"recent"}
+        ]});
+        let SummaryPlan::Hierarchical { chunks, recent } = plan_summary(&body, 4_000) else {
+            panic!("expected hierarchy");
+        };
+        assert!(chunks.len() > 1);
+        assert!(chunks
+            .iter()
+            .all(|chunk| estimate_tokens(&Value::Array(chunk.clone())) <= 4_000));
+        assert!(recent.to_string().contains("recent"));
     }
 }

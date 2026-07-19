@@ -144,7 +144,16 @@ impl CompactionService {
 
     pub(crate) fn prepare_local_summary_request(body: &Value) -> Value {
         let canonical = canonical_snapshot_body(body);
-        let mut prepared = super::planner::prepare_single_summary_body(&canonical);
+        let prepared = super::planner::prepare_single_summary_body(&canonical);
+        Self::prepare_local_summary_request_with(&prepared, COMPACTION_SUMMARY_INSTRUCTIONS, 8_000)
+    }
+
+    pub(crate) fn prepare_local_summary_request_with(
+        body: &Value,
+        prompt: &str,
+        max_output_tokens: usize,
+    ) -> Value {
+        let mut prepared = canonical_snapshot_body(body);
         let mut input = prepared
             .get("input")
             .and_then(Value::as_array)
@@ -155,14 +164,14 @@ impl CompactionService {
             "role": "user",
             "content": [{
                 "type": "input_text",
-                "text": COMPACTION_SUMMARY_INSTRUCTIONS,
+                "text": prompt,
             }],
         }));
         prepared["input"] = Value::Array(input);
         prepared["stream"] = Value::Bool(false);
         prepared["tools"] = Value::Array(Vec::new());
         prepared["tool_choice"] = Value::String("none".to_string());
-        prepared["max_output_tokens"] = Value::from(8_000);
+        prepared["max_output_tokens"] = Value::from(max_output_tokens as u64);
         prepared
     }
 
@@ -192,6 +201,17 @@ impl CompactionService {
             resume_verified: false,
             original_context_retained: true,
             error_code: None,
+            strategy: None,
+            input_tokens_before: snapshot.token_estimate.max(0) as usize,
+            summary_tokens: 0,
+            chunks_completed: 0,
+            chunks_total: 0,
+            retry_count: 0,
+            overflow_retry_count: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            provider_id: None,
             updated_at: now_iso(),
         })?;
         Ok(snapshot)
@@ -203,6 +223,17 @@ impl CompactionService {
         snapshot: &Snapshot,
         provider_id: &str,
         summary: &str,
+    ) -> Result<Value, AppError> {
+        self.create_bridge_compaction_with_execution(context, snapshot, provider_id, summary, None)
+    }
+
+    pub(crate) fn create_bridge_compaction_with_execution(
+        &self,
+        context: &CompactionContext,
+        snapshot: &Snapshot,
+        provider_id: &str,
+        summary: &str,
+        execution: Option<&super::executor::SummaryExecution>,
     ) -> Result<Value, AppError> {
         let store = self.store()?;
         if summary.trim().is_empty() {
@@ -236,6 +267,29 @@ impl CompactionService {
             resume_verified: false,
             original_context_retained: true,
             error_code: None,
+            strategy: execution.map(|value| value.strategy.clone()),
+            input_tokens_before: execution
+                .map(|value| value.input_tokens_before)
+                .unwrap_or(snapshot.token_estimate.max(0) as usize),
+            summary_tokens: execution
+                .map(|value| value.summary_tokens)
+                .unwrap_or_default(),
+            chunks_completed: execution.map(|value| value.chunks).unwrap_or_default(),
+            chunks_total: execution.map(|value| value.chunks).unwrap_or_default(),
+            retry_count: execution.map(|value| value.retries).unwrap_or_default(),
+            overflow_retry_count: execution
+                .map(|value| value.overflow_retries)
+                .unwrap_or_default(),
+            prompt_tokens: execution
+                .map(|value| value.prompt_tokens)
+                .unwrap_or_default(),
+            completion_tokens: execution
+                .map(|value| value.completion_tokens)
+                .unwrap_or_default(),
+            total_tokens: execution
+                .map(|value| value.total_tokens)
+                .unwrap_or_default(),
+            provider_id: Some(provider_id.to_string()),
             updated_at: now_iso(),
         };
         store.register_compaction_and_task_state(
@@ -277,6 +331,17 @@ impl CompactionService {
             resume_verified: false,
             original_context_retained: true,
             error_code: None,
+            strategy: Some("native".to_string()),
+            input_tokens_before: snapshot.token_estimate.max(0) as usize,
+            summary_tokens: 0,
+            chunks_completed: 1,
+            chunks_total: 1,
+            retry_count: 0,
+            overflow_retry_count: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            provider_id: Some(provider_id.to_string()),
             updated_at: now_iso(),
         };
         store.register_compaction_and_task_state(
