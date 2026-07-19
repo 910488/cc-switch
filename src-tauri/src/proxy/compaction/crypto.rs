@@ -6,7 +6,9 @@ use aes_gcm::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+#[cfg(windows)]
 use std::fs::{self, OpenOptions};
+#[cfg(windows)]
 use std::io::{Read, Write};
 use std::path::Path;
 use zeroize::Zeroizing;

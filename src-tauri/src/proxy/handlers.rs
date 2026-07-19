@@ -12,7 +12,8 @@ use super::{
         executor::{
             self as compaction_executor, SummaryCall, SummaryCallError, SummaryClient, SummaryReply,
         },
-        CompactionContext, CompactionService, ProviderRealm, Snapshot,
+        CompactionContext, CompactionService, MaterializationTarget, OfficialRecompactPlan,
+        ProviderRealm, Snapshot,
     },
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
@@ -803,7 +804,7 @@ async fn handle_responses_for_app(
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
     let mut ctx =
@@ -825,7 +826,17 @@ async fn handle_responses_for_app(
             ProviderRealm::Official
         }
     });
-    let snapshot = if is_compaction {
+    let rollout_mode = state.compaction_service.rollout_mode();
+    if initial_realm == Some(ProviderRealm::Bridge) && !rollout_mode.allows_bridge_compaction() {
+        return Err(ProxyError::InvalidRequest(format!(
+            "third-party compaction is disabled in {rollout_mode:?} mode"
+        )));
+    }
+    let should_capture = initial_realm.is_some_and(|realm| match realm {
+        ProviderRealm::Bridge => rollout_mode.allows_bridge_compaction(),
+        ProviderRealm::Official => rollout_mode.captures_official(),
+    });
+    let snapshot = if is_compaction && should_capture {
         Some(
             state
                 .compaction_service
@@ -866,6 +877,27 @@ async fn handle_responses_for_app(
             )
             .await;
         }
+    }
+    let initial_provider_is_bridge =
+        super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint)
+            || super::providers::should_convert_codex_responses_to_anthropic(
+                &ctx.provider,
+                &endpoint,
+            );
+    if !is_compaction && !initial_provider_is_bridge {
+        body = try_official_recompact(
+            &forwarder,
+            &app_type,
+            method.clone(),
+            headers.clone(),
+            tag,
+            ctx.app_config.non_streaming_timeout,
+            &state,
+            &continuity_context,
+            &ctx.provider,
+            &body,
+        )
+        .await?;
     }
     let mut result = match forwarder
         .forward_with_retry(
@@ -1030,12 +1062,24 @@ async fn handle_responses_compact_for_app(
         } else {
             ProviderRealm::Official
         };
+    let rollout_mode = state.compaction_service.rollout_mode();
+    if initial_realm == ProviderRealm::Bridge && !rollout_mode.allows_bridge_compaction() {
+        return Err(ProxyError::InvalidRequest(format!(
+            "third-party compaction is disabled in {rollout_mode:?} mode"
+        )));
+    }
     // Fail closed: never let the client receive an opaque compaction token unless
     // the exact canonical request was durably journaled first.
-    let snapshot = state
-        .compaction_service
-        .save_snapshot(&continuity_context, &body, initial_realm)
-        .map_err(|error| ProxyError::Internal(error.to_string()))?;
+    let snapshot = if initial_realm == ProviderRealm::Bridge || rollout_mode.captures_official() {
+        Some(
+            state
+                .compaction_service
+                .save_snapshot(&continuity_context, &body, initial_realm)
+                .map_err(|error| ProxyError::Internal(error.to_string()))?,
+        )
+    } else {
+        None
+    };
 
     let is_stream = body
         .get("stream")
@@ -1044,6 +1088,9 @@ async fn handle_responses_compact_for_app(
 
     let forwarder = ctx.create_forwarder(&state);
     if initial_realm == ProviderRealm::Bridge {
+        let snapshot = snapshot.as_ref().ok_or_else(|| {
+            ProxyError::Internal("bridge compaction journal was not captured".to_string())
+        })?;
         return execute_local_compaction(
             &forwarder,
             &app_type,
@@ -1055,7 +1102,7 @@ async fn handle_responses_compact_for_app(
             ctx.app_config.non_streaming_timeout,
             &state,
             &continuity_context,
-            &snapshot,
+            snapshot,
             &body,
             true,
             is_stream,
@@ -1088,6 +1135,17 @@ async fn handle_responses_compact_for_app(
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
+
+    let Some(snapshot) = snapshot else {
+        return process_response(
+            response,
+            &ctx,
+            &state,
+            &CODEX_PARSER_CONFIG,
+            connection_guard,
+        )
+        .await;
+    };
 
     if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
         return handle_local_compaction_response(
@@ -1136,6 +1194,124 @@ async fn handle_responses_compact_for_app(
 enum LocalSummaryProtocol {
     Chat,
     Anthropic,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_official_recompact(
+    forwarder: &RequestForwarder,
+    app_type: &AppType,
+    method: http::Method,
+    headers: axum::http::HeaderMap,
+    tag: &'static str,
+    non_streaming_timeout: u32,
+    state: &ProxyState,
+    continuity_context: &CompactionContext,
+    provider: &Provider,
+    original_body: &Value,
+) -> Result<Value, ProxyError> {
+    let target = MaterializationTarget {
+        provider_id: provider.id.clone(),
+        model: original_body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        realm: ProviderRealm::Official,
+        realm_key: format!("native:{}", provider.id),
+    };
+    let Some(plan) = state
+        .compaction_service
+        .prepare_official_recompact(original_body, &target)
+        .map_err(|error| ProxyError::TransformError(error.to_string()))?
+    else {
+        return Ok(original_body.clone());
+    };
+    if let Some(item) = plan.cached_item.clone() {
+        return Ok(plan.resumed_body(original_body, item));
+    }
+
+    let compact_result = forwarder
+        .forward_with_retry(
+            app_type,
+            method,
+            "/responses/compact",
+            plan.compact_body.clone(),
+            headers,
+            http::Extensions::new(),
+            vec![provider.clone()],
+        )
+        .await;
+    let mut result = match compact_result {
+        Ok(result) => result,
+        Err(error) => {
+            return official_recompact_fallback(
+                state,
+                &plan,
+                format!("official compact request failed: {}", error.error),
+            )
+        }
+    };
+    let status = result.response.status();
+    if !status.is_success() {
+        return official_recompact_fallback(
+            state,
+            &plan,
+            format!("official compact returned HTTP {}", status.as_u16()),
+        );
+    }
+    let timeout = if non_streaming_timeout > 0 {
+        std::time::Duration::from_secs(non_streaming_timeout as u64)
+    } else {
+        std::time::Duration::ZERO
+    };
+    let (response_headers, _status, body_bytes) =
+        match read_decoded_body(result.response, tag, timeout).await {
+            Ok(body) => body,
+            Err(error) => {
+                return official_recompact_fallback(
+                    state,
+                    &plan,
+                    format!("official compact response failed: {error}"),
+                )
+            }
+        };
+    let _connection_guard = result.connection_guard.take();
+    let Some(item) = compaction_items_from_response_bytes(&body_bytes, &response_headers)
+        .into_iter()
+        .next()
+    else {
+        return official_recompact_fallback(
+            state,
+            &plan,
+            "official compact response contained no compaction item".to_string(),
+        );
+    };
+    state
+        .compaction_service
+        .finish_official_recompact(continuity_context, &plan, &target, &item)
+        .map_err(|error| ProxyError::Internal(error.to_string()))?;
+    Ok(plan.resumed_body(original_body, item))
+}
+
+fn official_recompact_fallback(
+    state: &ProxyState,
+    plan: &OfficialRecompactPlan,
+    error: String,
+) -> Result<Value, ProxyError> {
+    let fallback = state
+        .compaction_service
+        .settings()
+        .map(|settings| settings.official_compact_fallback)
+        .unwrap_or(true);
+    if fallback {
+        log::warn!("[Compaction] {error}; using safe canonical materialization fallback");
+        Ok(plan.fallback_body.clone())
+    } else {
+        Err(ProxyError::UpstreamError {
+            status: 502,
+            body: Some(error),
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -37,7 +37,19 @@ export interface ContinuityStatus {
   compactions: number;
   migrations: number;
   task_states: number;
+  rollout_mode: CompactionRolloutMode;
   error: string | null;
+}
+
+export type CompactionRolloutMode =
+  | "off"
+  | "observe-only"
+  | "third-party-only"
+  | "full-switching";
+
+export interface CompactionSettings {
+  rolloutMode: CompactionRolloutMode;
+  officialCompactFallback: boolean;
 }
 
 export interface ActiveTarget {

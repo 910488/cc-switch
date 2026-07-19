@@ -26,8 +26,10 @@ import {
   useSetProxyTakeoverForApp,
   useGlobalProxyConfig,
   useUpdateGlobalProxyConfig,
+  useContinuitySettings,
+  useUpdateContinuitySettings,
 } from "@/lib/query/proxy";
-import type { ProxyStatus } from "@/types/proxy";
+import type { CompactionRolloutMode, ProxyStatus } from "@/types/proxy";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
 import { extractErrorMessage } from "@/utils/errorUtils";
@@ -55,6 +57,8 @@ export function ProxyPanel({
   // 获取全局代理配置
   const { data: globalConfig } = useGlobalProxyConfig();
   const updateGlobalConfig = useUpdateGlobalProxyConfig();
+  const { data: continuitySettings } = useContinuitySettings();
+  const updateContinuitySettings = useUpdateContinuitySettings();
 
   // 监听地址/端口的本地状态（端口用字符串以支持完全清空）
   const [listenAddress, setListenAddress] = useState("127.0.0.1");
@@ -120,6 +124,23 @@ export function ProxyPanel({
       toast.error(
         t("proxy.logging.failed", { defaultValue: "切换日志状态失败" }),
       );
+    }
+  };
+
+  const handleRolloutModeChange = async (mode: CompactionRolloutMode) => {
+    if (!continuitySettings) return;
+    try {
+      await updateContinuitySettings.mutateAsync({
+        ...continuitySettings,
+        rolloutMode: mode,
+      });
+      toast.success(
+        t("proxy.continuity.rolloutSaved", {
+          defaultValue: "Continuity rollout mode updated",
+        }),
+      );
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
     }
   };
 
@@ -557,6 +578,56 @@ export function ProxyPanel({
                     })}
                   </div>
                 </div>
+              </div>
+              <div className="mt-4 grid gap-3 border-t border-border pt-3 md:grid-cols-2">
+                <div className="space-y-1">
+                  <Label htmlFor="continuity-rollout" className="text-xs">
+                    {t("proxy.continuity.rolloutMode", {
+                      defaultValue: "Rollout mode",
+                    })}
+                  </Label>
+                  <select
+                    id="continuity-rollout"
+                    className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+                    value={
+                      continuitySettings?.rolloutMode ??
+                      status.continuity?.rollout_mode ??
+                      "full-switching"
+                    }
+                    disabled={updateContinuitySettings.isPending}
+                    onChange={(event) =>
+                      void handleRolloutModeChange(
+                        event.target.value as CompactionRolloutMode,
+                      )
+                    }
+                  >
+                    <option value="off">Off</option>
+                    <option value="observe-only">Observe only</option>
+                    <option value="third-party-only">Third-party only</option>
+                    <option value="full-switching">Full switching</option>
+                  </select>
+                </div>
+                <ToggleRow
+                  icon={<ShieldCheck className="h-4 w-4" />}
+                  title={t("proxy.continuity.officialFallback", {
+                    defaultValue: "Safe official compact fallback",
+                  })}
+                  description={t("proxy.continuity.officialFallbackHint", {
+                    defaultValue:
+                      "Materialize canonical context if the official compact endpoint fails.",
+                  })}
+                  checked={
+                    continuitySettings?.officialCompactFallback ?? true
+                  }
+                  disabled={updateContinuitySettings.isPending}
+                  onCheckedChange={(checked) => {
+                    if (!continuitySettings) return;
+                    void updateContinuitySettings.mutateAsync({
+                      ...continuitySettings,
+                      officialCompactFallback: checked,
+                    });
+                  }}
+                />
               </div>
             </div>
           </div>

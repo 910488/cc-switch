@@ -6,6 +6,43 @@ pub(crate) const ENVELOPE_VERSION: i64 = 1;
 pub(crate) const KEY_VERSION: i64 = 1;
 pub(crate) const MIGRATION_PROMPT_VERSION: i64 = 1;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompactionRolloutMode {
+    Off,
+    ObserveOnly,
+    ThirdPartyOnly,
+    #[default]
+    FullSwitching,
+}
+
+impl CompactionRolloutMode {
+    pub(crate) fn allows_bridge_compaction(self) -> bool {
+        matches!(Self::ThirdPartyOnly | Self::FullSwitching, self)
+    }
+
+    pub(crate) fn allows_cross_realm(self) -> bool {
+        self == Self::FullSwitching
+    }
+
+    pub(crate) fn captures_official(self) -> bool {
+        self != Self::Off
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionSettings {
+    #[serde(default)]
+    pub rollout_mode: CompactionRolloutMode,
+    #[serde(default = "default_true")]
+    pub official_compact_fallback: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderRealm {
     Official,
@@ -119,4 +156,30 @@ pub(crate) struct StoreCounts {
     pub compactions: i64,
     pub migrations: i64,
     pub task_states: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollout_defaults_to_full_switching_and_uses_stable_wire_names() {
+        let settings = CompactionSettings::default();
+        assert_eq!(settings.rollout_mode, CompactionRolloutMode::FullSwitching);
+        assert!(settings.official_compact_fallback);
+        assert_eq!(
+            serde_json::to_string(&settings.rollout_mode).unwrap(),
+            "\"full-switching\""
+        );
+    }
+
+    #[test]
+    fn rollout_permissions_match_product_modes() {
+        assert!(!CompactionRolloutMode::Off.captures_official());
+        assert!(CompactionRolloutMode::ObserveOnly.captures_official());
+        assert!(!CompactionRolloutMode::ObserveOnly.allows_bridge_compaction());
+        assert!(CompactionRolloutMode::ThirdPartyOnly.allows_bridge_compaction());
+        assert!(!CompactionRolloutMode::ThirdPartyOnly.allows_cross_realm());
+        assert!(CompactionRolloutMode::FullSwitching.allows_cross_realm());
+    }
 }

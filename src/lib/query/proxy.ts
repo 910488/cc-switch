@@ -2,7 +2,11 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { proxyApi } from "@/lib/api/proxy";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
-import type { GlobalProxyConfig, AppProxyConfig } from "@/types/proxy";
+import type {
+  GlobalProxyConfig,
+  AppProxyConfig,
+  CompactionSettings,
+} from "@/types/proxy";
 
 // ========== 代理服务器状态 Hooks ==========
 
@@ -14,6 +18,25 @@ export function useProxyStatus() {
     queryKey: ["proxyStatus"],
     queryFn: () => proxyApi.getProxyStatus(),
     refetchInterval: 5000, // 每 5 秒刷新一次
+  });
+}
+
+export function useContinuitySettings() {
+  return useQuery({
+    queryKey: ["continuitySettings"],
+    queryFn: () => proxyApi.getContinuitySettings(),
+  });
+}
+
+export function useUpdateContinuitySettings() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (settings: CompactionSettings) =>
+      proxyApi.updateContinuitySettings(settings),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["continuitySettings"] });
+      queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
+    },
   });
 }
 

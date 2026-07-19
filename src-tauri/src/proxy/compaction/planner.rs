@@ -360,6 +360,6 @@ mod tests {
         assert!(chunks
             .iter()
             .all(|chunk| estimate_tokens(&Value::Array(chunk.clone())) <= 4_000));
-        assert!(recent.to_string().contains("recent"));
+        assert!(Value::Array(recent).to_string().contains("recent"));
     }
 }

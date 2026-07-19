@@ -68,6 +68,25 @@ pub async fn get_proxy_status(state: tauri::State<'_, AppState>) -> Result<Proxy
     state.proxy_service.get_status().await
 }
 
+#[tauri::command]
+pub async fn get_continuity_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::proxy::compaction::CompactionSettings, String> {
+    crate::proxy::compaction::CompactionService::new(state.db.clone())
+        .settings()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn update_continuity_settings(
+    state: tauri::State<'_, AppState>,
+    settings: crate::proxy::compaction::CompactionSettings,
+) -> Result<(), String> {
+    crate::proxy::compaction::CompactionService::new(state.db.clone())
+        .update_settings(&settings)
+        .map_err(|error| error.to_string())
+}
+
 /// 获取代理配置
 #[tauri::command]
 pub async fn get_proxy_config(state: tauri::State<'_, AppState>) -> Result<ProxyConfig, String> {

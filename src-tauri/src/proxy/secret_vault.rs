@@ -475,7 +475,7 @@ impl SecretVault for SecretServiceVault {
                 "--label",
                 &format!("cc-switch {account}"),
                 "service",
-                &service,
+                service,
                 "account",
                 &account,
             ])

@@ -102,6 +102,7 @@ pub struct ContinuityStatus {
     pub compactions: i64,
     pub migrations: i64,
     pub task_states: i64,
+    pub rollout_mode: String,
     pub error: Option<String>,
 }
 

@@ -5,7 +5,9 @@ mod planner;
 pub(crate) mod service;
 pub(crate) mod store;
 
-pub(crate) use model::{CompactionContext, ProviderRealm, Snapshot};
-pub(crate) use service::{CompactionService, MaterializationTarget};
+pub(crate) use model::{
+    CompactionContext, CompactionRolloutMode, CompactionSettings, ProviderRealm, Snapshot,
+};
+pub(crate) use service::{CompactionService, MaterializationTarget, OfficialRecompactPlan};
 #[cfg(test)]
 pub(crate) use store::CompactionStore;

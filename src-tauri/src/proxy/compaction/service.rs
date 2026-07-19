@@ -1,6 +1,6 @@
 use super::model::{
-    CompactionContext, CompactionTaskState, ProviderRealm, Snapshot, ENVELOPE_PREFIX,
-    MIGRATION_PROMPT_VERSION,
+    CompactionContext, CompactionRolloutMode, CompactionSettings, CompactionTaskState,
+    ProviderRealm, Snapshot, ENVELOPE_PREFIX, MIGRATION_PROMPT_VERSION,
 };
 use super::store::{canonical_snapshot_body, new_id, CompactionStore};
 use crate::database::Database;
@@ -48,15 +48,37 @@ pub(crate) struct MaterializationResult {
     pub compaction_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct OfficialRecompactPlan {
+    pub compact_body: Value,
+    pub fallback_body: Value,
+    pub suffix: Vec<Value>,
+    pub source_compaction_id: String,
+    pub snapshot: Snapshot,
+    pub cached_item: Option<Value>,
+}
+
+impl OfficialRecompactPlan {
+    pub(crate) fn resumed_body(&self, original_body: &Value, item: Value) -> Value {
+        let mut body = original_body.clone();
+        let mut input = vec![item];
+        input.extend(self.suffix.clone());
+        body["input"] = Value::Array(input);
+        body
+    }
+}
+
 pub(crate) struct CompactionService {
+    db: Arc<Database>,
     store: Option<Arc<CompactionStore>>,
     init_error: Option<String>,
 }
 
 impl CompactionService {
     pub(crate) fn new(db: Arc<Database>) -> Self {
-        match CompactionStore::new(db) {
+        match CompactionStore::new(db.clone()) {
             Ok(store) => Self {
+                db,
                 store: Some(Arc::new(store)),
                 init_error: None,
             },
@@ -64,6 +86,7 @@ impl CompactionService {
                 let message = sanitize_error(&error.to_string());
                 log::error!("Codex continuity journal unavailable: {message}");
                 Self {
+                    db,
                     store: None,
                     init_error: Some(message),
                 }
@@ -73,10 +96,32 @@ impl CompactionService {
 
     #[cfg(test)]
     pub(crate) fn with_store(store: CompactionStore) -> Self {
+        let db = store.database();
         Self {
+            db,
             store: Some(Arc::new(store)),
             init_error: None,
         }
+    }
+
+    pub(crate) fn settings(&self) -> Result<CompactionSettings, AppError> {
+        let Some(raw) = self.db.get_setting("codex_compaction_settings")? else {
+            return Ok(CompactionSettings::default());
+        };
+        serde_json::from_str(&raw)
+            .map_err(|error| AppError::Config(format!("invalid compaction settings: {error}")))
+    }
+
+    pub(crate) fn update_settings(&self, settings: &CompactionSettings) -> Result<(), AppError> {
+        let raw = serde_json::to_string(settings)
+            .map_err(|error| AppError::Config(format!("invalid compaction settings: {error}")))?;
+        self.db.set_setting("codex_compaction_settings", &raw)
+    }
+
+    pub(crate) fn rollout_mode(&self) -> CompactionRolloutMode {
+        self.settings()
+            .map(|settings| settings.rollout_mode)
+            .unwrap_or_default()
     }
 
     #[allow(dead_code)]
@@ -104,6 +149,10 @@ impl CompactionService {
                 compactions: counts.compactions,
                 migrations: counts.migrations,
                 task_states: counts.task_states,
+                rollout_mode: serde_json::to_value(self.rollout_mode())
+                    .ok()
+                    .and_then(|value| value.as_str().map(ToString::to_string))
+                    .unwrap_or_else(|| "full-switching".to_string()),
                 error: None,
             },
             Err(error) => ContinuityStatus {
@@ -362,6 +411,21 @@ impl CompactionService {
         body: &Value,
         target: &MaterializationTarget,
     ) -> Result<MaterializationResult, AppError> {
+        let result = self.materialize_for_target_unbounded(body, target)?;
+        if result.changed_items == 0 {
+            return Ok(result);
+        }
+        Ok(MaterializationResult {
+            body: super::planner::bound_migrated_continuation(&result.body),
+            ..result
+        })
+    }
+
+    fn materialize_for_target_unbounded(
+        &self,
+        body: &Value,
+        target: &MaterializationTarget,
+    ) -> Result<MaterializationResult, AppError> {
         let Some(input) = body.get("input").and_then(Value::as_array) else {
             return Ok(MaterializationResult {
                 body: body.clone(),
@@ -380,12 +444,121 @@ impl CompactionService {
         let materialized = self.materialize_items(store, input, target, &mut visited, &mut ids)?;
         let mut output = body.clone();
         output["input"] = Value::Array(materialized);
-        let output = super::planner::bound_migrated_continuation(&output);
         Ok(MaterializationResult {
             body: output,
             changed_items: ids.len(),
             compaction_ids: ids,
         })
+    }
+
+    pub(crate) fn prepare_official_recompact(
+        &self,
+        body: &Value,
+        target: &MaterializationTarget,
+    ) -> Result<Option<OfficialRecompactPlan>, AppError> {
+        if target.realm != ProviderRealm::Official || !self.rollout_mode().allows_cross_realm() {
+            return Ok(None);
+        }
+        let Some(input) = body.get("input").and_then(Value::as_array) else {
+            return Ok(None);
+        };
+        let store = self.store()?;
+        let mut source = None;
+        let mut last_compaction_index = None;
+        for (index, item) in input.iter().enumerate() {
+            if item.get("type").and_then(Value::as_str) != Some("compaction") {
+                continue;
+            }
+            let encrypted = item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !encrypted.starts_with(ENVELOPE_PREFIX) {
+                continue;
+            }
+            let envelope = store
+                .open_envelope(encrypted, item.get("id").and_then(Value::as_str))?
+                .ok_or_else(|| AppError::InvalidInput("invalid bridge compaction".to_string()))?;
+            source = Some(envelope);
+            last_compaction_index = Some(index);
+        }
+        let (Some(envelope), Some(last_index)) = (source, last_compaction_index) else {
+            return Ok(None);
+        };
+        let suffix = input[last_index + 1..]
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) != Some("compaction_trigger"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let materialized = self.materialize_for_target_unbounded(body, target)?;
+        let mut compact_body = materialized.body.clone();
+        let compact_input = compact_body
+            .get_mut("input")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                AppError::InvalidInput("materialized compact body has no input".to_string())
+            })?;
+        if compact_input.len() < suffix.len() {
+            return Err(AppError::InvalidInput(
+                "materialized compact suffix is inconsistent".to_string(),
+            ));
+        }
+        compact_input.truncate(compact_input.len() - suffix.len());
+        compact_body["stream"] = Value::Bool(false);
+        let snapshot = store.get_snapshot(&envelope.snapshot_id)?.ok_or_else(|| {
+            AppError::InvalidInput(format!(
+                "canonical snapshot {} is unavailable",
+                envelope.snapshot_id
+            ))
+        })?;
+        let cached_item = store.get_migration(
+            &envelope.compaction_id,
+            &target.model,
+            "official",
+            &target.provider_id,
+            MIGRATION_PROMPT_VERSION,
+        )?;
+        Ok(Some(OfficialRecompactPlan {
+            compact_body,
+            fallback_body: super::planner::bound_migrated_continuation(&materialized.body),
+            suffix,
+            source_compaction_id: envelope.compaction_id,
+            snapshot,
+            cached_item,
+        }))
+    }
+
+    pub(crate) fn finish_official_recompact(
+        &self,
+        context: &CompactionContext,
+        plan: &OfficialRecompactPlan,
+        target: &MaterializationTarget,
+        item: &Value,
+    ) -> Result<(), AppError> {
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                AppError::InvalidInput("native compaction item has no id".to_string())
+            })?;
+        let store = self.store()?;
+        self.register_native_compaction(context, &plan.snapshot, &target.provider_id, item)?;
+        store.save_migration(
+            &plan.source_compaction_id,
+            &target.model,
+            "official",
+            &target.provider_id,
+            MIGRATION_PROMPT_VERSION,
+            item,
+        )?;
+        log::info!(
+            "[Compaction] bridge {} re-tokenized as official native item {} for provider {}",
+            plan.source_compaction_id,
+            id,
+            target.provider_id
+        );
+        Ok(())
     }
 
     fn materialize_items(
@@ -437,6 +610,12 @@ impl CompactionService {
                     }
                     output.push(message);
                 } else {
+                    if !self.rollout_mode().allows_cross_realm() {
+                        return Err(AppError::InvalidInput(format!(
+                            "bridge-to-official compaction migration is disabled in {:?} mode",
+                            self.rollout_mode()
+                        )));
+                    }
                     output.extend(self.materialize_snapshot(
                         store,
                         &envelope.snapshot_id,
@@ -463,6 +642,17 @@ impl CompactionService {
             if same_native_realm {
                 output.push(item.clone());
             } else {
+                let source_is_official =
+                    stored.realm == "official" || stored.realm.starts_with("native:");
+                if source_is_official
+                    && target.realm == ProviderRealm::Bridge
+                    && !self.rollout_mode().allows_cross_realm()
+                {
+                    return Err(AppError::InvalidInput(format!(
+                        "official-to-bridge compaction migration is disabled in {:?} mode",
+                        self.rollout_mode()
+                    )));
+                }
                 output.extend(self.materialize_snapshot(
                     store,
                     &stored.snapshot_id,
@@ -651,5 +841,95 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("invalid bridge compaction"));
+    }
+
+    #[test]
+    fn official_recompact_uses_full_snapshot_excludes_suffix_and_caches_native_item() {
+        let service = service();
+        let context = CompactionContext {
+            thread_id: "thread-recompact".into(),
+            session_id: "session-recompact".into(),
+            request_id: "request-recompact".into(),
+        };
+        let snapshot = service
+            .save_snapshot(
+                &context,
+                &json!({"model":"bridge-model","input":[
+                    {"type":"message","role":"user","content":"CANONICAL_HISTORY"}
+                ]}),
+                ProviderRealm::Bridge,
+            )
+            .unwrap();
+        let bridge = service
+            .create_bridge_compaction(&context, &snapshot, "bridge-provider", "bridge summary")
+            .unwrap();
+        let original = json!({"model":"official-model","input":[
+            bridge,
+            {"type":"message","role":"user","content":"NEW_SUFFIX"}
+        ]});
+        let target = MaterializationTarget {
+            provider_id: "official-provider".into(),
+            model: "official-model".into(),
+            realm: ProviderRealm::Official,
+            realm_key: "native:official-provider".into(),
+        };
+        let plan = service
+            .prepare_official_recompact(&original, &target)
+            .unwrap()
+            .expect("plan");
+        assert!(plan.compact_body.to_string().contains("CANONICAL_HISTORY"));
+        assert!(!plan.compact_body.to_string().contains("NEW_SUFFIX"));
+        assert!(plan.fallback_body.to_string().contains("NEW_SUFFIX"));
+
+        let native = json!({"id":"cmp-native","type":"compaction","encrypted_content":"opaque"});
+        service
+            .finish_official_recompact(&context, &plan, &target, &native)
+            .unwrap();
+        let cached = service
+            .prepare_official_recompact(&original, &target)
+            .unwrap()
+            .expect("cached plan");
+        assert_eq!(cached.cached_item, Some(native.clone()));
+        let resumed = cached.resumed_body(&original, native);
+        assert_eq!(resumed["input"].as_array().unwrap().len(), 2);
+        assert!(resumed.to_string().contains("NEW_SUFFIX"));
+    }
+
+    #[test]
+    fn third_party_only_rejects_bridge_to_official_materialization() {
+        let service = service();
+        service
+            .update_settings(&CompactionSettings {
+                rollout_mode: CompactionRolloutMode::ThirdPartyOnly,
+                official_compact_fallback: true,
+            })
+            .unwrap();
+        let context = CompactionContext {
+            thread_id: "thread-mode".into(),
+            session_id: "session-mode".into(),
+            request_id: "request-mode".into(),
+        };
+        let snapshot = service
+            .save_snapshot(
+                &context,
+                &json!({"model":"bridge","input":[{"type":"message","content":"history"}]}),
+                ProviderRealm::Bridge,
+            )
+            .unwrap();
+        let bridge = service
+            .create_bridge_compaction(&context, &snapshot, "bridge", "summary")
+            .unwrap();
+        let error = service
+            .materialize_for_target(
+                &json!({"model":"official","input":[bridge]}),
+                &MaterializationTarget {
+                    provider_id: "official".into(),
+                    model: "official".into(),
+                    realm: ProviderRealm::Official,
+                    realm_key: "native:official".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("bridge-to-official"));
     }
 }

@@ -6,6 +6,7 @@ import type {
   ProxyTakeoverStatus,
   GlobalProxyConfig,
   AppProxyConfig,
+  CompactionSettings,
 } from "@/types/proxy";
 
 export const proxyApi = {
@@ -24,6 +25,16 @@ export const proxyApi = {
   // 获取代理服务器状态
   async getProxyStatus(): Promise<ProxyStatus> {
     return invoke("get_proxy_status");
+  },
+
+  async getContinuitySettings(): Promise<CompactionSettings> {
+    return invoke("get_continuity_settings");
+  },
+
+  async updateContinuitySettings(
+    settings: CompactionSettings,
+  ): Promise<void> {
+    return invoke("update_continuity_settings", { settings });
   },
 
   // 检查代理服务器是否正在运行
