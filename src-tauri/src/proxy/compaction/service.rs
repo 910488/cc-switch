@@ -44,6 +44,7 @@ pub(crate) struct MaterializationTarget {
 pub(crate) struct MaterializationResult {
     pub body: Value,
     pub changed_items: usize,
+    #[allow(dead_code)]
     pub compaction_ids: Vec<String>,
 }
 
@@ -78,10 +79,12 @@ impl CompactionService {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_available(&self) -> bool {
         self.store.is_some()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn key_protection(&self) -> Option<&str> {
         self.store.as_ref().map(|store| store.key_protection())
     }

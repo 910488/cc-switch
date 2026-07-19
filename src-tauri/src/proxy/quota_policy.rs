@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub(crate) struct QuotaLatch {
+    #[allow(dead_code)]
     pub provider_id: String,
+    #[allow(dead_code)]
     pub account_id: String,
     pub quota_kind: String,
     pub blocked_until: DateTime<Utc>,

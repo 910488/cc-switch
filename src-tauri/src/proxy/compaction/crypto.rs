@@ -38,7 +38,7 @@ impl JournalCipher {
         {
             let key_path = root.join("compaction-key.dpapi");
             let key = load_or_create_dpapi_key(&key_path)?;
-            return Self::from_key(key, "dpapi-current-user");
+            Self::from_key(key, "dpapi-current-user")
         }
 
         #[cfg(not(windows))]

@@ -29,6 +29,7 @@ pub(crate) struct CompactionContext {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct Snapshot {
     pub id: String,
     pub thread_id: String,
@@ -43,6 +44,7 @@ pub(crate) struct Snapshot {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct StoredCompaction {
     pub id: String,
     pub snapshot_id: String,

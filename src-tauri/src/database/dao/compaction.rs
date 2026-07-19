@@ -37,6 +37,7 @@ pub(crate) struct CompactionRow {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct TaskStateRow {
     pub thread_id: String,
     pub session_id: String,
@@ -109,6 +110,7 @@ impl Database {
         .map_err(|e| AppError::Database(format!("读取 compaction snapshot 失败: {e}")))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn latest_compaction_snapshot_row(
         &self,
         thread_id: &str,
@@ -141,6 +143,7 @@ impl Database {
         result.map_err(|e| AppError::Database(format!("读取最新 compaction snapshot 失败: {e}")))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn upsert_compaction_row(&self, row: &CompactionRow) -> Result<(), AppError> {
         let conn = lock_conn!(self.conn);
         let inserted = conn.execute(
@@ -282,6 +285,7 @@ impl Database {
         .map_err(|e| AppError::Database(format!("读取 compaction item 失败: {e}")))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn upsert_compaction_migration(
         &self,
         source_compaction_id: &str,
@@ -357,6 +361,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn recent_compaction_task_state_rows(
         &self,
         limit: usize,
@@ -398,6 +403,7 @@ impl Database {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn delete_compaction_thread(&self, thread_id: &str) -> Result<usize, AppError> {
         let mut conn = lock_conn!(self.conn);
         let tx = conn

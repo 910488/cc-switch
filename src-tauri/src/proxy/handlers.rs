@@ -1348,9 +1348,10 @@ fn summary_usage(value: &Value, protocol: LocalSummaryProtocol) -> (u64, u64, u6
 
 fn summary_call_error(error: ProxyError) -> SummaryCallError {
     let overflow = match &error {
-        ProxyError::UpstreamError { status, body } if matches!(status, 400 | 413 | 422) => {
-            body.as_deref().is_some_and(is_context_overflow_detail)
-        }
+        ProxyError::UpstreamError {
+            status: 400 | 413 | 422,
+            body,
+        } => body.as_deref().is_some_and(is_context_overflow_detail),
         ProxyError::TransformError(message) | ProxyError::InvalidRequest(message) => {
             is_context_overflow_detail(message)
         }

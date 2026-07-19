@@ -111,6 +111,7 @@ impl CompactionStore {
         }))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn latest_snapshot(
         &self,
         thread_id: &str,
@@ -125,6 +126,7 @@ impl CompactionStore {
         self.get_snapshot(&row.id)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn register_compaction(
         &self,
         id: &str,
@@ -310,6 +312,7 @@ impl CompactionStore {
         )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn recent_task_states(
         &self,
         limit: usize,
@@ -400,6 +403,7 @@ impl CompactionStore {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn delete_thread(&self, thread_id: &str) -> Result<usize, AppError> {
         self.db.delete_compaction_thread(thread_id)
     }
