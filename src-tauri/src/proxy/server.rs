@@ -1197,8 +1197,9 @@ mod continuity_e2e_tests {
             .unwrap();
         assert_eq!(chat_resume.status(), reqwest::StatusCode::OK);
 
-        // Bridge token -> native Responses: use the bridge snapshot's canonical
-        // input and preserve the continuation suffix exactly once.
+        // Bridge token -> native Responses: recompact the bridge snapshot through
+        // the official compact endpoint, then resume with the returned native
+        // token and preserve the continuation suffix exactly once.
         let bridge_compact = client
             .post(format!(
                 "http://127.0.0.1:{}/v1/responses/compact",
@@ -1247,7 +1248,14 @@ mod continuity_e2e_tests {
             .map(Value::to_string)
             .find(|body| body.contains("BRIDGE_TO_NATIVE_SUFFIX"))
             .expect("bridge->native request");
-        assert!(native_wire.contains("BRIDGE_EARLY_CONTEXT"));
+        let official_recompact_wire = state
+            .native_requests
+            .iter()
+            .map(Value::to_string)
+            .find(|body| body.contains("BRIDGE_EARLY_CONTEXT"))
+            .expect("bridge snapshot sent to official compact endpoint");
+        assert!(!official_recompact_wire.contains("bcmp1."));
+        assert!(native_wire.contains("opaque-native-e2e"));
         assert_eq!(native_wire.matches("BRIDGE_TO_NATIVE_SUFFIX").count(), 1);
         assert!(!native_wire.contains("bcmp1."));
         drop(state);
