@@ -3,7 +3,6 @@
 //! Database access operations for each domain
 
 pub(crate) mod compaction;
-pub(crate) mod credentials;
 pub mod failover;
 pub mod mcp;
 pub mod profiles;
