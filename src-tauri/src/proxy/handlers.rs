@@ -8,16 +8,21 @@
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
 use super::{
+    auto_review::{self, AutoReviewMode},
     compaction::{
         executor::{
-            self as compaction_executor, SummaryCall, SummaryCallError, SummaryClient, SummaryReply,
+            self as compaction_executor, SummaryCall, SummaryCallError, SummaryClient,
+            SummaryExecutionOptions, SummaryReply,
         },
         CompactionContext, CompactionService, MaterializationTarget, OfficialRecompactPlan,
         ProviderRealm, Snapshot,
     },
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
-    forwarder::{ActiveConnectionGuard, RequestForwarder, INTERNAL_SUMMARY_HEADER},
+    forwarder::{
+        ActiveConnectionGuard, RequestForwarder, INTERNAL_MODEL_OVERRIDE_FIELD,
+        INTERNAL_MODEL_OVERRIDE_HEADER, INTERNAL_SUMMARY_HEADER,
+    },
     handler_config::{
         claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
         CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
@@ -811,6 +816,17 @@ async fn handle_responses_for_app(
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
     let endpoint = endpoint_with_query(&uri, "/responses");
 
+    if app_type == AppType::Codex && auto_review::is_auto_review_request(&body) {
+        let settings = auto_review::load_settings(&state.db)
+            .map_err(|error| ProxyError::ConfigError(error.to_string()))?;
+        if settings.mode != AutoReviewMode::Off {
+            return handle_auto_review_request(
+                &state, method, &endpoint, body, headers, extensions, ctx, settings,
+            )
+            .await;
+        }
+    }
+
     let is_compaction = CompactionService::is_compaction_request(&body);
     let continuity_context =
         CompactionService::context_from_request(&headers, &body, &ctx.session_id);
@@ -1040,6 +1056,195 @@ async fn handle_responses_for_app(
 }
 
 /// 处理 /v1/responses/compact 请求（OpenAI Responses Compact API - Codex CLI 透传）
+#[allow(clippy::too_many_arguments)]
+async fn handle_auto_review_request(
+    state: &ProxyState,
+    method: http::Method,
+    endpoint: &str,
+    body: Value,
+    mut headers: axum::http::HeaderMap,
+    extensions: http::Extensions,
+    mut ctx: RequestContext,
+    settings: auto_review::AutoReviewSettings,
+) -> Result<axum::response::Response, ProxyError> {
+    let original_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let forwarder = ctx.create_forwarder(state);
+
+    if settings.mode == AutoReviewMode::Auto {
+        let official = auto_review::resolve_official_provider(&state.db)?;
+        state.auto_review_runtime.record_official_attempt();
+        match forwarder
+            .forward_pinned(
+                &AppType::Codex,
+                method.clone(),
+                endpoint,
+                body.clone(),
+                headers.clone(),
+                extensions.clone(),
+                official,
+            )
+            .await
+        {
+            Ok(result) => {
+                return finish_codex_pinned_response(
+                    result,
+                    &mut ctx,
+                    state,
+                    endpoint,
+                    &body,
+                    original_stream,
+                )
+                .await;
+            }
+            Err(error) if auto_review::is_official_quota_429(&error.error) => {
+                state.auto_review_runtime.record_official_quota_429();
+                log::warn!("[AutoReview] official quota exhausted; using configured fallback");
+            }
+            Err(mut error) => {
+                if let Some(provider) = error.provider.take() {
+                    ctx.provider = provider;
+                }
+                log_forward_error(state, &ctx, original_stream, &error.error);
+                return build_codex_proxy_error_response(&ctx, endpoint, &error.error);
+            }
+        }
+    }
+
+    let fallback = auto_review::resolve_fallback_provider_for_request(&state.db, &settings)?;
+    let mut fallback_body = auto_review::prepare_fallback_body(&body, &settings);
+    // Buffer the substitute result so a JSON markdown fence can be removed
+    // before the response is returned. The client still receives its requested wire mode.
+    fallback_body["stream"] = Value::Bool(false);
+    fallback_body[INTERNAL_MODEL_OVERRIDE_FIELD] = Value::String(settings.fallback_model.clone());
+    headers.insert(
+        INTERNAL_MODEL_OVERRIDE_HEADER,
+        http::HeaderValue::from_static("1"),
+    );
+    state
+        .auto_review_runtime
+        .record_fallback(&fallback.id, &settings.fallback_model)
+        .await;
+
+    let result = match forwarder
+        .forward_pinned(
+            &AppType::Codex,
+            method,
+            endpoint,
+            fallback_body,
+            headers,
+            extensions,
+            fallback,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(mut error) => {
+            state
+                .auto_review_runtime
+                .record_fallback_failure(&error.error)
+                .await;
+            if let Some(provider) = error.provider.take() {
+                ctx.provider = provider;
+            }
+            log_forward_error(state, &ctx, original_stream, &error.error);
+            return build_codex_proxy_error_response(&ctx, endpoint, &error.error);
+        }
+    };
+
+    let response =
+        match finish_codex_pinned_response(result, &mut ctx, state, endpoint, &body, false).await {
+            Ok(response) => response,
+            Err(error) => {
+                state
+                    .auto_review_runtime
+                    .record_fallback_failure(&error)
+                    .await;
+                return Err(error);
+            }
+        };
+    let (parts, response_body) = response.into_parts();
+    let bytes = response_body
+        .collect()
+        .await
+        .map_err(|error| ProxyError::Internal(format!("Failed to buffer Auto Review: {error}")))?
+        .to_bytes();
+    let mut value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        ProxyError::TransformError(format!("Failed to parse Auto Review response: {error}"))
+    })?;
+    auto_review::strip_json_fence_from_response(&mut value);
+    let output = if original_stream {
+        auto_review::response_to_sse(&value)?
+    } else {
+        serde_json::to_vec(&value).map_err(|error| {
+            ProxyError::TransformError(format!("Failed to encode Auto Review response: {error}"))
+        })?
+    };
+    let mut response_headers = parts.headers;
+    strip_hop_by_hop_response_headers(&mut response_headers);
+    response_headers.remove(axum::http::header::CONTENT_LENGTH);
+    response_headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static(if original_stream {
+            "text/event-stream"
+        } else {
+            "application/json"
+        }),
+    );
+    let mut builder = axum::response::Response::builder().status(parts.status);
+    for (name, value) in &response_headers {
+        builder = builder.header(name, value);
+    }
+    let response = builder
+        .body(axum::body::Body::from(output))
+        .map_err(|error| ProxyError::Internal(format!("Failed to replay Auto Review: {error}")))?;
+    state.auto_review_runtime.record_fallback_success().await;
+    Ok(response)
+}
+
+async fn finish_codex_pinned_response(
+    mut result: super::forwarder::ForwardResult,
+    ctx: &mut RequestContext,
+    state: &ProxyState,
+    endpoint: &str,
+    request_body: &Value,
+    is_stream: bool,
+) -> Result<axum::response::Response, ProxyError> {
+    let connection_guard = result.connection_guard.take();
+    ctx.outbound_model = result.outbound_model.take();
+    ctx.provider = result.provider;
+    let tool_context = transform_codex_chat::build_codex_tool_context_from_request(request_body);
+    if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, endpoint) {
+        return handle_codex_anthropic_to_responses_transform(
+            result.response,
+            ctx,
+            state,
+            is_stream,
+            connection_guard,
+            tool_context,
+        )
+        .await;
+    }
+    if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, endpoint) {
+        return handle_codex_chat_to_responses_transform(
+            result.response,
+            ctx,
+            state,
+            is_stream,
+            connection_guard,
+            tool_context,
+        )
+        .await;
+    }
+    process_response(
+        result.response,
+        ctx,
+        state,
+        &CODEX_PARSER_CONFIG,
+        connection_guard,
+    )
+    .await
+}
+
 pub async fn handle_responses_compact(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
@@ -1423,6 +1628,14 @@ async fn execute_local_compaction(
     compact_endpoint: bool,
     original_stream: bool,
 ) -> Result<axum::response::Response, ProxyError> {
+    let settings = state
+        .compaction_service
+        .settings()
+        .map_err(|error| ProxyError::ConfigError(error.to_string()))?;
+    providers = state
+        .compaction_service
+        .resolve_summary_providers(app_type, providers)
+        .map_err(|error| ProxyError::ConfigError(error.to_string()))?;
     providers.retain(|provider| {
         super::providers::should_convert_codex_responses_to_chat(provider, endpoint)
             || super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint)
@@ -1440,26 +1653,35 @@ async fn execute_local_compaction(
         providers,
         tag,
         non_streaming_timeout,
+        summary_model: settings.summary_model.clone(),
         last_provider: None,
     };
-    let execution = compaction_executor::execute(&mut client, original_body, |progress| {
-        log::info!(
-            "[Compaction] strategy={} phase={} chunks={}/{} retries={} budget={}",
-            progress.strategy,
-            progress.phase,
-            progress.chunks_completed,
-            progress.chunks_total,
-            progress.retries,
-            progress.input_budget
-        );
-        if let Err(error) = state.compaction_service.record_summary_progress(
-            continuity_context,
-            snapshot,
-            &progress,
-        ) {
-            log::error!("[Compaction] failed to persist summary progress: {error}");
-        }
-    })
+    let execution = compaction_executor::execute(
+        &mut client,
+        original_body,
+        SummaryExecutionOptions {
+            input_budget: settings.summary_input_budget,
+            final_max_output_tokens: settings.summary_max_output_tokens,
+        },
+        |progress| {
+            log::info!(
+                "[Compaction] strategy={} phase={} chunks={}/{} retries={} budget={}",
+                progress.strategy,
+                progress.phase,
+                progress.chunks_completed,
+                progress.chunks_total,
+                progress.retries,
+                progress.input_budget
+            );
+            if let Err(error) = state.compaction_service.record_summary_progress(
+                continuity_context,
+                snapshot,
+                &progress,
+            ) {
+                log::error!("[Compaction] failed to persist summary progress: {error}");
+            }
+        },
+    )
     .await;
     let execution = match execution {
         Ok(execution) => execution,
@@ -1499,6 +1721,7 @@ struct ForwarderSummaryClient<'a> {
     providers: Vec<Provider>,
     tag: &'static str,
     non_streaming_timeout: u32,
+    summary_model: Option<String>,
     last_provider: Option<Provider>,
 }
 
@@ -1510,11 +1733,16 @@ impl SummaryClient for ForwarderSummaryClient<'_> {
         Box<dyn std::future::Future<Output = Result<SummaryReply, SummaryCallError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let prepared = CompactionService::prepare_local_summary_request_with(
+            let mut prepared = CompactionService::prepare_local_summary_request_with(
                 &call.body,
                 &call.prompt,
                 call.max_output_tokens,
             );
+            if let Some(model) = self.summary_model.as_ref() {
+                prepared["model"] = Value::String(model.clone());
+                prepared[super::forwarder::INTERNAL_SUMMARY_MODEL_FIELD] =
+                    Value::String(model.clone());
+            }
             let mut headers = self.headers.clone();
             headers.insert(INTERNAL_SUMMARY_HEADER, http::HeaderValue::from_static("1"));
             let mut result = self

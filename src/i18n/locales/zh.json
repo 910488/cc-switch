@@ -2493,6 +2493,44 @@
         "uptime": "运行时间"
       }
     },
+    "continuity": {
+      "configurationTitle": "上下文压缩",
+      "configurationDescription": "设置 Codex continuity 如何建立本地交接摘要，以及由哪个第三方路由执行摘要。",
+      "rolloutMode": "启用模式",
+      "rollout": {
+        "off": "关闭",
+        "observeOnly": "仅观察",
+        "thirdPartyOnly": "仅第三方",
+        "fullSwitching": "完整跨 Provider 续接"
+      },
+      "rolloutHint": "控制 journal 保存、本地压缩与跨 Provider 上下文续接。",
+      "officialFallback": "官方压缩安全回退",
+      "officialFallbackHint": "官方 compact endpoint 失败时，改用 canonical context 安全展开。",
+      "summaryProvider": "摘要 Provider",
+      "followActiveRoute": "跟随当前第三方路由",
+      "missingProvider": "找不到 Provider：{{id}}",
+      "summaryProviderHint": "可固定使用第三方 Codex Chat／Anthropic Provider，或维持现有的当前路由行为。",
+      "summaryModel": "摘要模型",
+      "summaryModelPlaceholder": "Provider 默认模型",
+      "summaryModelHint": "可选择已配置模型或输入精确的 upstream model ID；留空时使用 Provider 默认值。",
+      "effectiveTarget": "实际摘要目标",
+      "providerDefaultModel": "Provider 默认模型",
+      "activeRouteTarget": "当前第三方路由 · 原请求模型",
+      "appliesWhenStarted": "此设置会在本地路由启动后生效。",
+      "advancedLimits": "高级摘要限制",
+      "advancedLimitsHint": "只开放 executor 真正使用的限制；chunk 大小与 overflow retry 仍由系统自动处理。",
+      "inputBudget": "初始输入 budget",
+      "inputBudgetHint": "{{min}}–{{max}} tokens。小 context 模型可调低；overflow retry 仍会自动缩小。",
+      "outputTokens": "最终交接摘要输出上限",
+      "outputTokensHint": "{{min}}–{{max}} tokens，请勿超过所选模型的输出上限。",
+      "saved": "上下文压缩设置已保存",
+      "saveFailed": "无法保存上下文压缩设置：{{error}}",
+      "validation": {
+        "inputBudget": "输入 budget 必须介于 {{min}} 与 {{max}} tokens。",
+        "outputTokens": "输出上限必须介于 {{min}} 与 {{max}} tokens。",
+        "providerMissing": "选取的摘要 Provider 已不存在，请重新选择。"
+      }
+    },
     "settings": {
       "title": "路由服务设置",
       "description": "配置本地路由服务器的监听地址、端口和运行参数，保存后立即生效。",

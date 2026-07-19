@@ -40,6 +40,9 @@ use tokio::sync::RwLock;
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 pub(crate) const INTERNAL_SUMMARY_HEADER: &str = "x-cc-switch-summary-prepared";
+pub(crate) const INTERNAL_SUMMARY_MODEL_FIELD: &str = "_cc_switch_summary_model";
+pub(crate) const INTERNAL_MODEL_OVERRIDE_HEADER: &str = "x-cc-switch-model-override";
+pub(crate) const INTERNAL_MODEL_OVERRIDE_FIELD: &str = "_cc_switch_model_override";
 
 fn validate_codex_official_authorization(headers: &http::HeaderMap) -> Result<(), ProxyError> {
     let authorization = headers
@@ -375,6 +378,48 @@ impl RequestForwarder {
         result.map(|mut fr| {
             fr.connection_guard = Some(guard);
             fr
+        })
+    }
+
+    /// Send one request through one explicitly selected provider without
+    /// consulting the normal failover queue, quota latches, or circuit breaker.
+    /// This route also never changes the globally selected provider.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn forward_pinned(
+        &self,
+        app_type: &AppType,
+        method: http::Method,
+        endpoint: &str,
+        body: Value,
+        headers: axum::http::HeaderMap,
+        extensions: Extensions,
+        provider: Provider,
+    ) -> Result<ForwardResult, ForwardError> {
+        let guard = ActiveConnectionGuard::acquire(self.status.clone()).await;
+        let adapter = get_adapter(app_type);
+        self.forward(
+            app_type,
+            &method,
+            &provider,
+            endpoint,
+            &body,
+            &headers,
+            &extensions,
+            adapter.as_ref(),
+        )
+        .await
+        .map(
+            |(response, claude_api_format, outbound_model)| ForwardResult {
+                response,
+                provider: provider.clone(),
+                claude_api_format,
+                outbound_model,
+                connection_guard: Some(guard),
+            },
+        )
+        .map_err(|error| ForwardError {
+            error,
+            provider: Some(provider),
         })
     }
 
@@ -1220,6 +1265,27 @@ impl RequestForwarder {
             && codex_official_auth_mode == crate::provider::CodexOfficialAuthMode::Native;
         let codex_official_managed_auth = is_codex_official
             && codex_official_auth_mode != crate::provider::CodexOfficialAuthMode::Native;
+        let internal_summary_model = if headers.contains_key(INTERNAL_SUMMARY_HEADER) {
+            body.get(INTERNAL_SUMMARY_MODEL_FIELD)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(ToString::to_string)
+        } else {
+            None
+        };
+        let internal_model_override = if headers.contains_key(INTERNAL_MODEL_OVERRIDE_HEADER) {
+            body.get(INTERNAL_MODEL_OVERRIDE_FIELD)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(ToString::to_string)
+        } else {
+            None
+        };
+        let pinned_model = internal_model_override
+            .as_ref()
+            .or(internal_summary_model.as_ref());
 
         if codex_official_auth_passthrough {
             validate_codex_official_authorization(headers)?;
@@ -1239,6 +1305,15 @@ impl RequestForwarder {
 
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
         let mut mapped_body = normalize_thinking_type(mapped_body);
+
+        if let Some(object) = mapped_body.as_object_mut() {
+            object.remove(INTERNAL_SUMMARY_MODEL_FIELD);
+            object.remove(INTERNAL_MODEL_OVERRIDE_FIELD);
+        }
+
+        if let Some(model) = pinned_model {
+            mapped_body["model"] = Value::String(model.clone());
+        }
 
         // Grok Build exposes a stable client-side model profile in config.toml.
         // Route requests to the provider's real upstream model before applying
@@ -1553,6 +1628,9 @@ impl RequestForwarder {
                 );
             }
             super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
+            if let Some(model) = pinned_model {
+                mapped_body["model"] = Value::String(model.clone());
+            }
             let reasoning_config =
                 super::providers::resolve_codex_chat_reasoning_config(provider, &mapped_body);
             let mut chat_body = super::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning(
@@ -1570,6 +1648,9 @@ impl RequestForwarder {
         } else if codex_responses_to_anthropic {
             let mut mapped_body = mapped_body;
             super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
+            if let Some(model) = pinned_model {
+                mapped_body["model"] = Value::String(model.clone());
+            }
             // Per-provider output ceiling override. Codex does not forward its
             // `model_max_output_tokens` in the request body, so honor the value
             // configured on the provider here — it takes precedence over any
@@ -1578,13 +1659,15 @@ impl RequestForwarder {
             // lets the thinking-budget clamp size its headroom against the real
             // ceiling too. Kept per-provider to avoid a global large default that
             // would 400 on low-output-ceiling gateways.
-            if let Some(max_out) = provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.max_output_tokens)
-                .filter(|v| *v > 0)
-            {
-                mapped_body["max_output_tokens"] = Value::from(max_out);
+            if !headers.contains_key(INTERNAL_SUMMARY_HEADER) {
+                if let Some(max_out) = provider
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.max_output_tokens)
+                    .filter(|v| *v > 0)
+                {
+                    mapped_body["max_output_tokens"] = Value::from(max_out);
+                }
             }
             // Anthropic requires max_tokens; fall back to this default only when the
             // Codex request omits max_output_tokens (rare — Codex normally sends it).

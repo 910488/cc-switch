@@ -2493,6 +2493,44 @@
         "uptime": "Uptime"
       }
     },
+    "continuity": {
+      "configurationTitle": "Context compaction",
+      "configurationDescription": "Choose how Codex continuity creates local handoff summaries and which third-party route performs the work.",
+      "rolloutMode": "Rollout mode",
+      "rollout": {
+        "off": "Off",
+        "observeOnly": "Observe only",
+        "thirdPartyOnly": "Third-party only",
+        "fullSwitching": "Full switching"
+      },
+      "rolloutHint": "Controls journal capture, local compaction, and cross-provider continuation.",
+      "officialFallback": "Safe official compact fallback",
+      "officialFallbackHint": "Materialize canonical context if the official compact endpoint fails.",
+      "summaryProvider": "Summary provider",
+      "followActiveRoute": "Follow the active third-party route",
+      "missingProvider": "Missing provider: {{id}}",
+      "summaryProviderHint": "Pin a third-party Codex Chat or Anthropic provider, or keep the existing active-route behavior.",
+      "summaryModel": "Summary model",
+      "summaryModelPlaceholder": "Provider default model",
+      "summaryModelHint": "Select a configured model or enter its exact upstream model ID. Leave blank to use the provider default.",
+      "effectiveTarget": "Effective summary target",
+      "providerDefaultModel": "provider default model",
+      "activeRouteTarget": "Active third-party route · request model",
+      "appliesWhenStarted": "This selection takes effect when local routing starts.",
+      "advancedLimits": "Advanced summary limits",
+      "advancedLimitsHint": "Only limits that map to the executor are exposed. Chunk sizing and overflow retries remain automatic.",
+      "inputBudget": "Initial input budget",
+      "inputBudgetHint": "{{min}}–{{max}} tokens. Lower this for models with smaller context windows; overflow retries reduce it further.",
+      "outputTokens": "Final handoff output limit",
+      "outputTokensHint": "{{min}}–{{max}} tokens. Do not exceed the selected model's output ceiling.",
+      "saved": "Context compaction settings saved",
+      "saveFailed": "Failed to save context compaction settings: {{error}}",
+      "validation": {
+        "inputBudget": "Input budget must be between {{min}} and {{max}} tokens.",
+        "outputTokens": "Output limit must be between {{min}} and {{max}} tokens.",
+        "providerMissing": "The selected summary provider no longer exists. Choose another provider."
+      }
+    },
     "settings": {
       "title": "Routing Service Settings",
       "description": "Configure local routing server listening address, port and runtime parameters. Changes take effect immediately after saving.",

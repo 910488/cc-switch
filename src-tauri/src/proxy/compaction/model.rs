@@ -1,6 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub(crate) const DEFAULT_SUMMARY_INPUT_BUDGET: usize = 236_000;
+pub(crate) const MIN_SUMMARY_INPUT_BUDGET: usize = 4_000;
+pub(crate) const MAX_SUMMARY_INPUT_BUDGET: usize = DEFAULT_SUMMARY_INPUT_BUDGET;
+pub(crate) const DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS: usize = 12_000;
+pub(crate) const MIN_SUMMARY_MAX_OUTPUT_TOKENS: usize = 1_200;
+pub(crate) const MAX_SUMMARY_MAX_OUTPUT_TOKENS: usize = DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS;
+
 pub(crate) const ENVELOPE_PREFIX: &str = "bcmp1.";
 pub(crate) const ENVELOPE_VERSION: i64 = 1;
 pub(crate) const KEY_VERSION: i64 = 1;
@@ -37,6 +44,20 @@ pub struct CompactionSettings {
     pub rollout_mode: CompactionRolloutMode,
     #[serde(default = "default_true")]
     pub official_compact_fallback: bool,
+    /// Optional, pinned third-party Codex provider used only for local bridge
+    /// summaries. `None` preserves the existing active-route/failover behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_provider_id: Option<String>,
+    /// Exact upstream model for bridge summaries. This is meaningful only when
+    /// `summary_provider_id` is set; `None` uses that provider's configured default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_model: Option<String>,
+    /// Initial per-call input budget. Overflow retries reduce this automatically.
+    #[serde(default = "default_summary_input_budget")]
+    pub summary_input_budget: usize,
+    /// Final handoff output ceiling. Chunk summaries remain derived and bounded.
+    #[serde(default = "default_summary_max_output_tokens")]
+    pub summary_max_output_tokens: usize,
 }
 
 impl Default for CompactionSettings {
@@ -44,12 +65,76 @@ impl Default for CompactionSettings {
         Self {
             rollout_mode: CompactionRolloutMode::FullSwitching,
             official_compact_fallback: true,
+            summary_provider_id: None,
+            summary_model: None,
+            summary_input_budget: DEFAULT_SUMMARY_INPUT_BUDGET,
+            summary_max_output_tokens: DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS,
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_summary_input_budget() -> usize {
+    DEFAULT_SUMMARY_INPUT_BUDGET
+}
+
+fn default_summary_max_output_tokens() -> usize {
+    DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS
+}
+
+impl CompactionSettings {
+    pub(crate) fn normalized(mut self) -> Self {
+        self.summary_provider_id = normalize_optional_text(self.summary_provider_id);
+        self.summary_model = normalize_optional_text(self.summary_model);
+        if self.summary_provider_id.is_none() {
+            self.summary_model = None;
+        }
+        self
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !(MIN_SUMMARY_INPUT_BUDGET..=MAX_SUMMARY_INPUT_BUDGET)
+            .contains(&self.summary_input_budget)
+        {
+            return Err(format!(
+                "summary input budget must be between {MIN_SUMMARY_INPUT_BUDGET} and {MAX_SUMMARY_INPUT_BUDGET} tokens"
+            ));
+        }
+        if !(MIN_SUMMARY_MAX_OUTPUT_TOKENS..=MAX_SUMMARY_MAX_OUTPUT_TOKENS)
+            .contains(&self.summary_max_output_tokens)
+        {
+            return Err(format!(
+                "summary output limit must be between {MIN_SUMMARY_MAX_OUTPUT_TOKENS} and {MAX_SUMMARY_MAX_OUTPUT_TOKENS} tokens"
+            ));
+        }
+        if self
+            .summary_provider_id
+            .as_deref()
+            .is_some_and(|value| value.len() > 256 || value.chars().any(char::is_control))
+        {
+            return Err("summary provider id is invalid".to_string());
+        }
+        if self
+            .summary_model
+            .as_deref()
+            .is_some_and(|value| value.len() > 256 || value.chars().any(char::is_control))
+        {
+            return Err("summary model is invalid".to_string());
+        }
+        if self.summary_provider_id.is_none() && self.summary_model.is_some() {
+            return Err("summary model requires a pinned summary provider".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,10 +261,57 @@ mod tests {
         let settings = CompactionSettings::default();
         assert_eq!(settings.rollout_mode, CompactionRolloutMode::FullSwitching);
         assert!(settings.official_compact_fallback);
+        assert_eq!(settings.summary_input_budget, 236_000);
+        assert_eq!(settings.summary_max_output_tokens, 12_000);
+        assert!(settings.summary_provider_id.is_none());
         assert_eq!(
             serde_json::to_string(&settings.rollout_mode).unwrap(),
             "\"full-switching\""
         );
+    }
+
+    #[test]
+    fn legacy_settings_receive_safe_summary_defaults() {
+        let settings: CompactionSettings = serde_json::from_value(serde_json::json!({
+            "rolloutMode": "third-party-only",
+            "officialCompactFallback": false
+        }))
+        .unwrap();
+        assert_eq!(settings.summary_input_budget, DEFAULT_SUMMARY_INPUT_BUDGET);
+        assert_eq!(
+            settings.summary_max_output_tokens,
+            DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS
+        );
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn summary_settings_trim_values_and_reject_unsafe_limits() {
+        let normalized = CompactionSettings {
+            summary_provider_id: Some(" provider-a ".into()),
+            summary_model: Some(" model-a ".into()),
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(
+            normalized.summary_provider_id.as_deref(),
+            Some("provider-a")
+        );
+        assert_eq!(normalized.summary_model.as_deref(), Some("model-a"));
+        normalized.validate().unwrap();
+
+        assert!(CompactionSettings {
+            summary_input_budget: MIN_SUMMARY_INPUT_BUDGET - 1,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(CompactionSettings {
+            summary_max_output_tokens: MAX_SUMMARY_MAX_OUTPUT_TOKENS + 1,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

@@ -9,6 +9,7 @@
 //! a direct (non-proxied) CLI request.
 
 use super::{
+    auto_review::{AutoReviewRuntime, AutoReviewStats},
     compaction::CompactionService,
     failover_switch::FailoverSwitchManager,
     handlers,
@@ -47,6 +48,8 @@ pub struct ProxyState {
     pub codex_chat_history: Arc<CodexChatHistoryStore>,
     /// Durable encrypted journal used to keep Codex context valid while providers change.
     pub compaction_service: Arc<CompactionService>,
+    /// Runtime counters for the pinned `codex-auto-review` route.
+    pub auto_review_runtime: Arc<AutoReviewRuntime>,
     /// AppHandle，用于发射事件和更新托盘菜单
     pub app_handle: Option<tauri::AppHandle>,
     /// 故障转移切换管理器
@@ -84,6 +87,7 @@ impl ProxyServer {
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             compaction_service,
+            auto_review_runtime: Arc::new(AutoReviewRuntime::default()),
             app_handle,
             failover_manager,
         };
@@ -280,6 +284,10 @@ impl ProxyServer {
         status.continuity = self.state.compaction_service.status();
 
         status
+    }
+
+    pub async fn get_auto_review_stats(&self) -> AutoReviewStats {
+        self.state.auto_review_runtime.snapshot().await
     }
 
     /// 更新某个应用类型当前“目标供应商”（用于 UI 展示 active_targets）
@@ -886,7 +894,6 @@ mod continuity_e2e_tests {
         let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
         app_config.auto_failover_enabled = true;
         db.update_proxy_config_for_app(app_config).await.unwrap();
-
         let server = ProxyServer::new(test_proxy_config(), db.clone(), None);
         let info = server.start().await.expect("start quota proxy");
         let client = reqwest::Client::new();
@@ -1086,6 +1093,15 @@ mod continuity_e2e_tests {
         let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
         app_config.auto_failover_enabled = true;
         db.update_proxy_config_for_app(app_config).await.unwrap();
+        crate::proxy::compaction::CompactionService::new(db.clone())
+            .update_settings(&crate::proxy::compaction::CompactionSettings {
+                summary_provider_id: Some("hierarchical-chat".to_string()),
+                summary_model: Some("summary-ui-model".to_string()),
+                summary_input_budget: 64_000,
+                summary_max_output_tokens: 4_000,
+                ..Default::default()
+            })
+            .unwrap();
 
         let server = ProxyServer::new(test_proxy_config(), db, None);
         let info = server.start().await.expect("start hierarchical proxy");
@@ -1130,6 +1146,9 @@ mod continuity_e2e_tests {
             state.chat_requests.len() >= 2,
             "large context must make chunk calls followed by a final handoff call"
         );
+        assert!(state.chat_requests.iter().all(|request| {
+            request.get("model").and_then(Value::as_str) == Some("summary-ui-model")
+        }));
         let final_request = state.chat_requests.last().unwrap().to_string();
         assert!(final_request.contains("Earlier chronological checkpoint"));
         assert!(!final_request.contains("Older chronological segment"));

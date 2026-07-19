@@ -4,7 +4,10 @@
 //! summaries, final handoff, caching and overflow replanning) and delegates the
 //! actual HTTP call to a small client trait implemented by the proxy handler.
 
-use super::planner::{plan_summary, SummaryPlan, DEFAULT_INPUT_BUDGET};
+use super::model::{
+    DEFAULT_SUMMARY_INPUT_BUDGET, DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS, MIN_SUMMARY_INPUT_BUDGET,
+};
+use super::planner::{plan_summary, SummaryPlan};
 use super::service::COMPACTION_SUMMARY_INSTRUCTIONS;
 use super::store::estimate_tokens;
 use serde_json::{json, Value};
@@ -12,8 +15,21 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashMap, future::Future, pin::Pin};
 
 const MAX_ATTEMPTS: usize = 3;
-const MIN_INPUT_BUDGET: usize = 4_000;
-const FINAL_MAX_OUTPUT_TOKENS: usize = 12_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SummaryExecutionOptions {
+    pub input_budget: usize,
+    pub final_max_output_tokens: usize,
+}
+
+impl Default for SummaryExecutionOptions {
+    fn default() -> Self {
+        Self {
+            input_budget: DEFAULT_SUMMARY_INPUT_BUDGET,
+            final_max_output_tokens: DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct SummaryCall {
@@ -79,6 +95,7 @@ pub(crate) struct SummaryExecution {
 pub(crate) async fn execute<C, P>(
     client: &mut C,
     body: &Value,
+    options: SummaryExecutionOptions,
     mut on_progress: P,
 ) -> Result<SummaryExecution, SummaryCallError>
 where
@@ -87,7 +104,7 @@ where
 {
     let input_tokens_before = estimate_tokens(body);
     let mut cache = HashMap::<String, SummaryReply>::new();
-    let mut input_budget = DEFAULT_INPUT_BUDGET;
+    let mut input_budget = options.input_budget;
     let mut last_error = None;
 
     for attempt in 0..MAX_ATTEMPTS {
@@ -95,6 +112,7 @@ where
             client,
             body,
             input_budget,
+            options.final_max_output_tokens,
             attempt,
             &mut cache,
             &mut on_progress,
@@ -112,7 +130,7 @@ where
             Err(error) if error.context_overflow && attempt + 1 < MAX_ATTEMPTS => {
                 last_error = Some(error);
                 input_budget = ((input_budget as f64) * 0.70) as usize;
-                input_budget = input_budget.max(MIN_INPUT_BUDGET);
+                input_budget = input_budget.max(MIN_SUMMARY_INPUT_BUDGET);
                 on_progress(SummaryProgress {
                     strategy: "hierarchical".to_string(),
                     phase: "replanning".to_string(),
@@ -137,6 +155,7 @@ async fn execute_once<C, P>(
     client: &mut C,
     body: &Value,
     input_budget: usize,
+    final_max_output_tokens: usize,
     retries: usize,
     cache: &mut HashMap<String, SummaryReply>,
     on_progress: &mut P,
@@ -160,7 +179,7 @@ where
                 SummaryCall {
                     body: prepared,
                     prompt: COMPACTION_SUMMARY_INSTRUCTIONS.to_string(),
-                    max_output_tokens: FINAL_MAX_OUTPUT_TOKENS,
+                    max_output_tokens: final_max_output_tokens,
                 },
                 cache,
             )
@@ -193,7 +212,9 @@ where
             let mut replies = Vec::with_capacity(total + 1);
             for (index, chunk) in chunks.into_iter().enumerate() {
                 let chunk_tokens = estimate_tokens(&Value::Array(chunk.clone()));
-                let max_output_tokens = ((chunk_tokens as f64 * 0.12) as usize).clamp(1_200, 4_000);
+                let max_output_tokens = ((chunk_tokens as f64 * 0.12) as usize)
+                    .clamp(1_200, 4_000)
+                    .min(final_max_output_tokens);
                 let mut chunk_body = body.clone();
                 chunk_body["input"] = Value::Array(chunk);
                 let reply = summarize_cached(
@@ -252,7 +273,7 @@ where
                 SummaryCall {
                     body: final_body,
                     prompt: COMPACTION_SUMMARY_INSTRUCTIONS.to_string(),
-                    max_output_tokens: FINAL_MAX_OUTPUT_TOKENS,
+                    max_output_tokens: final_max_output_tokens,
                 },
                 cache,
             )
@@ -376,7 +397,14 @@ mod tests {
             calls: 0,
             results: VecDeque::new(),
         };
-        let result = execute(&mut client, &body, |_| {}).await.expect("execute");
+        let result = execute(
+            &mut client,
+            &body,
+            SummaryExecutionOptions::default(),
+            |_| {},
+        )
+        .await
+        .expect("execute");
         assert_eq!(result.strategy, "hierarchical");
         assert!(result.chunks >= 1);
         assert_eq!(client.calls, result.chunks + 1);
@@ -399,10 +427,49 @@ mod tests {
                 Err(SummaryCallError::new("context length exceeded", true)),
             ]),
         };
-        let result = execute(&mut client, &body, |_| {})
-            .await
-            .expect("replanned");
+        let result = execute(
+            &mut client,
+            &body,
+            SummaryExecutionOptions::default(),
+            |_| {},
+        )
+        .await
+        .expect("replanned");
         assert_eq!(result.overflow_retries, 1);
         assert!(!result.summary.is_empty());
+    }
+
+    #[tokio::test]
+    async fn configured_limits_reach_summary_calls() {
+        struct CapturingClient(Vec<SummaryCall>);
+        impl SummaryClient for CapturingClient {
+            fn summarize<'a>(
+                &'a mut self,
+                call: SummaryCall,
+            ) -> Pin<Box<dyn Future<Output = Result<SummaryReply, SummaryCallError>> + Send + 'a>>
+            {
+                self.0.push(call);
+                Box::pin(std::future::ready(Ok(SummaryReply {
+                    summary: "configured summary".into(),
+                    ..Default::default()
+                })))
+            }
+        }
+
+        let body = json!({"model":"test","input":[{"role":"user","content":"small"}]});
+        let mut client = CapturingClient(Vec::new());
+        execute(
+            &mut client,
+            &body,
+            SummaryExecutionOptions {
+                input_budget: 64_000,
+                final_max_output_tokens: 4_000,
+            },
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.0.len(), 1);
+        assert_eq!(client.0[0].max_output_tokens, 4_000);
     }
 }

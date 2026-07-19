@@ -7,6 +7,7 @@ import type {
   GlobalProxyConfig,
   AppProxyConfig,
   CompactionSettings,
+  CompactionSummaryTarget,
   ContinuityTaskState,
 } from "@/types/proxy";
 
@@ -34,6 +35,10 @@ export const proxyApi = {
 
   async updateContinuitySettings(settings: CompactionSettings): Promise<void> {
     return invoke("update_continuity_settings", { settings });
+  },
+
+  async getContinuitySummaryTargets(): Promise<CompactionSummaryTarget[]> {
+    return invoke("get_continuity_summary_targets");
   },
 
   async getContinuityTasks(limit = 20): Promise<ContinuityTaskState[]> {

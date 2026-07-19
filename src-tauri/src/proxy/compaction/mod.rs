@@ -6,6 +6,8 @@ pub(crate) mod service;
 pub(crate) mod store;
 
 pub(crate) use model::{CompactionContext, CompactionSettings, ProviderRealm, Snapshot};
-pub(crate) use service::{CompactionService, MaterializationTarget, OfficialRecompactPlan};
+pub(crate) use service::{
+    CompactionService, CompactionSummaryTarget, MaterializationTarget, OfficialRecompactPlan,
+};
 #[cfg(test)]
 pub(crate) use store::CompactionStore;

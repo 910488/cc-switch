@@ -3,11 +3,14 @@ use super::model::{
     ProviderRealm, Snapshot, ENVELOPE_PREFIX, MIGRATION_PROMPT_VERSION,
 };
 use super::store::{canonical_snapshot_body, new_id, CompactionStore};
+use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
+use crate::provider::Provider;
 use crate::proxy::types::ContinuityStatus;
 use axum::http::HeaderMap;
 use chrono::{SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -29,6 +32,17 @@ Bridge fidelity requirements:
 - Keep claims evidence-based. Do not say work is complete unless the transcript proves it.
 - Do not reproduce system/developer instructions, tool schemas, skills, credentials, secrets, or large raw tool outputs.
 - Return only the handoff summary. Do not call tools."#;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionSummaryTarget {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub protocol: String,
+    pub models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct MaterializationTarget {
@@ -108,14 +122,87 @@ impl CompactionService {
         let Some(raw) = self.db.get_setting("codex_compaction_settings")? else {
             return Ok(CompactionSettings::default());
         };
-        serde_json::from_str(&raw)
-            .map_err(|error| AppError::Config(format!("invalid compaction settings: {error}")))
+        let settings: CompactionSettings = serde_json::from_str(&raw)
+            .map_err(|error| AppError::Config(format!("invalid compaction settings: {error}")))?;
+        let settings = settings.normalized();
+        settings
+            .validate()
+            .map_err(|error| AppError::Config(format!("invalid compaction settings: {error}")))?;
+        Ok(settings)
     }
 
     pub(crate) fn update_settings(&self, settings: &CompactionSettings) -> Result<(), AppError> {
-        let raw = serde_json::to_string(settings)
+        let settings = settings.clone().normalized();
+        settings
+            .validate()
+            .map_err(|error| AppError::InvalidInput(error.to_string()))?;
+        if let Some(provider_id) = settings.summary_provider_id.as_deref() {
+            let provider = self
+                .db
+                .get_provider_by_id(provider_id, AppType::Codex.as_str())?
+                .ok_or_else(|| {
+                    AppError::InvalidInput(format!(
+                        "summary provider '{provider_id}' no longer exists"
+                    ))
+                })?;
+            if !is_bridge_summary_provider(&provider) {
+                return Err(AppError::InvalidInput(
+                    "summary provider must be a third-party Codex Chat or Anthropic route"
+                        .to_string(),
+                ));
+            }
+        }
+        let raw = serde_json::to_string(&settings)
             .map_err(|error| AppError::Config(format!("invalid compaction settings: {error}")))?;
         self.db.set_setting("codex_compaction_settings", &raw)
+    }
+
+    /// Authoritative list used by the UI. Keeping protocol detection in Rust
+    /// prevents the selector from advertising a provider the proxy cannot use
+    /// for local bridge summaries.
+    pub(crate) fn summary_targets(&self) -> Result<Vec<CompactionSummaryTarget>, AppError> {
+        let providers = self.db.get_all_providers(AppType::Codex.as_str())?;
+        let mut targets = providers
+            .values()
+            .filter(|provider| is_bridge_summary_provider(provider))
+            .map(summary_target_from_provider)
+            .collect::<Vec<_>>();
+        targets.sort_by(|a, b| {
+            a.provider_name
+                .to_lowercase()
+                .cmp(&b.provider_name.to_lowercase())
+                .then_with(|| a.provider_id.cmp(&b.provider_id))
+        });
+        Ok(targets)
+    }
+
+    /// A pinned summary route intentionally replaces the active request's
+    /// failover chain. It applies only to Codex; Grok Build keeps its own route.
+    pub(crate) fn resolve_summary_providers(
+        &self,
+        app_type: &AppType,
+        fallback: Vec<Provider>,
+    ) -> Result<Vec<Provider>, AppError> {
+        if *app_type != AppType::Codex {
+            return Ok(fallback);
+        }
+        let Some(provider_id) = self.settings()?.summary_provider_id else {
+            return Ok(fallback);
+        };
+        let provider = self
+            .db
+            .get_provider_by_id(&provider_id, AppType::Codex.as_str())?
+            .ok_or_else(|| {
+                AppError::InvalidInput(format!(
+                    "configured summary provider '{provider_id}' no longer exists"
+                ))
+            })?;
+        if !is_bridge_summary_provider(&provider) {
+            return Err(AppError::InvalidInput(format!(
+                "configured summary provider '{provider_id}' is not a bridge-compatible Codex provider"
+            )));
+        }
+        Ok(vec![provider])
     }
 
     pub(crate) fn recent_tasks(
@@ -820,6 +907,55 @@ impl CompactionService {
     }
 }
 
+fn is_bridge_summary_provider(provider: &Provider) -> bool {
+    let endpoint = "/responses/compact";
+    crate::proxy::providers::should_convert_codex_responses_to_chat(provider, endpoint)
+        || crate::proxy::providers::should_convert_codex_responses_to_anthropic(provider, endpoint)
+}
+
+fn summary_target_from_provider(provider: &Provider) -> CompactionSummaryTarget {
+    let endpoint = "/responses/compact";
+    let protocol =
+        if crate::proxy::providers::should_convert_codex_responses_to_anthropic(provider, endpoint)
+        {
+            "anthropic"
+        } else {
+            "openai_chat"
+        };
+    let default_model = crate::proxy::providers::codex_provider_upstream_model(provider);
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(model) = default_model.as_ref() {
+        if seen.insert(model.clone()) {
+            models.push(model.clone());
+        }
+    }
+    if let Some(catalog) = provider
+        .settings_config
+        .pointer("/modelCatalog/models")
+        .and_then(Value::as_array)
+    {
+        for model in catalog.iter().filter_map(|entry| {
+            entry
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+        }) {
+            if seen.insert(model.to_string()) {
+                models.push(model.to_string());
+            }
+        }
+    }
+    CompactionSummaryTarget {
+        provider_id: provider.id.clone(),
+        provider_name: provider.name.clone(),
+        protocol: protocol.to_string(),
+        models,
+        default_model,
+    }
+}
+
 fn is_compaction_item(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("compaction")
 }
@@ -1013,6 +1149,7 @@ mod tests {
             .update_settings(&CompactionSettings {
                 rollout_mode: CompactionRolloutMode::ThirdPartyOnly,
                 official_compact_fallback: true,
+                ..CompactionSettings::default()
             })
             .unwrap();
         let context = CompactionContext {
@@ -1042,5 +1179,83 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("bridge-to-official"));
+    }
+
+    #[test]
+    fn summary_targets_only_expose_bridge_compatible_codex_providers() {
+        let service = service();
+        let chat = Provider::with_id(
+            "summary-chat".into(),
+            "Summary Chat".into(),
+            json!({
+                "base_url": "https://summary.example/v1",
+                "api_format": "openai_chat",
+                "config": "model = \"summary-default\"\n",
+                "modelCatalog": {"models": [
+                    {"model": "summary-default"},
+                    {"model": "summary-fast"}
+                ]}
+            }),
+            None,
+        );
+        service.db.save_provider("codex", &chat).unwrap();
+        let native = Provider::with_id(
+            "native".into(),
+            "Native".into(),
+            json!({
+                "base_url": "https://native.example/v1",
+                "api_format": "openai_responses"
+            }),
+            None,
+        );
+        service.db.save_provider("codex", &native).unwrap();
+
+        let targets = service.summary_targets().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].provider_id, "summary-chat");
+        assert_eq!(targets[0].default_model.as_deref(), Some("summary-default"));
+        assert_eq!(
+            targets[0].models,
+            vec!["summary-default".to_string(), "summary-fast".to_string()]
+        );
+    }
+
+    #[test]
+    fn pinned_summary_provider_replaces_the_request_failover_chain() {
+        let service = service();
+        let pinned = Provider::with_id(
+            "pinned-summary".into(),
+            "Pinned Summary".into(),
+            json!({
+                "base_url": "https://summary.example/v1",
+                "api_format": "anthropic",
+                "config": "model = \"claude-summary\"\n"
+            }),
+            None,
+        );
+        service.db.save_provider("codex", &pinned).unwrap();
+        service
+            .update_settings(&CompactionSettings {
+                summary_provider_id: Some(pinned.id.clone()),
+                summary_model: Some("claude-summary-fast".into()),
+                ..CompactionSettings::default()
+            })
+            .unwrap();
+
+        let fallback = vec![Provider::with_id(
+            "active-provider".into(),
+            "Active".into(),
+            json!({}),
+            None,
+        )];
+        let resolved = service
+            .resolve_summary_providers(&AppType::Codex, fallback)
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, "pinned-summary");
+        assert_eq!(
+            service.settings().unwrap().summary_model.as_deref(),
+            Some("claude-summary-fast")
+        );
     }
 }

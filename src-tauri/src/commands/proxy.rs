@@ -89,6 +89,37 @@ pub async fn update_continuity_settings(
 }
 
 #[tauri::command]
+pub async fn get_auto_review_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::proxy::auto_review::AutoReviewSettings, String> {
+    crate::proxy::auto_review::load_settings(&state.db).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn update_auto_review_settings(
+    state: tauri::State<'_, AppState>,
+    settings: crate::proxy::auto_review::AutoReviewSettings,
+) -> Result<crate::proxy::auto_review::AutoReviewSettings, String> {
+    crate::proxy::auto_review::save_settings(&state.db, settings).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_auto_review_stats(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::proxy::auto_review::AutoReviewStats, String> {
+    Ok(state.proxy_service.get_auto_review_stats().await)
+}
+
+#[tauri::command]
+pub async fn get_continuity_summary_targets(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crate::proxy::compaction::CompactionSummaryTarget>, String> {
+    crate::proxy::compaction::CompactionService::new(state.db.clone())
+        .summary_targets()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn get_continuity_tasks(
     state: tauri::State<'_, AppState>,
     limit: Option<usize>,

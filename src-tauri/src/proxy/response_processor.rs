@@ -946,6 +946,7 @@ mod tests {
                 crate::proxy::compaction::CompactionStore::with_key(db.clone(), vec![11; 32])
                     .expect("test compaction store"),
             )),
+            auto_review_runtime: Arc::new(crate::proxy::auto_review::AutoReviewRuntime::default()),
             app_handle: None,
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
         }

@@ -3021,6 +3021,14 @@ impl ProxyService {
         }
     }
 
+    pub async fn get_auto_review_stats(&self) -> crate::proxy::auto_review::AutoReviewStats {
+        if let Some(server) = self.server.read().await.as_ref() {
+            server.get_auto_review_stats().await
+        } else {
+            crate::proxy::auto_review::AutoReviewStats::default()
+        }
+    }
+
     /// 获取代理配置
     pub async fn get_config(&self) -> Result<ProxyConfig, String> {
         self.db

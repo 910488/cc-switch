@@ -40,6 +40,13 @@ export function useUpdateContinuitySettings() {
   });
 }
 
+export function useContinuitySummaryTargets() {
+  return useQuery({
+    queryKey: ["continuitySummaryTargets"],
+    queryFn: () => proxyApi.getContinuitySummaryTargets(),
+  });
+}
+
 export function useContinuityTasks(enabled = true) {
   return useQuery({
     queryKey: ["continuityTasks"],

@@ -50,6 +50,18 @@ export type CompactionRolloutMode =
 export interface CompactionSettings {
   rolloutMode: CompactionRolloutMode;
   officialCompactFallback: boolean;
+  summaryProviderId?: string;
+  summaryModel?: string;
+  summaryInputBudget: number;
+  summaryMaxOutputTokens: number;
+}
+
+export interface CompactionSummaryTarget {
+  providerId: string;
+  providerName: string;
+  protocol: "openai_chat" | "anthropic";
+  models: string[];
+  defaultModel?: string;
 }
 
 export interface ContinuityTaskState {
