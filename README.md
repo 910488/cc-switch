@@ -26,8 +26,9 @@ This fork is maintained at **[910488/cc-switch](https://github.com/910488/cc-swi
 - **Encrypted canonical journal** — stores the exact pre-compaction context in SQLite using AES-256-GCM; Windows protects the master key with current-user DPAPI
 - **Restart-safe resume** — compaction references remain recoverable after restarting CC Switch or reopening its database
 - **Durable native streaming** — native SSE events remain streaming, while compaction state is committed before the reference is exposed to Codex
-- **Quota-aware fallback** — quota-exhausted provider/account routes are temporarily latched and skipped without poisoning circuit-breaker health or permanently changing the selected provider
-- **Large-context protection** — preserves recent turns, tool-call pairs, and bounded chronological excerpts when a cross-provider migration would exceed the next model's context window
+- **Secure multi-account fallback** — stores per-provider credentials in the OS vault, rotates accounts inside one provider, learns standard OpenAI/Anthropic rate-limit windows from response headers, and skips exhausted accounts without poisoning circuit-breaker health or permanently changing the selected provider
+- **Hierarchical large-context compaction** — summarizes oversized histories in bounded chunks, retries overflow with a reduced budget, then creates a final handoff instead of truncating the task to a few excerpts
+- **Continuity operations in the desktop UI** — exposes rollout mode, official compact fallback, task phase/health, token and chunk counts, retry/overflow counts, resume verification, and per-thread journal deletion in the existing Proxy panel
 
 The continuity tables are local-only and are excluded from WebDAV/cloud SQL synchronization. Missing, corrupt, or unauthenticated journal data fails closed: CC Switch returns an error instead of forwarding an opaque compaction reference to an incompatible provider.
 
@@ -389,10 +390,12 @@ src-tauri/target/release/bundle/msi/*.msi
 After installation:
 
 1. Open CC Switch and add or import the Codex providers you want to use.
-2. Open the proxy settings, enable the local proxy, and enable Codex takeover.
-3. Verify that **Codex context continuity** in the Proxy panel reports `Encrypted journal ready (dpapi-current-user)` on Windows.
-4. Restart the Codex CLI so it picks up the CC Switch proxy configuration.
-5. Keep at least one fallback provider in the Codex failover queue if you want quota-aware fallback.
+2. If one provider has multiple accounts, edit that provider and add each API key or bearer token under **Secure Credential Pool**. The secret is sent directly to the Tauri backend and is not stored in SQLite.
+3. Open the proxy settings, enable the local proxy, and enable Codex takeover.
+4. Verify that **Codex context continuity** in the Proxy panel reports `Encrypted journal ready (dpapi-current-user)` on Windows.
+5. Select the desired continuity rollout mode. Use **Full switching** to enable official/third-party migration and safe official compact fallback.
+6. Restart the Codex CLI so it picks up the CC Switch proxy configuration.
+7. Keep at least one fallback provider in the Codex failover queue if you want provider-level quota fallback.
 
 > **Updater note:** this branch currently inherits the upstream updater signing configuration. Until this fork publishes a separately signed `latest.json`, install fork updates manually from its Releases page so an upstream update does not replace the custom build.
 
