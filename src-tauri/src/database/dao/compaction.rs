@@ -495,6 +495,12 @@ impl Database {
             .map_err(|e| AppError::Database(format!("解析 quota latch 失败: {e}")))
     }
 
+    pub(crate) fn clear_quota_latches_for_app(&self, app_type: &str) -> Result<usize, AppError> {
+        let conn = lock_conn!(self.conn);
+        conn.execute("DELETE FROM quota_latches WHERE app_type = ?1", [app_type])
+            .map_err(|e| AppError::Database(format!("清理应用 quota latch 失败: {e}")))
+    }
+
     pub(crate) fn clear_expired_quota_latches(&self, now_iso: &str) -> Result<usize, AppError> {
         let conn = lock_conn!(self.conn);
         conn.execute(

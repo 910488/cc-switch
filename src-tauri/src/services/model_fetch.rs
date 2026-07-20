@@ -7,6 +7,7 @@
 use reqwest::header::{HeaderValue, USER_AGENT};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::time::Duration;
 
 /// 获取到的模型信息
@@ -15,18 +16,71 @@ use std::time::Duration;
 pub struct FetchedModel {
     pub id: String,
     pub owned_by: Option<String>,
+    /// Maximum context tokens reported by the provider's /models payload.
+    /// Omitted when the endpoint exposes only OpenAI's minimal id/owner shape.
+    pub context_window: Option<u64>,
 }
 
 /// OpenAI 兼容的 /v1/models 响应格式
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
+    #[serde(alias = "models")]
     data: Option<Vec<ModelEntry>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ModelEntry {
+    #[serde(alias = "slug")]
     id: String,
+    #[serde(default)]
     owned_by: Option<String>,
+    #[serde(flatten)]
+    metadata: serde_json::Map<String, Value>,
+}
+
+impl ModelEntry {
+    fn context_window(&self) -> Option<u64> {
+        context_window_from_object(&self.metadata)
+    }
+}
+
+pub(crate) fn context_window_from_object(object: &serde_json::Map<String, Value>) -> Option<u64> {
+    // Aggregators use several names for the same capability. Prefer explicit
+    // maximum fields, but accept common snake/camel variants and numeric
+    // strings. Some gateways nest limits under capabilities/metadata, so walk
+    // nested objects after checking the top level. Never infer context from
+    // max_output_tokens.
+    const KEYS: &[&str] = &[
+        "max_context_window",
+        "maxContextWindow",
+        "context_window",
+        "contextWindow",
+        "context_length",
+        "contextLength",
+        "max_model_len",
+        "maxModelLen",
+        "max_input_tokens",
+        "maxInputTokens",
+    ];
+    KEYS.iter()
+        .find_map(|key| object.get(*key).and_then(positive_u64_from_value))
+        .or_else(|| object.values().find_map(context_window_from_value))
+}
+
+pub(crate) fn context_window_from_value(value: &Value) -> Option<u64> {
+    match value {
+        Value::Object(object) => context_window_from_object(object),
+        Value::Array(items) => items.iter().find_map(context_window_from_value),
+        _ => None,
+    }
+}
+
+fn positive_u64_from_value(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64().filter(|value| *value > 0),
+        Value::String(text) => text.trim().parse::<u64>().ok().filter(|value| *value > 0),
+        _ => None,
+    }
 }
 
 const FETCH_TIMEOUT_SECS: u64 = 15;
@@ -97,6 +151,7 @@ pub async fn fetch_models(
                 .unwrap_or_default()
                 .into_iter()
                 .map(|m| FetchedModel {
+                    context_window: m.context_window(),
                     id: m.id,
                     owned_by: m.owned_by,
                 })
@@ -457,6 +512,27 @@ mod tests {
         assert_eq!(data[0].id, "gpt-4");
         assert_eq!(data[0].owned_by.as_deref(), Some("openai"));
         assert_eq!(data[1].id, "claude-3-sonnet");
+    }
+
+    #[test]
+    fn test_parse_response_context_window_variants() {
+        let json = r#"{
+            "data": [
+                {"id":"glm-a","context_window":272000},
+                {"id":"glm-b","maxContextWindow":"200000"},
+                {"id":"glm-c","context_length":128000},
+                {"id":"glm-d","max_output_tokens":8192},
+                {"slug":"glm-e","capabilities":{"limits":{"max_input_tokens":"262144"}}}
+            ]
+        }"#;
+        let resp: ModelsResponse = serde_json::from_str(json).unwrap();
+        let data = resp.data.unwrap();
+        assert_eq!(data[0].context_window(), Some(272_000));
+        assert_eq!(data[1].context_window(), Some(200_000));
+        assert_eq!(data[2].context_window(), Some(128_000));
+        assert_eq!(data[3].context_window(), None);
+        assert_eq!(data[4].id, "glm-e");
+        assert_eq!(data[4].context_window(), Some(262_144));
     }
 
     #[test]

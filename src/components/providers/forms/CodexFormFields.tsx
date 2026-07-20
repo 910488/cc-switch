@@ -326,6 +326,24 @@ export function CodexFormFields({
       .then((models) => {
         if (seq !== fetchModelsSeqRef.current) return;
         setFetchedModels(models);
+        // If /models exposes a context limit, fill only blank catalog rows.
+        // Explicit user values remain authoritative.
+        const contexts = new Map(
+          models
+            .filter((model) => (model.contextWindow ?? 0) > 0)
+            .map((model) => [model.id, model.contextWindow!] as const),
+        );
+        if (contexts.size > 0) {
+          setCatalogRows((current) =>
+            current.map((row) => {
+              if (String(row.contextWindow ?? "").trim()) return row;
+              const contextWindow = contexts.get(row.model.trim());
+              return contextWindow
+                ? { ...row, contextWindow: String(contextWindow) }
+                : row;
+            }),
+          );
+        }
         if (models.length === 0) {
           toast.info(t("providerForm.fetchModelsEmpty"));
         } else {
@@ -929,14 +947,25 @@ export function CodexFormFields({
                           {fetchedModels.length > 0 && (
                             <ModelDropdown
                               models={fetchedModels}
-                              onSelect={(id) =>
+                              onSelect={(id) => {
+                                const fetched = fetchedModels.find(
+                                  (model) => model.id === id,
+                                );
                                 handleUpdateCatalogRow(index, {
                                   model: id,
                                   displayName: row.displayName?.trim()
                                     ? row.displayName
                                     : id,
-                                })
-                              }
+                                  ...(!String(row.contextWindow ?? "").trim() &&
+                                  (fetched?.contextWindow ?? 0) > 0
+                                    ? {
+                                        contextWindow: String(
+                                          fetched!.contextWindow,
+                                        ),
+                                      }
+                                    : {}),
+                                });
+                              }}
                             />
                           )}
                         </div>

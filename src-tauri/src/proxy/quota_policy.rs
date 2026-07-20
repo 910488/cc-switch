@@ -7,6 +7,8 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+const MODEL_SCOPED_QUOTA_LATCH_MIGRATION_KEY: &str = "codex_model_scoped_quota_latch_migration_v1";
+
 #[derive(Debug, Clone)]
 pub(crate) struct QuotaLatch {
     #[allow(dead_code)]
@@ -23,11 +25,86 @@ pub(crate) struct QuotaPolicy {
 
 impl QuotaPolicy {
     pub(crate) fn new(db: Arc<Database>) -> Self {
-        Self { db }
+        let policy = Self { db };
+        if let Err(error) = policy.clear_legacy_codex_provider_latches_once() {
+            log::warn!("Failed to clear legacy model-agnostic Codex quota latches: {error}");
+        }
+        policy
+    }
+
+    fn clear_legacy_codex_provider_latches_once(&self) -> Result<(), AppError> {
+        if self
+            .db
+            .get_bool_flag(MODEL_SCOPED_QUOTA_LATCH_MIGRATION_KEY)?
+        {
+            return Ok(());
+        }
+
+        // Older releases stored every upstream 429 as a provider-wide Codex
+        // latch. The row has no model dimension, so a GLM-5.2p exhaustion can
+        // incorrectly block GLM-5.2 until the upstream reset date. These rows
+        // are an operational cache, not durable user data; clear them once when
+        // upgrading to model-scoped quota handling.
+        self.db.clear_quota_latches_for_app("codex")?;
+        self.db
+            .set_setting(MODEL_SCOPED_QUOTA_LATCH_MIGRATION_KEY, "true")?;
+        Ok(())
     }
 
     pub(crate) fn is_quota_error(error: &ProxyError) -> bool {
         matches!(error, ProxyError::UpstreamError { status: 429, .. })
+    }
+
+    /// Whether the upstream explicitly says only one model/model-group is out
+    /// of quota. Such an error must not disable every model behind the same
+    /// provider: GLM-5.2p and GLM-5.2, for example, may have independent
+    /// weekly/monthly pools even though they share one API key and endpoint.
+    pub(crate) fn is_model_scoped_quota_error(error: &ProxyError) -> bool {
+        let ProxyError::UpstreamError {
+            status: 429,
+            body: Some(body),
+        } = error
+        else {
+            return false;
+        };
+        let body = body.to_ascii_lowercase();
+        [
+            "received model group=",
+            "received model group =",
+            "model group quota",
+            "model-specific quota",
+            "per-model quota",
+            "quota for model",
+        ]
+        .iter()
+        .any(|needle| body.contains(needle))
+    }
+
+    /// Persistent balance/subscription exhaustion, as opposed to a transient
+    /// request-rate throttle. This classification is also used by the Codex
+    /// error response path to avoid hiding an actionable upstream message
+    /// behind generic retry exhaustion.
+    pub(crate) fn is_hard_quota_error(error: &ProxyError) -> bool {
+        let ProxyError::UpstreamError {
+            status: 429,
+            body: Some(body),
+        } = error
+        else {
+            return false;
+        };
+        let body = body.to_ascii_lowercase();
+        [
+            "insufficient_quota",
+            "usage limit",
+            "quota exceeded",
+            "limit_reached",
+            "limit exhausted",
+            "weekly/monthly limit",
+            "credit balance",
+            "billing",
+        ]
+        .iter()
+        .any(|needle| body.contains(needle))
     }
 
     pub(crate) fn record_from_error_for_account(
@@ -40,21 +117,17 @@ impl QuotaPolicy {
         let ProxyError::UpstreamError { status: 429, body } = error else {
             return Ok(None);
         };
+        // Do not turn a model-specific exhaustion into a provider-wide latch.
+        // The original 429 is still returned to the caller, but sibling models
+        // remain routable immediately.
+        if Self::is_model_scoped_quota_error(error) {
+            return Ok(None);
+        }
         let now = Utc::now();
         let body_value = body
             .as_deref()
             .and_then(|body| serde_json::from_str::<Value>(body).ok());
-        let body_lower = body.as_deref().unwrap_or_default().to_ascii_lowercase();
-        let hard_quota = [
-            "insufficient_quota",
-            "usage limit",
-            "quota exceeded",
-            "limit_reached",
-            "credit balance",
-            "billing",
-        ]
-        .iter()
-        .any(|needle| body_lower.contains(needle));
+        let hard_quota = Self::is_hard_quota_error(error);
         let blocked_until = body_value
             .as_ref()
             .and_then(|value| reset_time_from_value(value, now))
@@ -198,6 +271,45 @@ mod tests {
     }
 
     #[test]
+    fn clears_legacy_model_agnostic_codex_latches_once() {
+        let db = Arc::new(Database::memory().unwrap());
+        db.save_provider("codex", &provider("weikuwu")).unwrap();
+        db.upsert_quota_latch(&QuotaLatchRow {
+            app_type: "codex".to_string(),
+            provider_id: "weikuwu".to_string(),
+            account_id: String::new(),
+            quota_kind: "hard_quota".to_string(),
+            blocked_until: Some(iso(Utc::now() + Duration::days(2))),
+            signal_hash: None,
+            detail_blob: None,
+            updated_at: iso(Utc::now()),
+        })
+        .unwrap();
+
+        let policy = QuotaPolicy::new(db.clone());
+        assert!(!policy.is_provider_latched("codex", "weikuwu").unwrap());
+        assert!(db
+            .get_bool_flag(MODEL_SCOPED_QUOTA_LATCH_MIGRATION_KEY)
+            .unwrap());
+
+        let provider = provider("new-quota");
+        db.save_provider("codex", &provider).unwrap();
+        policy
+            .record_from_error_for_account(
+                "codex",
+                &provider,
+                &ProxyError::UpstreamError {
+                    status: 429,
+                    body: Some(json!({"error":{"code":"insufficient_quota"}}).to_string()),
+                },
+                None,
+            )
+            .unwrap();
+        let recreated = QuotaPolicy::new(db);
+        assert!(recreated.is_provider_latched("codex", "new-quota").unwrap());
+    }
+
+    #[test]
     fn hard_quota_creates_persistent_provider_latch() {
         let db = Arc::new(Database::memory().unwrap());
         let provider = provider("quota-a");
@@ -250,6 +362,39 @@ mod tests {
                 .account_id,
             "credential-a"
         );
+    }
+
+    #[test]
+    fn model_scoped_quota_does_not_latch_the_whole_provider() {
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = provider("weikuwu");
+        db.save_provider("codex", &provider).unwrap();
+        let policy = QuotaPolicy::new(db.clone());
+        let error = ProxyError::UpstreamError {
+            status: 429,
+            body: Some(
+                json!({"error":{"message":"Weekly/Monthly Limit Exhausted. Received Model Group=GLM-5.2p"}})
+                    .to_string(),
+            ),
+        };
+
+        assert!(QuotaPolicy::is_hard_quota_error(&error));
+        assert!(QuotaPolicy::is_model_scoped_quota_error(&error));
+        assert!(policy
+            .record_from_error_for_account("codex", &provider, &error, None)
+            .unwrap()
+            .is_none());
+        assert!(!policy.is_provider_latched("codex", "weikuwu").unwrap());
+    }
+
+    #[test]
+    fn transient_rate_limit_is_not_classified_as_hard_quota() {
+        let error = ProxyError::UpstreamError {
+            status: 429,
+            body: Some(json!({"error":{"message":"Too many requests"}}).to_string()),
+        };
+        assert!(!QuotaPolicy::is_hard_quota_error(&error));
+        assert!(!QuotaPolicy::is_model_scoped_quota_error(&error));
     }
 
     #[test]

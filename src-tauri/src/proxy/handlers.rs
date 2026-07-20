@@ -2885,8 +2885,9 @@ fn build_codex_proxy_error_response(
     endpoint: &str,
     error: &ProxyError,
 ) -> Result<axum::response::Response, ProxyError> {
-    let status = axum::http::StatusCode::from_u16(map_proxy_error_to_status(error))
-        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let status =
+        axum::http::StatusCode::from_u16(codex_proxy_response_status(&ctx.provider, error))
+            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     let body = codex_proxy_error_json(&ctx.provider.name, &ctx.request_model, endpoint, error);
     let body = serde_json::to_vec(&body).map_err(|e| {
         log::error!("[Codex] 序列化代理错误体失败: {e}");
@@ -2904,6 +2905,20 @@ fn build_codex_proxy_error_response(
             log::error!("[Codex] 构建代理错误响应失败: {e}");
             ProxyError::Internal(format!("Failed to build proxy error response: {e}"))
         })
+}
+
+fn codex_proxy_response_status(provider: &Provider, error: &ProxyError) -> u16 {
+    // Codex retries HTTP 429 and eventually replaces the response body with the
+    // generic "exceeded retry limit" message. For an explicit persistent quota
+    // exhaustion from a third-party provider, return a non-retriable client
+    // status while preserving upstream_status=429 in the JSON body. This makes
+    // the provider's actionable reset/quota message visible to the user.
+    if !super::providers::is_codex_official_provider(provider)
+        && super::quota_policy::QuotaPolicy::is_hard_quota_error(error)
+    {
+        return 400;
+    }
+    map_proxy_error_to_status(error)
 }
 
 fn codex_proxy_error_json(
@@ -2942,7 +2957,22 @@ fn codex_proxy_error_json(
         return body;
     };
 
-    let message = if upstream_status == Some(413) {
+    let message = if super::quota_policy::QuotaPolicy::is_hard_quota_error(error) {
+        let cause = error_obj
+            .get("message")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| get_error_message(error));
+        let scope = if super::quota_policy::QuotaPolicy::is_model_scoped_quota_error(error) {
+            "model"
+        } else {
+            "provider/account"
+        };
+        format!(
+            "Upstream {scope} quota exhausted (額度不足). Provider: {provider_name}; model: {request_model}; endpoint: {endpoint}; upstream_status: HTTP 429; original error: {cause}"
+        )
+    } else if upstream_status == Some(413) {
         // 413 来自上游渠道商的网关（典型是 nginx 的 client_max_body_size），不是 CC
         // Switch 本地代理的限制（本地 DefaultBodyLimit 已放到 200MB）。上游响应体往往是
         // 一整段 nginx HTML，对用户毫无价值，这里替换成明确指向上游 + 可操作的指引，
@@ -2988,6 +3018,17 @@ fn codex_proxy_error_json(
         .unwrap_or(true)
     {
         error_obj.insert("type".to_string(), Value::String("proxy_error".to_string()));
+    }
+
+    if super::quota_policy::QuotaPolicy::is_model_scoped_quota_error(error) {
+        error_obj.insert(
+            "type".to_string(),
+            Value::String("insufficient_quota".to_string()),
+        );
+        error_obj.insert(
+            "code".to_string(),
+            Value::String("model_quota_exhausted".to_string()),
+        );
     }
 
     if error_obj.get("code").map(Value::is_null).unwrap_or(true) {
@@ -3784,10 +3825,10 @@ async fn log_usage(
 mod tests {
     use super::{
         body_looks_like_sse, body_snippet, chat_sse_to_response_value, codex_proxy_error_json,
-        responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
-        upstream_body_parse_error,
+        codex_proxy_response_status, responses_sse_to_response_value,
+        should_use_claude_transform_streaming, transform, upstream_body_parse_error,
     };
-    use crate::proxy::ProxyError;
+    use crate::{provider::Provider, proxy::ProxyError};
 
     #[test]
     fn body_looks_like_sse_detects_unlabeled_sse_prefixes() {
@@ -4429,6 +4470,38 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         assert!(message.contains("upstream gateway failed"));
         assert_eq!(body["error"]["code"], 2013);
         assert_eq!(body["error"]["upstream_status"], 502);
+    }
+
+    #[test]
+    fn codex_proxy_model_quota_is_visible_and_non_retriable() {
+        let provider = Provider::with_id(
+            "weikuwu".to_string(),
+            "weikuwu".to_string(),
+            serde_json::json!({}),
+            None,
+        );
+        let error = ProxyError::UpstreamError {
+            status: 429,
+            body: Some(
+                serde_json::json!({
+                    "error": {
+                        "message": "Weekly/Monthly Limit Exhausted. Received Model Group=GLM-5.2p",
+                        "type": "throttling_error",
+                        "code": "429"
+                    }
+                })
+                .to_string(),
+            ),
+        };
+
+        assert_eq!(codex_proxy_response_status(&provider, &error), 400);
+        let body = codex_proxy_error_json("weikuwu", "GLM-5.2p", "/responses", &error);
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("quota exhausted"));
+        assert!(message.contains("額度不足"));
+        assert!(message.contains("Weekly/Monthly Limit Exhausted"));
+        assert_eq!(body["error"]["code"], "model_quota_exhausted");
+        assert_eq!(body["error"]["upstream_status"], 429);
     }
 
     #[test]

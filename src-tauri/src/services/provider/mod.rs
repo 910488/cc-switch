@@ -1113,6 +1113,14 @@ command = "legacy-cmd"
     async fn update_current_codex_provider_refreshes_and_clears_catalog_during_takeover() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
+        let live_config_path = crate::codex_config::get_codex_config_path();
+        fs::create_dir_all(live_config_path.parent().expect("Codex config parent"))
+            .expect("create Codex config dir");
+        fs::write(
+            &live_config_path,
+            "model_provider = \"openai\"\n\n[desktop]\nappearanceTheme = \"dark\"\n",
+        )
+        .expect("seed native Codex live config");
 
         let db = Arc::new(Database::memory().expect("init db"));
         let state = AppState::new(db.clone());
