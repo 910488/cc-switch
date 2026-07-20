@@ -4801,8 +4801,11 @@ sandbox = "elevated"
             .expect("seed current Codex profile");
         let global_state_path =
             crate::codex_config::get_codex_config_dir().join(".codex-global-state.json");
-        let global_state =
-            br#"{"electron:onboarding-welcome-pending":false,"projects":{"current":true}}"#;
+        // Codex Desktop stores onboarding atoms under
+        // `electron-persisted-atom-state`. Reproduce the real pending state seen
+        // after an interrupted Windows setup, rather than a synthetic top-level
+        // key, and prove model injection never rewrites private Desktop state.
+        let global_state = br#"{"electron-persisted-atom-state":{"electron:onboarding-primary-runtime-install-ready":false,"electron:onboarding-primary-runtime-install-requested":true,"electron:onboarding-welcome-pending":true},"projects":{"current":true}}"#;
         std::fs::write(&global_state_path, global_state).expect("seed Codex Desktop state");
 
         // Reproduce an upgraded database whose old built-in official row still

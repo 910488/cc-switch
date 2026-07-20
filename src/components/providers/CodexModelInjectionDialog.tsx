@@ -117,6 +117,29 @@ export function CodexModelInjectionDialog({
     await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
   };
 
+  const refreshCodexModelService = async () => {
+    try {
+      const result = await codexModelRoutesApi.refreshDesktopModelService();
+      if (result.stoppedProcesses === 0) {
+        toast.success("模型清單已更新；Codex Desktop 下次開啟時會自動載入");
+      } else if (result.respawned) {
+        toast.success(
+          "模型清單已更新，且只重新載入 Codex 模型服務；不會重跑 Windows 首次設定",
+        );
+      } else {
+        toast.warning(
+          "模型清單已更新，但 Codex 模型服務未自動恢復；請稍候幾秒後再確認模型清單",
+        );
+      }
+    } catch (error) {
+      toast.warning(
+        `模型清單已更新，但無法自動重新載入 Codex 模型服務：${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  };
+
   const apply = async () => {
     const selectedModels: CodexCatalogModel[] = available
       .filter((entry) => selected.has(entry.id))
@@ -164,8 +187,8 @@ export function CodexModelInjectionDialog({
         })),
       );
       await refreshProxyQueries();
-      toast.success("官方與第三方模型已共存於 Codex；請重新啟動 Codex App");
       onOpenChange(false);
+      await refreshCodexModelService();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
     }
@@ -175,8 +198,8 @@ export function CodexModelInjectionDialog({
     try {
       await codexModelRoutesApi.rollback();
       await refreshProxyQueries();
-      toast.success("已還原官方 Codex 設定；請重新啟動 Codex App");
       onOpenChange(false);
+      await refreshCodexModelService();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
     }
@@ -190,7 +213,9 @@ export function CodexModelInjectionDialog({
           <DialogTitle>Codex 模型共生 · {provider.name}</DialogTitle>
           <DialogDescription>
             將選定的第三方模型加入 Codex App，同時保留官方模型。選官方模型會走
-            OpenAI，選第三方模型才會走此 Provider。
+            OpenAI，選第三方模型才會走此
+            Provider。套用時只重新載入模型服務，不會重啟 Codex App 或重跑
+            Windows 首次設定；進行中的回覆可能短暫中斷。
           </DialogDescription>
         </DialogHeader>
 
