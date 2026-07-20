@@ -2557,6 +2557,7 @@ impl ProviderService {
         let live_taken_over = state
             .proxy_service
             .detect_takeover_in_live_config_for_app(&app_type);
+        let proxy_running = futures::executor::block_on(state.proxy_service.is_running());
 
         let should_hot_switch = is_app_taken_over || live_taken_over;
 
@@ -2589,6 +2590,20 @@ impl ProviderService {
                     .hot_switch_provider_inner(app_type.as_str(), id),
             )
             .map_err(|e| AppError::Message(format!("热切换失败: {e}")))?;
+
+            // A leftover local route with takeover disabled is crash-recovery
+            // state, not an active immutable snapshot. Rebuild its restore
+            // backup for the selected provider; otherwise disabling the stale
+            // route restores the previous provider and hides the same chats
+            // again behind a different Desktop provider filter.
+            if !proxy_running && live_taken_over && matches!(app_type, AppType::Codex) {
+                futures::executor::block_on(
+                    state
+                        .proxy_service
+                        .update_live_backup_from_provider_inner(app_type.as_str(), _provider),
+                )
+                .map_err(|e| AppError::Message(format!("更新 Codex 恢复备份失败: {e}")))?;
+            }
 
             // The proxy server will route requests to the new provider via is_current.
             // MCP sync is intentionally skipped while Live config is owned by takeover.

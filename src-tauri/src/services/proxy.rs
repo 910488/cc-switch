@@ -437,6 +437,8 @@ impl ProxyService {
         let config_text = settings.get("config").and_then(Value::as_str).unwrap_or("");
         let updated = crate::codex_config::ensure_codex_official_proxy_history_alias(config_text)
             .map_err(|e| format!("建立 Codex 官方聊天历史兼容路由失败: {e}"))?;
+        let updated = crate::codex_config::canonicalize_codex_live_provider_id(&updated)
+            .map_err(|e| format!("统一 Codex 聊天历史 provider 失败: {e}"))?;
         let target = settings
             .as_object_mut()
             .ok_or_else(|| "Codex 设置必须是 JSON 对象".to_string())?;
@@ -2407,7 +2409,7 @@ impl ProxyService {
     }
 
     /// 仅供已持有 per-app 切换锁的调用方使用。
-    async fn update_live_backup_from_provider_inner(
+    pub(crate) async fn update_live_backup_from_provider_inner(
         &self,
         app_type: &str,
         provider: &Provider,
@@ -2625,6 +2627,14 @@ impl ProxyService {
                     profile,
                 )
                 .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
+
+                // The backup belongs to a stale takeover whose local route is
+                // no longer active. Rebuild it for the newly selected provider
+                // so disabling/recovering the proxy cannot restore the old
+                // endpoint. Active takeover switches keep their immutable
+                // native snapshot via the branch above.
+                self.update_live_backup_from_provider_inner(app_type, &provider)
+                    .await?;
             }
 
             Ok(())
@@ -2822,8 +2832,11 @@ impl ProxyService {
                 .map_err(|e| format!("生成 Codex 官方接管配置失败: {e}"));
         }
 
-        let updated = crate::codex_config::update_codex_toml_field(toml_str, "base_url", proxy_url)
-            .map_err(|e| format!("更新 Codex 代理地址失败: {e}"))?;
+        let canonical = crate::codex_config::canonicalize_codex_live_provider_id(toml_str)
+            .map_err(|e| format!("统一 Codex 聊天历史 provider 失败: {e}"))?;
+        let updated =
+            crate::codex_config::update_codex_toml_field(&canonical, "base_url", proxy_url)
+                .map_err(|e| format!("更新 Codex 代理地址失败: {e}"))?;
         let mut updated =
             crate::codex_config::update_codex_toml_field(&updated, "wire_api", "responses")
                 .map_err(|e| format!("更新 Codex wire_api 失败: {e}"))?;
@@ -3385,7 +3398,7 @@ mod tests {
 
     fn assert_codex_official_proxy_route(config_text: &str, expected_base_url: &str) {
         let parsed: toml::Value = toml::from_str(config_text).expect("parse Codex proxy route");
-        let route_id = crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID;
+        let route_id = "openai";
         assert_eq!(
             parsed
                 .get("model_provider")
@@ -3416,7 +3429,7 @@ mod tests {
 
     fn assert_codex_third_party_proxy_route(
         config_text: &str,
-        provider_id: &str,
+        _provider_id: &str,
         expected_base_url: &str,
     ) {
         let parsed: toml::Value = toml::from_str(config_text).expect("parse Codex proxy route");
@@ -3424,11 +3437,11 @@ mod tests {
             parsed
                 .get("model_provider")
                 .and_then(|value| value.as_str()),
-            Some(provider_id)
+            Some("openai")
         );
         let route = parsed
             .get("model_providers")
-            .and_then(|value| value.get(provider_id))
+            .and_then(|value| value.get("openai"))
             .expect("selected third-party provider route");
         assert_eq!(
             route.get("base_url").and_then(|value| value.as_str()),
@@ -3443,27 +3456,16 @@ mod tests {
     fn assert_codex_direct_history_alias(config_text: &str) {
         let parsed: toml::Value = toml::from_str(config_text).expect("parse direct Codex config");
         let alias_id = crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID;
-        let alias = parsed
+        assert!(matches!(
+            parsed
+                .get("model_provider")
+                .and_then(|value| value.as_str()),
+            None | Some("openai")
+        ));
+        assert!(parsed
             .get("model_providers")
             .and_then(|value| value.get(alias_id))
-            .expect("official history compatibility alias");
-        assert!(alias.get("base_url").is_none());
-        assert_eq!(
-            alias
-                .get("requires_openai_auth")
-                .and_then(|value| value.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            alias
-                .get("supports_websockets")
-                .and_then(|value| value.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            alias.get("wire_api").and_then(|value| value.as_str()),
-            Some("responses")
-        );
+            .is_none());
     }
 
     fn seed_codex_model_template() {
@@ -4461,8 +4463,8 @@ appearanceTheme = "dark"
             Some("trusted")
         );
 
-        // Simulate a real session created while the takeover provider id is
-        // active. Proxy toggles must never rewrite or orphan this metadata.
+        // A session created while takeover is active must remain in the same
+        // provider bucket that Codex Desktop uses for its sidebar filter.
         let session_path = crate::codex_config::get_codex_config_dir()
             .join("sessions")
             .join("2026")
@@ -4473,7 +4475,7 @@ appearanceTheme = "dark"
             .expect("create session directory");
         let session_text = format!(
             "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"history-consistency\",\"model_provider\":\"{}\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"keep me\"}}}}\n",
-            crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID
+            "openai"
         );
         std::fs::write(&session_path, &session_text).expect("seed proxy-created session");
 
@@ -5374,8 +5376,8 @@ wire_api = "chat"
 
         let provider = parsed
             .get("model_providers")
-            .and_then(|v| v.get("chat_only"))
-            .expect("model_providers.chat_only should exist");
+            .and_then(|v| v.get("openai"))
+            .expect("model_providers.openai should be the canonical live route");
 
         assert_eq!(
             provider.get("base_url").and_then(|v| v.as_str()),
@@ -5469,7 +5471,7 @@ wire_api = "responses"
         assert_eq!(
             parsed
                 .get("model_providers")
-                .and_then(|v| v.get("deepseek"))
+                .and_then(|v| v.get("openai"))
                 .and_then(|v| v.get("base_url"))
                 .and_then(|v| v.as_str()),
             Some(proxy_url)
@@ -6413,8 +6415,8 @@ requires_openai_auth = true
         let parsed_live: toml::Value = toml::from_str(live_config).expect("parse live config");
         assert_eq!(
             parsed_live.get("model_provider").and_then(|v| v.as_str()),
-            Some("aihubmix"),
-            "the live route should follow the selected provider"
+            Some("openai"),
+            "the live route should keep the sidebar history provider stable"
         );
         assert_codex_third_party_proxy_route(live_config, "aihubmix", "http://127.0.0.1:15721/v1");
 
@@ -6431,8 +6433,8 @@ requires_openai_auth = true
         let parsed_live: toml::Value = toml::from_str(live_config).expect("parse live config");
         assert_eq!(
             parsed_live.get("model_provider").and_then(|v| v.as_str()),
-            Some("rightcode"),
-            "restored Codex live config should be the original snapshot"
+            Some("openai"),
+            "restored Codex live config should keep the canonical history bucket"
         );
         assert_eq!(
             live.get("auth")
@@ -6540,7 +6542,7 @@ requires_openai_auth = true
 
         assert_eq!(
             parsed_live.get("model_provider").and_then(|v| v.as_str()),
-            Some("deepseek")
+            Some("openai")
         );
         assert_codex_third_party_proxy_route(live_config, "deepseek", "http://127.0.0.1:15721/v1");
         assert_eq!(

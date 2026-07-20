@@ -13,10 +13,8 @@ use std::process::Command;
 use toml_edit::DocumentMut;
 
 pub const CC_SWITCH_CODEX_MODEL_PROVIDER_ID: &str = "custom";
-/// Temporary model-provider id used while the built-in `codex-official`
-/// provider is routed through CC Switch.  A dedicated id is an ownership
-/// marker: unlike a generic localhost `base_url`, it can be detected and
-/// cleaned up without mistaking a user's own local provider for takeover.
+/// Legacy model-provider id emitted by CC Switch 3.17.0 prerelease builds.
+/// Kept only so live configs created by those builds can be normalized.
 pub const CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID: &str = "cc-switch-official";
 pub const CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME: &str = "cc-switch-model-catalog.json";
 const CODEX_PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
@@ -1383,9 +1381,9 @@ pub fn read_codex_live_settings() -> Result<Value, AppError> {
     Ok(json!({ "auth": auth, "config": cfg_text }))
 }
 
-/// `[model_providers.custom]` entry that makes an official (ChatGPT OAuth)
-/// provider behave like Codex's built-in `openai` entry while running under
-/// the shared custom id: `requires_openai_auth` routes auth to the ChatGPT
+/// `[model_providers.openai]` entry that routes the official (ChatGPT OAuth)
+/// provider through CC Switch without changing Codex's provider identity.
+/// `requires_openai_auth` routes auth to the ChatGPT
 /// login in `auth.json` (base_url then defaults to the official Codex
 /// backend), `name = "OpenAI"` keeps Codex's `is_openai()` feature gates
 /// (web search, remote compaction), and `supports_websockets` restores the
@@ -1434,7 +1432,7 @@ fn remove_codex_proxy_placeholders_from_providers(providers: &mut toml_edit::Tab
 /// Project the built-in Codex official provider through the local proxy while
 /// keeping authentication owned by Codex itself.
 ///
-/// The resulting custom provider explicitly opts into OpenAI authentication,
+/// The resulting override explicitly opts into OpenAI authentication,
 /// so Codex forwards its existing ChatGPT login to the local `/responses`
 /// endpoint.  No API key or bearer placeholder is written to `auth.json`.
 pub fn apply_codex_official_proxy_route(
@@ -1448,7 +1446,10 @@ pub fn apply_codex_official_proxy_route(
     // A third-party takeover may have left the proxy placeholder in config.toml.
     // The official route must use Codex's native OpenAI login instead.
     doc.as_table_mut().remove("experimental_bearer_token");
-    doc["model_provider"] = toml_edit::value(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID);
+    // Codex Desktop filters thread/list by the active provider id. Keeping the
+    // built-in id is therefore required for existing chats and project task
+    // lists to remain visible while the proxy is toggled.
+    doc["model_provider"] = toml_edit::value("openai");
 
     let mut providers = match doc.as_table_mut().remove("model_providers") {
         Some(item) => item.into_table().map_err(|_| {
@@ -1470,39 +1471,30 @@ pub fn apply_codex_official_proxy_route(
     // The local proxy currently exposes HTTP/SSE, not Codex websocket routes.
     let table = codex_official_provider_table(Some(proxy_base_url), false);
 
-    providers.insert(
-        CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID,
-        toml_edit::Item::Table(table),
-    );
+    providers.remove(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID);
+    providers.insert("openai", toml_edit::Item::Table(table));
     doc["model_providers"] = toml_edit::Item::Table(providers);
     Ok(doc.to_string())
 }
 
 /// Whether a live Codex config is the official route projected by CC Switch.
 pub fn codex_config_has_official_proxy_route(config_text: &str) -> bool {
-    if !config_text.contains(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID) {
+    let Ok(doc) = config_text.parse::<DocumentMut>() else {
+        return false;
+    };
+    if doc.get("model_provider").and_then(|item| item.as_str()) != Some("openai") {
         return false;
     }
-    config_text
-        .parse::<DocumentMut>()
-        .ok()
-        .and_then(|doc| {
-            doc.get("model_provider")
-                .and_then(|item| item.as_str())
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+    doc.get("model_providers")
+        .and_then(|item| item.as_table())
+        .and_then(|providers| providers.get("openai"))
+        .and_then(|item| item.as_table())
+        .is_some_and(table_matches_codex_official_proxy_provider)
 }
 
-/// Keep the takeover provider id resolvable after routing returns to the
-/// built-in `openai` provider. Codex persists `model_provider` in session
-/// metadata, so chats created while takeover is enabled may still reference
-/// `cc-switch-official` later. The compatibility entry deliberately has no
-/// `base_url`: it uses Codex's native OpenAI backend and existing ChatGPT auth.
-///
-/// When the takeover route is currently active, leave its local HTTP/SSE table
-/// untouched. This makes the helper safe to apply to every Codex live profile.
+/// Remove the provider alias emitted by CC Switch 3.17.0 prerelease builds.
+/// Those builds used `cc-switch-official`, which made Codex Desktop hide all
+/// existing `openai` chats due to its provider-scoped thread/list query.
 pub fn ensure_codex_official_proxy_history_alias(config_text: &str) -> Result<String, AppError> {
     let mut doc = config_text
         .parse::<DocumentMut>()
@@ -1511,7 +1503,7 @@ pub fn ensure_codex_official_proxy_history_alias(config_text: &str) -> Result<St
     if doc.get("model_provider").and_then(|item| item.as_str())
         == Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
     {
-        return Ok(config_text.to_string());
+        doc["model_provider"] = toml_edit::value("openai");
     }
 
     let mut providers = match doc.as_table_mut().remove("model_providers") {
@@ -1526,11 +1518,10 @@ pub fn ensure_codex_official_proxy_history_alias(config_text: &str) -> Result<St
             table
         }
     };
-    providers.insert(
-        CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID,
-        toml_edit::Item::Table(codex_official_provider_table(None, true)),
-    );
-    doc["model_providers"] = toml_edit::Item::Table(providers);
+    providers.remove(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID);
+    if !providers.is_empty() {
+        doc["model_providers"] = toml_edit::Item::Table(providers);
+    }
     Ok(doc.to_string())
 }
 
@@ -1540,8 +1531,9 @@ pub fn remove_codex_official_proxy_route(config_text: &str) -> Result<String, Ap
     let mut doc = config_text
         .parse::<DocumentMut>()
         .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
-    if doc.get("model_provider").and_then(|item| item.as_str())
-        != Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+    let active = doc.get("model_provider").and_then(|item| item.as_str());
+    if active != Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+        && !codex_config_has_official_proxy_route(config_text)
     {
         return Ok(config_text.to_string());
     }
@@ -1553,14 +1545,54 @@ pub fn remove_codex_official_proxy_route(config_text: &str) -> Result<String, Ap
                 "Invalid Codex config.toml: model_providers must be a table".to_string(),
             )
         })?;
-        providers.insert(
-            CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID,
-            toml_edit::Item::Table(codex_official_provider_table(None, true)),
-        );
+        providers.remove(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID);
+        let remove_openai = providers
+            .get("openai")
+            .and_then(|item| item.as_table())
+            .is_some_and(table_matches_codex_official_proxy_provider);
+        if remove_openai {
+            providers.remove("openai");
+        }
         remove_codex_proxy_placeholders_from_providers(&mut providers);
-        doc["model_providers"] = toml_edit::Item::Table(providers);
+        if !providers.is_empty() {
+            doc["model_providers"] = toml_edit::Item::Table(providers);
+        }
     }
     Ok(doc.to_string())
+}
+
+fn table_matches_codex_official_proxy_provider(table: &toml_edit::Table) -> bool {
+    table.get("name").and_then(|item| item.as_str()) == Some("OpenAI")
+        && table
+            .get("requires_openai_auth")
+            .and_then(|item| item.as_bool())
+            == Some(true)
+        && table
+            .get("supports_websockets")
+            .and_then(|item| item.as_bool())
+            == Some(false)
+        && table.get("wire_api").and_then(|item| item.as_str()) == Some("responses")
+        && table
+            .get("base_url")
+            .and_then(|item| item.as_str())
+            .is_some_and(is_loopback_codex_proxy_url)
+}
+
+fn is_loopback_codex_proxy_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    let authority = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .unwrap_or(&lower)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    authority == "localhost"
+        || authority.starts_with("localhost:")
+        || authority == "127.0.0.1"
+        || authority.starts_with("127.0.0.1:")
+        || authority == "[::1]"
+        || authority.starts_with("[::1]:")
 }
 
 fn table_matches_codex_unified_official_provider(table: &toml_edit::Table) -> bool {
@@ -1801,11 +1833,60 @@ pub fn prepare_codex_provider_live_config(
 ) -> Result<String, AppError> {
     let token = extract_codex_auth_api_key(auth)
         .or_else(|| extract_codex_experimental_bearer_token(config_text));
+    let config_text = canonicalize_codex_live_provider_id(config_text)?;
 
     Ok(match token {
-        Some(token) => set_codex_experimental_bearer_token(config_text, &token)?,
-        None => config_text.to_string(),
+        Some(token) => set_codex_experimental_bearer_token(&config_text, &token)?,
+        None => config_text,
     })
+}
+
+/// Keep every CC Switch live profile in Codex Desktop's built-in `openai`
+/// history bucket. The Desktop sidebar sends the active provider id as a
+/// `thread/list.modelProviders` filter, so preserving arbitrary provider ids
+/// makes all tasks created under another provider appear deleted.
+///
+/// Stored provider templates remain unchanged; only the generated live TOML is
+/// canonicalized. Routing and credentials are moved with the active table.
+pub fn canonicalize_codex_live_provider_id(config_text: &str) -> Result<String, AppError> {
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    let Some(active) = doc
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        .map(str::to_string)
+    else {
+        return Ok(config_text.to_string());
+    };
+    if active == "openai" {
+        return Ok(config_text.to_string());
+    }
+
+    doc["model_provider"] = toml_edit::value("openai");
+    if let Some(item) = doc.as_table_mut().remove("model_providers") {
+        let mut providers = item.into_table().map_err(|_| {
+            AppError::Message(
+                "Invalid Codex config.toml: model_providers must be a table".to_string(),
+            )
+        })?;
+        if let Some(active_table) = providers.remove(&active) {
+            providers.insert("openai", active_table);
+        }
+        doc["model_providers"] = toml_edit::Item::Table(providers);
+    }
+    if let Some(profiles) = doc.get_mut("profiles").and_then(|item| item.as_table_mut()) {
+        for (_, profile) in profiles.iter_mut() {
+            if let Some(table) = profile.as_table_mut() {
+                if table.get("model_provider").and_then(|item| item.as_str())
+                    == Some(active.as_str())
+                {
+                    table["model_provider"] = toml_edit::value("openai");
+                }
+            }
+        }
+    }
+    Ok(doc.to_string())
 }
 
 /// During DB backfill, lift a live `experimental_bearer_token` back into
@@ -2042,7 +2123,7 @@ command = "example"
 
         assert_eq!(
             doc.get("model_provider").and_then(toml::Value::as_str),
-            Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+            Some("openai")
         );
         assert!(doc.get("experimental_bearer_token").is_none());
         assert!(
@@ -2050,7 +2131,7 @@ command = "example"
             "unrelated config survives"
         );
 
-        let provider = &doc["model_providers"][CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID];
+        let provider = &doc["model_providers"]["openai"];
         assert_eq!(
             provider.get("base_url").and_then(toml::Value::as_str),
             Some("http://127.0.0.1:15721/v1")
@@ -2081,23 +2162,28 @@ command = "example"
             doc.get("model_provider").and_then(toml::Value::as_str),
             Some("openai")
         );
-        let alias = &doc["model_providers"][CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID];
-        assert!(alias.get("base_url").is_none());
-        assert_eq!(
-            alias
-                .get("requires_openai_auth")
-                .and_then(toml::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            alias
-                .get("supports_websockets")
-                .and_then(toml::Value::as_bool),
-            Some(true)
-        );
+        assert!(doc.get("model_providers").is_none());
         assert_eq!(
             doc.get("model").and_then(toml::Value::as_str),
             Some("gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn official_proxy_detection_does_not_claim_remote_openai_override() {
+        let user_config = r#"model_provider = "openai"
+
+[model_providers.openai]
+name = "OpenAI"
+base_url = "https://gateway.example/v1"
+requires_openai_auth = true
+supports_websockets = false
+wire_api = "responses"
+"#;
+        assert!(!codex_config_has_official_proxy_route(user_config));
+        assert_eq!(
+            remove_codex_official_proxy_route(user_config).expect("leave user route unchanged"),
+            user_config
         );
     }
 
@@ -2123,9 +2209,7 @@ model_providers = { rightcode = { name = "RightCode", experimental_bearer_token 
         assert!(projected_doc["model_providers"]["rightcode"]
             .get("experimental_bearer_token")
             .is_none());
-        assert!(projected_doc["model_providers"]
-            .get(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
-            .is_some());
+        assert!(projected_doc["model_providers"].get("openai").is_some());
 
         let cleaned = remove_codex_official_proxy_route(&projected).expect("clean projected");
         let cleaned_doc: toml::Value = toml::from_str(&cleaned).expect("parse cleaned");
@@ -2136,31 +2220,21 @@ model_providers = { rightcode = { name = "RightCode", experimental_bearer_token 
             Some("openai")
         );
         assert!(cleaned_doc["model_providers"].get("rightcode").is_some());
-        let alias = &cleaned_doc["model_providers"][CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID];
-        assert!(alias.get("base_url").is_none());
-        assert_eq!(
-            alias
-                .get("supports_websockets")
-                .and_then(toml::Value::as_bool),
-            Some(true)
-        );
+        assert!(cleaned_doc["model_providers"].get("openai").is_none());
     }
 
     #[test]
-    fn official_proxy_history_alias_is_stable_across_on_off_cycles() {
+    fn official_proxy_provider_id_is_stable_across_on_off_cycles() {
         let native = r#"model_provider = "openai"
 model = "gpt-5.4"
 
 [projects."C:/work/demo"]
 trust_level = "trusted"
 "#;
-        let direct = ensure_codex_official_proxy_history_alias(native).expect("add history alias");
+        let direct = ensure_codex_official_proxy_history_alias(native).expect("normalize config");
         let direct_doc: toml::Value = toml::from_str(&direct).expect("parse direct config");
         assert_eq!(direct_doc["model_provider"].as_str(), Some("openai"));
-        let direct_alias =
-            &direct_doc["model_providers"][CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID];
-        assert!(direct_alias.get("base_url").is_none());
-        assert_eq!(direct_alias["supports_websockets"].as_bool(), Some(true));
+        assert!(direct_doc.get("model_providers").is_none());
         assert_eq!(
             direct_doc["projects"]["C:/work/demo"]["trust_level"].as_str(),
             Some("trusted")
@@ -2169,12 +2243,8 @@ trust_level = "trusted"
         let proxied = apply_codex_official_proxy_route(&direct, "http://127.0.0.1:15721/v1")
             .expect("enable route");
         let proxied_doc: toml::Value = toml::from_str(&proxied).expect("parse proxy config");
-        assert_eq!(
-            proxied_doc["model_provider"].as_str(),
-            Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
-        );
-        let proxied_alias =
-            &proxied_doc["model_providers"][CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID];
+        assert_eq!(proxied_doc["model_provider"].as_str(), Some("openai"));
+        let proxied_alias = &proxied_doc["model_providers"]["openai"];
         assert_eq!(
             proxied_alias["base_url"].as_str(),
             Some("http://127.0.0.1:15721/v1")
@@ -2185,14 +2255,27 @@ trust_level = "trusted"
         let direct_again_doc: toml::Value =
             toml::from_str(&direct_again).expect("parse restored direct config");
         assert_eq!(direct_again_doc["model_provider"].as_str(), Some("openai"));
-        let restored_alias =
-            &direct_again_doc["model_providers"][CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID];
-        assert!(restored_alias.get("base_url").is_none());
-        assert_eq!(restored_alias["supports_websockets"].as_bool(), Some(true));
+        assert!(direct_again_doc.get("model_providers").is_none());
         assert_eq!(
             direct_again_doc["projects"]["C:/work/demo"]["trust_level"].as_str(),
             Some("trusted")
         );
+    }
+
+    #[test]
+    fn official_proxy_normalizer_removes_prerelease_history_alias() {
+        let stale = r#"model_provider = "cc-switch-official"
+
+[model_providers.cc-switch-official]
+name = "OpenAI"
+requires_openai_auth = true
+supports_websockets = true
+wire_api = "responses"
+"#;
+        let normalized = ensure_codex_official_proxy_history_alias(stale).expect("normalize");
+        let doc: toml::Value = toml::from_str(&normalized).expect("parse normalized");
+        assert_eq!(doc["model_provider"].as_str(), Some("openai"));
+        assert!(doc.get("model_providers").is_none());
     }
 
     #[test]
@@ -2453,10 +2536,11 @@ model = "gpt-5"
     }
 
     #[test]
-    fn prepare_provider_live_config_preserves_custom_provider_id() {
+    fn prepare_provider_live_config_canonicalizes_provider_id_for_sidebar_history() {
         let input = r#"model_provider = "vendor_alpha"
 model = "gpt-5.4"
 profile = "work"
+model_catalog_json = "cc-switch-model-catalog.json"
 
 [model_providers.vendor_alpha]
 name = "Vendor Alpha"
@@ -2475,20 +2559,31 @@ model = "gpt-5.4"
 
         assert_eq!(
             parsed.get("model_provider").and_then(|v| v.as_str()),
-            Some("vendor_alpha")
+            Some("openai")
+        );
+        assert_eq!(
+            parsed.get("model_catalog_json").and_then(|v| v.as_str()),
+            Some("cc-switch-model-catalog.json"),
+            "catalog injection must survive provider canonicalization"
         );
         assert!(
             parsed
                 .get("model_providers")
-                .and_then(|v| v.get("custom"))
+                .and_then(|v| v.get("vendor_alpha"))
                 .is_none(),
-            "provider writes should not force custom provider ids"
+            "live provider writes must not leave provider-scoped history ids"
         );
         assert_eq!(
             parsed
                 .get("model_providers")
-                .and_then(|v| v.get("vendor_alpha"))
-                .and_then(|v| v.get("experimental_bearer_token"))
+                .and_then(|v| v.get("openai"))
+                .and_then(|v| v.get("base_url"))
+                .and_then(|v| v.as_str()),
+            Some("https://alpha.example/v1")
+        );
+        assert_eq!(
+            parsed
+                .get("experimental_bearer_token")
                 .and_then(|v| v.as_str()),
             Some("sk-test")
         );
@@ -2498,8 +2593,8 @@ model = "gpt-5.4"
                 .and_then(|v| v.get("work"))
                 .and_then(|v| v.get("model_provider"))
                 .and_then(|v| v.as_str()),
-            Some("vendor_alpha"),
-            "profile provider references should be preserved"
+            Some("openai"),
+            "profile provider references should follow the canonical history bucket"
         );
     }
 
