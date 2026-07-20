@@ -2818,6 +2818,62 @@ impl ProxyService {
         Ok(())
     }
 
+    /// Enable the combined Codex model catalog without applying the stored
+    /// `codex-official` provider snapshot to the live Codex profile.
+    ///
+    /// Model injection is a routing operation, not an account switch.  Older
+    /// CC Switch databases may still contain auth/config data in the built-in
+    /// official row.  Calling `ProviderService::switch` here would write that
+    /// stale snapshot before takeover has a chance to back up the current
+    /// profile, which can change the ChatGPT account and retrigger Desktop
+    /// onboarding.  Point the router at the built-in official capability and
+    /// let `set_takeover_for_app` derive its immutable backup from live files.
+    pub async fn enable_codex_model_routes_from_current_live(&self) -> Result<(), String> {
+        const APP_TYPE: &str = "codex";
+        let app = AppType::Codex;
+        let official_id = crate::database::CODEX_OFFICIAL_PROVIDER_ID;
+
+        let takeover_enabled = self
+            .db
+            .get_proxy_config_for_app(APP_TYPE)
+            .await
+            .map_err(|e| format!("Failed to read Codex proxy configuration: {e}"))?
+            .enabled;
+        if takeover_enabled {
+            return self.switch_proxy_target(APP_TYPE, official_id).await;
+        }
+
+        self.db
+            .ensure_official_seed_by_id(official_id, app.clone())
+            .map_err(|e| format!("Failed to ensure the Codex official route: {e}"))?;
+
+        let previous_db_provider = self
+            .db
+            .get_current_provider(APP_TYPE)
+            .map_err(|e| format!("Failed to read the current Codex provider: {e}"))?;
+        let previous_local_provider = crate::settings::get_current_provider(&app);
+
+        self.db
+            .set_current_provider(APP_TYPE, official_id)
+            .map_err(|e| format!("Failed to select the Codex official route: {e}"))?;
+        if let Err(error) = crate::settings::set_current_provider(&app, Some(official_id)) {
+            let rollback_id = previous_db_provider.as_deref().unwrap_or("");
+            let _ = self.db.set_current_provider(APP_TYPE, rollback_id);
+            return Err(format!(
+                "Failed to select the Codex official route: {error}"
+            ));
+        }
+
+        if let Err(error) = self.set_takeover_for_app(APP_TYPE, true).await {
+            let rollback_id = previous_db_provider.as_deref().unwrap_or("");
+            let _ = self.db.set_current_provider(APP_TYPE, rollback_id);
+            let _ = crate::settings::set_current_provider(&app, previous_local_provider.as_deref());
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
     // ==================== Live 配置读写辅助方法 ====================
 
     /// 接管 Codex 时，本地客户端必须继续以 Responses wire API 访问代理。
@@ -4715,6 +4771,130 @@ wire_api = "responses"
             .set_takeover_for_app("codex", false)
             .await
             .expect("disable Codex takeover");
+        crate::settings::update_settings(crate::settings::AppSettings::default())
+            .expect("reset settings");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_model_routes_start_from_live_profile_not_stale_official_snapshot() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+
+        let live_auth = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "account_id": "current-account",
+                "access_token": "current-access"
+            }
+        });
+        let live_config = r#"model = "gpt-5.4"
+
+[windows]
+sandbox = "elevated"
+"#;
+        crate::codex_config::write_codex_live_atomic(&live_auth, Some(live_config))
+            .expect("seed current Codex profile");
+        let global_state_path =
+            crate::codex_config::get_codex_config_dir().join(".codex-global-state.json");
+        let global_state =
+            br#"{"electron:onboarding-welcome-pending":false,"projects":{"current":true}}"#;
+        std::fs::write(&global_state_path, global_state).expect("seed Codex Desktop state");
+
+        // Reproduce an upgraded database whose old built-in official row still
+        // contains a different account and first-run-era config snapshot.
+        let mut stale_official = Provider::with_id(
+            crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            "OpenAI Official".to_string(),
+            json!({
+                "auth": {
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "account_id": "stale-account",
+                        "access_token": "stale-access"
+                    }
+                },
+                "config": "model = \"gpt-old\"\n[windows]\nsandbox = \"unelevated\"\n"
+            }),
+            None,
+        );
+        stale_official.category = Some("official".to_string());
+        db.save_provider("codex", &stale_official)
+            .expect("save stale official snapshot");
+
+        let third_party = Provider::with_id(
+            "glm".to_string(),
+            "GLM".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "glm-key" },
+                "config": "model_provider = \"glm\"\n"
+            }),
+            None,
+        );
+        db.save_provider("codex", &third_party)
+            .expect("save third-party provider");
+        db.set_current_provider("codex", "glm")
+            .expect("set DB current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some("glm"))
+            .expect("set local current provider");
+
+        service
+            .enable_codex_model_routes_from_current_live()
+            .await
+            .expect("enable model routes from current live profile");
+
+        let routed_auth: Value =
+            crate::config::read_json_file(&crate::codex_config::get_codex_auth_path())
+                .expect("read routed auth");
+        assert_eq!(
+            routed_auth, live_auth,
+            "model injection must not switch the signed-in ChatGPT account"
+        );
+        let routed_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read routed config");
+        assert!(routed_config.contains("sandbox = \"elevated\""));
+        assert!(!routed_config.contains("stale-account"));
+        assert!(!routed_config.contains("gpt-old"));
+        assert_eq!(
+            std::fs::read(&global_state_path).expect("read routed Desktop state"),
+            global_state,
+            "model injection must not reset Codex Desktop onboarding or project state"
+        );
+        assert_codex_official_proxy_route(&routed_config, &running_codex_base_url(&service).await);
+
+        let backup = db
+            .get_live_backup("codex")
+            .await
+            .expect("read live backup")
+            .expect("live backup exists");
+        let backup: Value = serde_json::from_str(&backup.original_config).expect("parse backup");
+        assert_eq!(backup.get("auth"), Some(&live_auth));
+        assert!(backup
+            .get("config")
+            .and_then(Value::as_str)
+            .is_some_and(|config| config.contains("sandbox = \"elevated\"")));
+
+        service
+            .set_takeover_for_app("codex", false)
+            .await
+            .expect("restore current Codex profile");
+        let restored_auth: Value =
+            crate::config::read_json_file(&crate::codex_config::get_codex_auth_path())
+                .expect("read restored auth");
+        let restored_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read restored config");
+        assert_eq!(restored_auth, live_auth);
+        assert!(restored_config.contains("sandbox = \"elevated\""));
+        assert!(!restored_config.contains("gpt-old"));
+        assert_eq!(
+            std::fs::read(&global_state_path).expect("read restored Desktop state"),
+            global_state
+        );
+
         crate::settings::update_settings(crate::settings::AppSettings::default())
             .expect("reset settings");
     }

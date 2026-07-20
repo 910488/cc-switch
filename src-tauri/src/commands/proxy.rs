@@ -156,15 +156,9 @@ pub async fn apply_codex_model_routes(
                 .switch_proxy_target("codex", crate::database::CODEX_OFFICIAL_PROVIDER_ID)
                 .await?;
         } else {
-            crate::services::ProviderService::switch(
-                state.inner(),
-                crate::app_config::AppType::Codex,
-                crate::database::CODEX_OFFICIAL_PROVIDER_ID,
-            )
-            .map_err(|error| error.to_string())?;
             state
                 .proxy_service
-                .set_takeover_for_app("codex", true)
+                .enable_codex_model_routes_from_current_live()
                 .await?;
         }
         Ok(())
@@ -190,13 +184,6 @@ pub async fn rollback_codex_model_routes(state: tauri::State<'_, AppState>) -> R
             .proxy_service
             .set_takeover_for_app("codex", false)
             .await?;
-    } else {
-        crate::services::ProviderService::switch(
-            state.inner(),
-            crate::app_config::AppType::Codex,
-            crate::database::CODEX_OFFICIAL_PROVIDER_ID,
-        )
-        .map_err(|error| error.to_string())?;
     }
     Ok(())
 }
