@@ -6972,6 +6972,16 @@ requires_openai_auth = true
             config_text.contains("model_catalog_json"),
             "config.toml must reference model_catalog_json after switch"
         );
+        let config_doc: toml::Value =
+            toml::from_str(&config_text).expect("parse switched config.toml");
+        let catalog_pointer = config_doc
+            .get("model_catalog_json")
+            .and_then(|value| value.as_str())
+            .expect("catalog pointer after switch");
+        assert!(
+            std::path::Path::new(catalog_pointer).is_absolute(),
+            "Codex Desktop requires an absolute model_catalog_json path, got: {catalog_pointer}"
+        );
         assert!(
             config_text.contains("[mcp_servers.shared]"),
             "config.toml must keep common config after switch"
@@ -7248,9 +7258,16 @@ requires_openai_auth = true
             restored.contains("model_catalog_json"),
             "restore must preserve the model_catalog_json pointer, got:\n{restored}"
         );
-        assert!(
-            restored.contains(pointer.as_str()),
-            "restored pointer must still reference the cc-switch generated catalog file"
+        let restored_doc: toml::Value =
+            toml::from_str(&restored).expect("parse restored config.toml");
+        let restored_pointer = restored_doc
+            .get("model_catalog_json")
+            .and_then(|value| value.as_str())
+            .expect("restored catalog pointer");
+        assert_eq!(
+            std::path::Path::new(restored_pointer),
+            catalog_path,
+            "restored pointer must reference the cc-switch generated catalog file"
         );
     }
 

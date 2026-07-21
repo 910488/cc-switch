@@ -953,8 +953,18 @@ fn set_codex_model_catalog_json_field(
         .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
 
     match catalog_path {
-        Some(_) => {
-            doc["model_catalog_json"] = toml_edit::value(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        Some(path) => {
+            if !path.is_absolute() {
+                return Err(AppError::Message(format!(
+                    "Codex model catalog path must be absolute: {}",
+                    path.display()
+                )));
+            }
+            // Codex deserializes this field as an AbsolutePathBuf.  A bare
+            // filename used to be resolved relative to CODEX_HOME, but current
+            // Desktop builds reject it while creating a task with:
+            // `AbsolutePathBuf deserialized without a base path`.
+            doc["model_catalog_json"] = toml_edit::value(codex_catalog_config_path(path));
         }
         None => {
             let should_remove = doc
@@ -972,6 +982,33 @@ fn set_codex_model_catalog_json_field(
     }
 
     Ok(doc.to_string())
+}
+
+/// Return the absolute path syntax understood by the Codex process that owns
+/// the selected config directory. Native paths stay native. A Windows UNC path
+/// into a WSL distribution is converted back to its distribution-local Linux
+/// path, because that config.toml is consumed by Codex running inside WSL.
+fn codex_catalog_config_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    #[cfg(target_os = "windows")]
+    {
+        let mut unc = raw.as_ref();
+        if let Some(rest) = unc.strip_prefix(r"\\?\UNC\") {
+            unc = rest;
+        } else {
+            unc = unc.trim_start_matches('\\');
+        }
+        let mut parts = unc.split('\\');
+        let host = parts.next().unwrap_or_default();
+        if host.eq_ignore_ascii_case("wsl.localhost") || host.eq_ignore_ascii_case("wsl$") {
+            let _distribution = parts.next();
+            let linux_parts: Vec<&str> = parts.filter(|part| !part.is_empty()).collect();
+            if !linux_parts.is_empty() {
+                return format!("/{}", linux_parts.join("/"));
+            }
+        }
+    }
+    raw.into_owned()
 }
 
 /// Pure toggle for the top-level `web_search` field that turns Codex's built-in
@@ -1195,8 +1232,9 @@ fn build_simplified_catalog_from_texts(config_text: &str, catalog_text: &str) ->
 /// - **Snapshot backup** (`read_codex_live_settings`): `{ auth, config }` with no
 ///   inline `modelCatalog`. Its `config.toml` text already carries whatever
 ///   `model_catalog_json` pointer existed at backup time, and the generated
-///   catalog file on disk is untouched. Here we must keep the config **raw** —
-///   running catalog projection would see "no specs" and strip the live pointer.
+///   catalog file on disk is untouched. Here we keep the config content, but
+///   migrate a legacy cc-switch-owned relative pointer to the required absolute
+///   path. Running full catalog projection would see "no specs" and strip it.
 /// - **Provider-rebuilt backup** (`update_live_backup_from_provider`): the DB
 ///   provider's settings, i.e. `{ auth, config (no pointer), modelCatalog
 ///   (inline DB SSOT) }`. Here the pointer/catalog file must be (re)generated
@@ -1217,7 +1255,12 @@ pub fn prepare_codex_live_config_text_with_optional_catalog(
     if settings.get("modelCatalog").is_some() {
         prepare_codex_config_text_with_model_catalog(settings, config_text, profile)
     } else {
-        Ok(config_text.to_string())
+        let generated_path = get_codex_model_catalog_path();
+        if resolve_cc_switch_catalog_path(config_text, &generated_path).is_some() {
+            set_codex_model_catalog_json_field(config_text, Some(&generated_path))
+        } else {
+            Ok(config_text.to_string())
+        }
     }
 }
 
@@ -3241,21 +3284,21 @@ base_url = "https://production.api/v1"
     }
 
     #[test]
-    fn model_catalog_json_field_writes_relative_filename() {
+    fn model_catalog_json_field_writes_absolute_path() {
         let input = r#"model_provider = "any"
 
 [model_providers.any]
 name = "any"
 "#;
-        let catalog_path = Path::new("/tmp/cc-switch-model-catalog.json");
+        let catalog_path = std::env::temp_dir().join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
 
-        let result = set_codex_model_catalog_json_field(input, Some(catalog_path)).unwrap();
+        let result = set_codex_model_catalog_json_field(input, Some(&catalog_path)).unwrap();
         let parsed: toml::Value = toml::from_str(&result).unwrap();
         assert_eq!(
             parsed
                 .get("model_catalog_json")
                 .and_then(|value| value.as_str()),
-            Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)
+            Some(catalog_path.to_string_lossy().as_ref())
         );
         assert!(
             parsed
@@ -3674,12 +3717,12 @@ web_search = "disabled"
 
     #[test]
     #[cfg(target_os = "windows")]
-    fn set_catalog_json_field_writes_filename_ignoring_unc_path() {
+    fn set_catalog_json_field_converts_wsl_unc_to_linux_absolute_path() {
         let input = r#"model_provider = "custom"
 model = "glm-5"
 "#;
-        // Simulate a WSL UNC path as cc-switch would see it on Windows;
-        // the function now writes just the relative filename.
+        // This config is consumed by Codex inside WSL, so the Windows-side UNC
+        // path must become an absolute path in that distribution.
         let unc_path =
             Path::new(r"\\wsl.localhost\Ubuntu\home\user\.codex\cc-switch-model-catalog.json");
 
@@ -3691,25 +3734,52 @@ model = "glm-5"
             .and_then(|v| v.as_str())
             .expect("model_catalog_json should be set");
         assert_eq!(
-            written_path, CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME,
-            "should write only the relative filename, not the UNC path"
+            written_path, "/home/user/.codex/cc-switch-model-catalog.json",
+            "should write the distribution-local absolute path"
         );
     }
 
     #[test]
-    fn set_catalog_json_field_writes_filename_for_any_path() {
+    fn set_catalog_json_field_writes_full_absolute_path() {
         let input = r#"model_provider = "custom"
 model = "glm-5"
 "#;
-        let regular_path = Path::new("/home/user/.codex/cc-switch-model-catalog.json");
+        let regular_path = std::env::temp_dir().join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
 
-        let result = set_codex_model_catalog_json_field(input, Some(regular_path)).unwrap();
+        let result = set_codex_model_catalog_json_field(input, Some(&regular_path)).unwrap();
         let parsed: toml::Value = toml::from_str(&result).unwrap();
 
         assert_eq!(
             parsed.get("model_catalog_json").and_then(|v| v.as_str()),
-            Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME),
-            "should write only the relative filename, not the full path"
+            Some(regular_path.to_string_lossy().as_ref()),
+            "Codex requires the full absolute path"
+        );
+    }
+
+    #[test]
+    fn optional_catalog_migrates_legacy_relative_pointer() {
+        let input = r#"model_catalog_json = "cc-switch-model-catalog.json"
+"#;
+        let result = prepare_codex_live_config_text_with_optional_catalog(
+            &json!({}),
+            input,
+            CodexCatalogToolProfile::ProxyChat,
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(&result).unwrap();
+        let written_path = parsed
+            .get("model_catalog_json")
+            .and_then(|value| value.as_str())
+            .unwrap();
+        assert!(
+            Path::new(written_path).is_absolute(),
+            "legacy cc-switch pointer must be migrated to an absolute path"
+        );
+        assert_eq!(
+            Path::new(written_path)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)
         );
     }
 
