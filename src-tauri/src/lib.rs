@@ -5,7 +5,6 @@ mod claude_desktop_config;
 mod claude_mcp;
 mod claude_plugin;
 mod codex_config;
-mod codex_desktop;
 mod codex_history_migration;
 mod codex_state_db;
 mod commands;
@@ -1389,7 +1388,6 @@ pub fn run() {
             commands::get_auto_review_stats,
             commands::get_codex_model_routes,
             commands::get_codex_cached_official_models,
-            commands::refresh_codex_desktop_model_service,
             commands::apply_codex_model_routes,
             commands::rollback_codex_model_routes,
             commands::get_continuity_summary_targets,

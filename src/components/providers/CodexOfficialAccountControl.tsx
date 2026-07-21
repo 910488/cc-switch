@@ -22,6 +22,7 @@ import {
   CODEX_OFFICIAL_ACCOUNT_PREFIX,
   CODEX_OFFICIAL_MANAGED_DEFAULT,
   CODEX_OFFICIAL_NATIVE,
+  resolveCodexOfficialQuotaSelection,
   resolveCodexOfficialSelection,
   updateCodexOfficialAuthMeta,
 } from "@/lib/codexOfficialAuth";
@@ -41,21 +42,12 @@ export function CodexOfficialAccountControl({
   const updateProvider = useUpdateProviderMutation("codex");
   const configuredMode: CodexOfficialAuthMode =
     provider.meta?.codexOfficialAuthMode ?? CODEX_OFFICIAL_NATIVE;
-  const boundAccountId =
-    provider.meta?.authBinding?.source === "managed_account" &&
-    provider.meta.authBinding.authProvider === "codex_oauth"
-      ? provider.meta.authBinding.accountId
-      : undefined;
   const selectedValue = resolveCodexOfficialSelection(provider.meta);
   const refreshSeconds = provider.meta?.codexOfficialQuotaRefreshSeconds ?? 300;
-  const effectiveMode = isProxyTakeover
-    ? configuredMode
-    : CODEX_OFFICIAL_NATIVE;
-  const effectiveAccountId = useMemo(() => {
-    if (effectiveMode === "managed_account") return boundAccountId ?? null;
-    if (effectiveMode === "managed_default") return defaultAccountId;
-    return null;
-  }, [boundAccountId, defaultAccountId, effectiveMode]);
+  const { mode: effectiveMode, accountId: effectiveAccountId } = useMemo(
+    () => resolveCodexOfficialQuotaSelection(provider.meta, defaultAccountId),
+    [defaultAccountId, provider.meta],
+  );
   const effectiveAccount = accounts.find(
     (account) => account.id === effectiveAccountId,
   );
@@ -132,7 +124,7 @@ export function CodexOfficialAccountControl({
             </SelectTrigger>
             <SelectContent>
               <SelectItem value={CODEX_OFFICIAL_NATIVE}>
-                Codex 原生登入
+                Codex CLI 登入（~/.codex/auth.json）
               </SelectItem>
               <SelectItem
                 value={CODEX_OFFICIAL_MANAGED_DEFAULT}
@@ -153,7 +145,7 @@ export function CodexOfficialAccountControl({
           </Select>
           {!isProxyTakeover && configuredMode !== CODEX_OFFICIAL_NATIVE && (
             <span className="text-[11px] text-amber-600">
-              Proxy 未接管；目前實際使用 Codex 原生登入
+              Proxy 未接管；請求仍使用 Codex 原生登入，下方額度顯示所選帳號
             </span>
           )}
         </div>

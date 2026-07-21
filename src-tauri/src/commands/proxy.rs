@@ -123,14 +123,6 @@ pub fn get_codex_cached_official_models(
 }
 
 #[tauri::command]
-pub async fn refresh_codex_desktop_model_service(
-) -> Result<crate::codex_desktop::CodexDesktopRefreshResult, String> {
-    tauri::async_runtime::spawn_blocking(crate::codex_desktop::refresh_model_service)
-        .await
-        .map_err(|error| format!("Codex Desktop model service refresh task failed: {error}"))?
-}
-
-#[tauri::command]
 pub async fn apply_codex_model_routes(
     state: tauri::State<'_, AppState>,
     provider_id: String,

@@ -4,6 +4,36 @@ export const CODEX_OFFICIAL_NATIVE = "native";
 export const CODEX_OFFICIAL_MANAGED_DEFAULT = "managed_default";
 export const CODEX_OFFICIAL_ACCOUNT_PREFIX = "account:";
 
+export interface CodexOfficialQuotaSelection {
+  mode: CodexOfficialAuthMode;
+  accountId: string | null;
+}
+
+/**
+ * Resolve which credentials own the quota shown in the official-provider row.
+ *
+ * This deliberately does not depend on proxy takeover. Takeover controls which
+ * credentials requests use; the account picker must always preview the account
+ * the user selected, even while takeover is off.
+ */
+export function resolveCodexOfficialQuotaSelection(
+  meta: ProviderMeta | undefined,
+  defaultAccountId: string | null,
+): CodexOfficialQuotaSelection {
+  const mode = meta?.codexOfficialAuthMode ?? CODEX_OFFICIAL_NATIVE;
+  if (mode === "managed_default") {
+    return { mode, accountId: defaultAccountId };
+  }
+  if (
+    mode === "managed_account" &&
+    meta?.authBinding?.source === "managed_account" &&
+    meta.authBinding.authProvider === "codex_oauth"
+  ) {
+    return { mode, accountId: meta.authBinding.accountId ?? null };
+  }
+  return { mode: CODEX_OFFICIAL_NATIVE, accountId: null };
+}
+
 export function resolveCodexOfficialSelection(meta?: ProviderMeta): string {
   const mode = meta?.codexOfficialAuthMode ?? CODEX_OFFICIAL_NATIVE;
   const binding = meta?.authBinding;

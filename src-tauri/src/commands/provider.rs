@@ -631,7 +631,7 @@ async fn query_provider_usage_inner(
             });
         }
 
-        let quota = crate::services::subscription::get_subscription_quota(app_type.as_str())
+        let quota = crate::services::subscription::get_subscription_quota(app_type.as_str(), false)
             .await
             .map_err(|e| format!("Failed to query subscription quota: {e}"))?;
 

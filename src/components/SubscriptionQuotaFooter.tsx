@@ -138,12 +138,18 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
 
   // 凭据过期
   if (quota.credentialStatus === "expired" && !quota.success) {
+    const expiredDetail = quota.credentialMessage || quota.error;
     if (inline) {
       return (
         <div className="inline-flex items-center gap-2 text-xs rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 px-3 py-2 shadow-sm">
           <div className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
             <AlertCircle size={12} />
-            <span>{t("subscription.expired")}</span>
+            <span
+              className="max-w-[440px] truncate"
+              title={expiredDetail || undefined}
+            >
+              {expiredDetail || t("subscription.expired")}
+            </span>
           </div>
           <button
             onClick={() => refetch()}

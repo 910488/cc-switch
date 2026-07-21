@@ -99,7 +99,7 @@ export function useSubscriptionQuota(
 
   const query = useQuery({
     queryKey: subscriptionKeys.quota(appId),
-    queryFn: () => subscriptionApi.getQuota(appId),
+    queryFn: () => subscriptionApi.getQuota(appId, true),
     enabled: enabled && ["claude", "codex", "gemini"].includes(appId),
     refetchInterval,
     refetchIntervalInBackground: Boolean(refetchInterval),
@@ -152,7 +152,9 @@ export function useCodexOauthQuota(
   );
   const query = useQuery({
     queryKey,
-    queryFn: () => subscriptionApi.getCodexOauthQuota(accountId, false),
+    // A picker change or scheduled refresh must represent the selected
+    // account's current upstream state, not a previously cached snapshot.
+    queryFn: () => subscriptionApi.getCodexOauthQuota(accountId, true),
     enabled,
     refetchInterval,
     refetchIntervalInBackground: Boolean(refetchInterval),

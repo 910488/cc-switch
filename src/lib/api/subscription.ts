@@ -6,8 +6,8 @@ import type {
 } from "@/types/subscription";
 
 export const subscriptionApi = {
-  getQuota: (tool: string): Promise<SubscriptionQuota> =>
-    invoke("get_subscription_quota", { tool }),
+  getQuota: (tool: string, forceRefresh = false): Promise<SubscriptionQuota> =>
+    invoke("get_subscription_quota", { tool, forceRefresh }),
   getCodexOauthQuota: (
     accountId: string | null,
     forceRefresh = false,

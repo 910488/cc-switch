@@ -24,11 +24,6 @@ export interface CodexModelRouteSettings {
   routes: CodexModelRoute[];
 }
 
-export interface CodexDesktopRefreshResult {
-  stoppedProcesses: number;
-  respawned: boolean;
-}
-
 export const codexModelRoutesApi = {
   get(): Promise<CodexModelRouteSettings> {
     return invoke("get_codex_model_routes");
@@ -46,9 +41,6 @@ export const codexModelRoutesApi = {
       officialModels,
       thirdPartyModels,
     });
-  },
-  refreshDesktopModelService(): Promise<CodexDesktopRefreshResult> {
-    return invoke("refresh_codex_desktop_model_service");
   },
   rollback(): Promise<void> {
     return invoke("rollback_codex_model_routes");
