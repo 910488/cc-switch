@@ -1,8 +1,9 @@
-use crate::{database::Database, error::AppError};
+use crate::{database::Database, error::AppError, provider::Provider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const SETTINGS_KEY: &str = "codex_model_routes";
+const PROVIDER_KEY: &str = "codex_model_route_provider_id";
 
 fn is_managed_virtual_model(model: &str, display_name: Option<&str>) -> bool {
     let model = model.trim();
@@ -92,6 +93,115 @@ pub fn save(db: &Database, settings: &ModelRouteSettings) -> Result<(), AppError
 
 pub fn clear(db: &Database) -> Result<(), AppError> {
     save(db, &ModelRouteSettings::default())
+}
+
+pub fn remember_provider(db: &Database, provider_id: &str) -> Result<(), AppError> {
+    db.set_setting(PROVIDER_KEY, provider_id.trim())
+}
+
+pub fn forget_provider(db: &Database) -> Result<(), AppError> {
+    db.set_setting(PROVIDER_KEY, "")
+}
+
+fn provider_catalog_models(provider: &Provider) -> Vec<CatalogModelInput> {
+    provider
+        .settings_config
+        .pointer("/modelCatalog/models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| serde_json::from_value(model.clone()).ok())
+        .filter(|model: &CatalogModelInput| !model.model.trim().is_empty())
+        .collect()
+}
+
+fn ensure_configured_with_official_models(
+    db: &Database,
+    official_models: Vec<CatalogModelInput>,
+) -> Result<ModelRouteSettings, AppError> {
+    let existing = load(db)?;
+    if !existing.routes.is_empty() {
+        return Ok(existing);
+    }
+
+    let providers = db.get_all_providers("codex")?;
+    let remembered = db
+        .get_setting(PROVIDER_KEY)?
+        .filter(|provider_id| !provider_id.trim().is_empty());
+    let candidates = providers
+        .values()
+        .filter(|provider| {
+            provider.category.as_deref() != Some("official")
+                && !provider_catalog_models(provider).is_empty()
+        })
+        .collect::<Vec<_>>();
+    let provider = remembered
+        .as_deref()
+        .and_then(|provider_id| {
+            candidates
+                .iter()
+                .copied()
+                .find(|provider| provider.id == provider_id)
+        })
+        .or_else(|| (candidates.len() == 1).then(|| candidates[0]));
+    let Some(provider) = provider else {
+        return Ok(existing);
+    };
+    if official_models.is_empty() {
+        return Err(AppError::Config(
+            "Codex Desktop official model cache is empty; load the native model menu first"
+                .to_string(),
+        ));
+    }
+
+    let settings = build_settings(
+        &provider.id,
+        &provider.name,
+        official_models,
+        provider_catalog_models(provider),
+    )?;
+    save(db, &settings)?;
+    remember_provider(db, &provider.id)?;
+    Ok(settings)
+}
+
+/// Repair the durable route projection before takeover. Older builds could
+/// leave the provider's selected modelCatalog intact while clearing the route
+/// table, so merely opening the proxy produced an official-only/stale menu.
+pub fn ensure_configured_for_takeover(db: &Database) -> Result<ModelRouteSettings, AppError> {
+    ensure_configured_with_official_models(db, cached_official_models()?)
+}
+
+/// Persist the model choices in the provider SSOT without applying the provider
+/// to Codex live files. This is deliberately separate from ProviderService::update:
+/// updating the currently selected third-party provider may also replace
+/// `~/.codex/auth.json`, which would destroy the user's ChatGPT authentication.
+pub fn with_provider_model_catalog(
+    provider: &Provider,
+    models: &[CatalogModelInput],
+) -> Result<Provider, AppError> {
+    if models.is_empty() {
+        return Err(AppError::InvalidInput(
+            "Select at least one third-party model".to_string(),
+        ));
+    }
+
+    let mut updated = provider.clone();
+    if !updated.settings_config.is_object() {
+        updated.settings_config = serde_json::json!({});
+    }
+    updated.settings_config["modelCatalog"] = serde_json::json!({
+        "models": models,
+    });
+    Ok(updated)
+}
+
+pub fn without_provider_model_catalog(provider: &Provider) -> Provider {
+    let mut updated = provider.clone();
+    if let Some(settings) = updated.settings_config.as_object_mut() {
+        settings.remove("modelCatalog");
+    }
+    updated
 }
 
 pub fn cached_official_models() -> Result<Vec<CatalogModelInput>, AppError> {
@@ -184,7 +294,7 @@ pub fn build_settings(
             provider_id: provider_id.to_string(),
             upstream_model: upstream.to_string(),
             display_name: format!(
-                "{provider_name} · {}",
+                "[{provider_name}] {}",
                 model.display_name.unwrap_or_else(|| upstream.to_string())
             ),
             context_window: model.context_window,
@@ -259,6 +369,82 @@ pub fn augment_settings(db: &Database, base: &Value) -> Result<Value, AppError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_catalog_update_preserves_provider_auth_and_other_settings() {
+        let provider = Provider::with_id(
+            "third-party".into(),
+            "Third Party".into(),
+            serde_json::json!({
+                "auth": {
+                    "OPENAI_API_KEY": "third-party-key"
+                },
+                "config": "model = 'old-model'\nbase_url = 'https://example.test/v1'\n",
+                "unrelated": { "keep": true }
+            }),
+            None,
+        );
+        let original_auth = provider.settings_config["auth"].clone();
+
+        let updated = with_provider_model_catalog(
+            &provider,
+            &[CatalogModelInput {
+                model: "GLM-5.2".into(),
+                display_name: Some("GLM-5.2".into()),
+                context_window: Some(200_000),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(updated.settings_config["auth"], original_auth);
+        assert_eq!(updated.settings_config["unrelated"]["keep"], true);
+        assert_eq!(
+            updated.settings_config["modelCatalog"]["models"][0]["model"],
+            "GLM-5.2"
+        );
+        assert!(provider.settings_config.get("modelCatalog").is_none());
+
+        let cleared = without_provider_model_catalog(&updated);
+        assert!(cleared.settings_config.get("modelCatalog").is_none());
+        assert_eq!(cleared.settings_config["auth"], original_auth);
+    }
+
+    #[test]
+    fn takeover_repairs_empty_routes_from_the_only_configured_provider_catalog() {
+        let db = Database::memory().unwrap();
+        let provider = Provider::with_id(
+            "weikuwu".into(),
+            "weikuwu".into(),
+            serde_json::json!({
+                "modelCatalog": {"models": [
+                    {"model":"GLM-5.2","displayName":"GLM-5.2"},
+                    {"model":"GLM-5.2p","displayName":"GLM-5.2p"}
+                ]}
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        save(&db, &ModelRouteSettings::default()).unwrap();
+
+        let repaired = ensure_configured_with_official_models(
+            &db,
+            vec![CatalogModelInput {
+                model: "gpt-5.6-sol".into(),
+                display_name: Some("GPT-5.6-Sol".into()),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(repaired.official_models.len(), 1);
+        assert_eq!(repaired.routes.len(), 2);
+        assert_eq!(repaired.routes[0].upstream_model, "GLM-5.2");
+        assert_eq!(
+            db.get_setting(PROVIDER_KEY).unwrap().as_deref(),
+            Some("weikuwu")
+        );
+    }
 
     #[test]
     fn builds_distinct_aliases_and_keeps_official_models() {
@@ -343,7 +529,7 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert_eq!(models[0]["model"], "gpt-5.6");
         assert_eq!(models[1]["model"], settings.routes[0].alias);
-        assert_eq!(models[1]["displayName"], "Third · GLM");
+        assert_eq!(models[1]["displayName"], "[Third] GLM");
         assert_eq!(models[0]["defaultReasoningLevel"], "medium");
         assert_eq!(models[1]["defaultReasoningLevel"], "high");
         assert_eq!(
@@ -355,6 +541,50 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["low", "medium", "high", "xhigh"]
         );
+    }
+
+    #[test]
+    fn augments_catalog_with_every_selected_third_party_model() {
+        let db = Database::memory().unwrap();
+        let selected = [
+            "DeepSeek-V4-Flash",
+            "GLM-5.2",
+            "GLM-5.2p",
+            "nemotron-3-ultra",
+        ];
+        let settings = build_settings(
+            "provider",
+            "weikuwu",
+            vec![CatalogModelInput {
+                model: "gpt-5.6-sol".into(),
+                display_name: Some("GPT-5.6-Sol".into()),
+                ..Default::default()
+            }],
+            selected
+                .iter()
+                .map(|model| CatalogModelInput {
+                    model: (*model).into(),
+                    display_name: Some((*model).into()),
+                    ..Default::default()
+                })
+                .collect(),
+        )
+        .unwrap();
+        save(&db, &settings).unwrap();
+
+        let output = augment_settings(&db, &serde_json::json!({})).unwrap();
+        let models = output["modelCatalog"]["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1 + selected.len());
+        for (index, expected) in selected.iter().enumerate() {
+            assert_eq!(
+                models[index + 1]["displayName"],
+                format!("[weikuwu] {expected}")
+            );
+            assert!(models[index + 1]["model"]
+                .as_str()
+                .unwrap()
+                .starts_with("ccs-provider-"));
+        }
     }
 
     #[test]

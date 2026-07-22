@@ -14,11 +14,11 @@ use bytes::Bytes;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex};
 
 pub const AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 const SETTINGS_KEY: &str = "codex_auto_review_settings";
+const STATS_KEY: &str = "codex_auto_review_stats";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -223,64 +223,81 @@ pub struct AutoReviewStats {
 
 #[derive(Default)]
 pub(crate) struct AutoReviewRuntime {
-    official_attempts: AtomicU64,
-    official_quota_429: AtomicU64,
-    fallbacks: AtomicU64,
-    successful_fallbacks: AtomicU64,
-    failed_fallbacks: AtomicU64,
-    detail: RwLock<AutoReviewRuntimeDetail>,
-}
-
-#[derive(Default)]
-struct AutoReviewRuntimeDetail {
-    last_fallback_at: Option<String>,
-    last_fallback_provider_id: Option<String>,
-    last_fallback_model: Option<String>,
-    last_error: Option<String>,
+    stats: Mutex<AutoReviewStats>,
+    db: Option<Arc<Database>>,
 }
 
 impl AutoReviewRuntime {
+    pub(crate) fn new(db: Arc<Database>) -> Self {
+        let stats = load_stats(&db);
+        Self {
+            stats: Mutex::new(stats),
+            db: Some(db),
+        }
+    }
+
+    fn update(&self, update: impl FnOnce(&mut AutoReviewStats)) {
+        let serialized = {
+            let mut stats = self
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            update(&mut stats);
+            serde_json::to_string(&*stats).ok()
+        };
+        if let (Some(db), Some(serialized)) = (&self.db, serialized) {
+            if let Err(error) = db.set_setting(STATS_KEY, &serialized) {
+                log::warn!("[AutoReview] unable to persist counters: {error}");
+            }
+        }
+    }
+
     pub(crate) fn record_official_attempt(&self) {
-        self.official_attempts.fetch_add(1, Ordering::Relaxed);
+        self.update(|stats| stats.official_attempts += 1);
     }
 
     pub(crate) fn record_official_quota_429(&self) {
-        self.official_quota_429.fetch_add(1, Ordering::Relaxed);
+        self.update(|stats| stats.official_quota_429 += 1);
     }
 
     pub(crate) async fn record_fallback(&self, provider_id: &str, model: &str) {
-        self.fallbacks.fetch_add(1, Ordering::Relaxed);
-        let mut detail = self.detail.write().await;
-        detail.last_fallback_at = Some(Utc::now().to_rfc3339());
-        detail.last_fallback_provider_id = Some(provider_id.to_string());
-        detail.last_fallback_model = Some(model.to_string());
-        detail.last_error = None;
+        self.update(|stats| {
+            stats.fallbacks += 1;
+            stats.last_fallback_at = Some(Utc::now().to_rfc3339());
+            stats.last_fallback_provider_id = Some(provider_id.to_string());
+            stats.last_fallback_model = Some(model.to_string());
+            stats.last_error = None;
+        });
     }
 
     pub(crate) async fn record_fallback_success(&self) {
-        self.successful_fallbacks.fetch_add(1, Ordering::Relaxed);
-        self.detail.write().await.last_error = None;
+        self.update(|stats| {
+            stats.successful_fallbacks += 1;
+            stats.last_error = None;
+        });
     }
 
     pub(crate) async fn record_fallback_failure(&self, error: &ProxyError) {
-        self.failed_fallbacks.fetch_add(1, Ordering::Relaxed);
-        self.detail.write().await.last_error = Some(error.to_string());
+        self.update(|stats| {
+            stats.failed_fallbacks += 1;
+            stats.last_error = Some(error.to_string());
+        });
     }
 
     pub(crate) async fn snapshot(&self) -> AutoReviewStats {
-        let detail = self.detail.read().await;
-        AutoReviewStats {
-            official_attempts: self.official_attempts.load(Ordering::Relaxed),
-            official_quota_429: self.official_quota_429.load(Ordering::Relaxed),
-            fallbacks: self.fallbacks.load(Ordering::Relaxed),
-            successful_fallbacks: self.successful_fallbacks.load(Ordering::Relaxed),
-            failed_fallbacks: self.failed_fallbacks.load(Ordering::Relaxed),
-            last_fallback_at: detail.last_fallback_at.clone(),
-            last_fallback_provider_id: detail.last_fallback_provider_id.clone(),
-            last_fallback_model: detail.last_fallback_model.clone(),
-            last_error: detail.last_error.clone(),
-        }
+        self.stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
+}
+
+pub(crate) fn load_stats(db: &Database) -> AutoReviewStats {
+    db.get_setting(STATS_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
 }
 
 pub(crate) fn strip_json_fence_from_response(response: &mut Value) -> usize {
@@ -556,5 +573,31 @@ mod tests {
         assert!(stream.contains("event: response.function_call_arguments.done"));
         assert!(stream.contains("event: response.completed"));
         assert!(stream.contains("{\\\"ok\\\":true}"));
+    }
+
+    #[tokio::test]
+    async fn runtime_counters_survive_proxy_server_recreation() {
+        let db = Arc::new(Database::memory().unwrap());
+        let runtime = AutoReviewRuntime::new(db.clone());
+        runtime.record_official_attempt();
+        runtime.record_official_quota_429();
+        runtime
+            .record_fallback("provider-1", "fallback-model")
+            .await;
+        runtime.record_fallback_success().await;
+
+        let restored = AutoReviewRuntime::new(db).snapshot().await;
+        assert_eq!(restored.official_attempts, 1);
+        assert_eq!(restored.official_quota_429, 1);
+        assert_eq!(restored.fallbacks, 1);
+        assert_eq!(restored.successful_fallbacks, 1);
+        assert_eq!(
+            restored.last_fallback_provider_id.as_deref(),
+            Some("provider-1")
+        );
+        assert_eq!(
+            restored.last_fallback_model.as_deref(),
+            Some("fallback-model")
+        );
     }
 }

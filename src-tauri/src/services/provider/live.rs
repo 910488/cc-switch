@@ -448,6 +448,37 @@ fn remove_toml_table_like(target: &mut dyn TableLike, source: &dyn TableLike) {
     }
 }
 
+/// Split settings that belong to this Windows installation out of a portable
+/// Codex common-config snippet. Older CC Switch builds shared
+/// `windows.sandbox`, which can force a fresh PC into elevated-runtime
+/// onboarding before that runtime exists.
+fn split_codex_device_local_common_config(mut portable: DocumentMut) -> (DocumentMut, DocumentMut) {
+    let mut device_local = DocumentMut::new();
+    let mut remove_windows_table = false;
+    let sandbox = portable
+        .as_table_mut()
+        .get_mut("windows")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|windows| {
+            let sandbox = windows.remove("sandbox");
+            remove_windows_table = windows.is_empty();
+            sandbox
+        });
+
+    if remove_windows_table {
+        portable.as_table_mut().remove("windows");
+    }
+    if let Some(sandbox) = sandbox {
+        let mut windows = toml_edit::Table::new();
+        windows.insert("sandbox", sandbox);
+        device_local
+            .as_table_mut()
+            .insert("windows", Item::Table(windows));
+    }
+
+    (portable, device_local)
+}
+
 /// 前端表单勾选/取消"使用通用配置"时，对编辑器里的 config.toml 文本做
 /// 结构化合并/剥离。必须在后端用 toml_edit 做：前端 smol-toml 只能
 /// parse → merge → 整文档重序列化，注释全丢、键序重排，还会生成多余的
@@ -472,6 +503,7 @@ pub fn update_toml_common_config_snippet(
     let source_doc = trimmed
         .parse::<DocumentMut>()
         .map_err(|e| AppError::Message(format!("Invalid Codex common config snippet: {e}")))?;
+    let (source_doc, _) = split_codex_device_local_common_config(source_doc);
 
     if enabled {
         merge_toml_table_like(target_doc.as_table_mut(), source_doc.as_table());
@@ -507,6 +539,10 @@ fn settings_contain_common_config(app_type: &AppType, settings: &Value, snippet:
                 Ok(doc) => doc,
                 Err(_) => return false,
             };
+            let (source_doc, _) = split_codex_device_local_common_config(source_doc);
+            if source_doc.as_table().is_empty() {
+                return false;
+            }
 
             toml_item_is_subset(target_doc.as_item(), source_doc.as_item())
         }
@@ -581,6 +617,7 @@ pub(crate) fn remove_common_config_from_settings(
             let source_doc = trimmed.parse::<DocumentMut>().map_err(|e| {
                 AppError::Message(format!("Invalid Codex common config snippet: {e}"))
             })?;
+            let (source_doc, _) = split_codex_device_local_common_config(source_doc);
 
             remove_toml_table_like(target_doc.as_table_mut(), source_doc.as_table());
             if let Some(obj) = result.as_object_mut() {
@@ -638,6 +675,7 @@ fn apply_common_config_to_settings(
             let source_doc = trimmed.parse::<DocumentMut>().map_err(|e| {
                 AppError::Message(format!("Invalid Codex common config snippet: {e}"))
             })?;
+            let (source_doc, _) = split_codex_device_local_common_config(source_doc);
 
             merge_toml_table_like(target_doc.as_table_mut(), source_doc.as_table());
             if let Some(obj) = result.as_object_mut() {
@@ -2329,6 +2367,53 @@ base_url = "https://a.example/v1"
             removed.contains("notifications = false"),
             "user-modified value must survive removal, got: {removed}"
         );
+    }
+
+    #[test]
+    fn common_windows_sandbox_is_not_shared_and_live_device_value_is_preserved() {
+        let snippet = r#"[windows]
+sandbox = "elevated"
+
+[tui]
+notifications = true
+"#;
+
+        let fresh = update_toml_common_config_snippet("", snippet, true).unwrap();
+        assert!(!fresh.contains("sandbox"));
+        assert!(fresh.contains("notifications = true"));
+
+        let previously_injected = update_toml_common_config_snippet(
+            "[windows]\nsandbox = \"elevated\"\nterminal = \"powershell\"\n",
+            snippet,
+            true,
+        )
+        .unwrap();
+        assert!(previously_injected.contains("sandbox = \"elevated\""));
+        assert!(previously_injected.contains("terminal = \"powershell\""));
+
+        let locally_changed = update_toml_common_config_snippet(
+            "[windows]\nsandbox = \"unelevated\"\n",
+            snippet,
+            true,
+        )
+        .unwrap();
+        assert!(locally_changed.contains("sandbox = \"unelevated\""));
+        assert!(!locally_changed.contains("sandbox = \"elevated\""));
+    }
+
+    #[test]
+    fn applying_codex_common_config_preserves_live_device_sandbox_value() {
+        let settings = json!({
+            "config": "[windows]\nsandbox = \"elevated\"\nterminal = \"powershell\"\n"
+        });
+        let snippet = "[windows]\nsandbox = \"elevated\"\n\n[tui]\nnotifications = true\n";
+
+        let applied = apply_common_config_to_settings(&AppType::Codex, &settings, snippet)
+            .expect("apply legacy Codex common config");
+        let config = applied.get("config").and_then(Value::as_str).unwrap();
+        assert!(config.contains("sandbox = \"elevated\""));
+        assert!(config.contains("terminal = \"powershell\""));
+        assert!(config.contains("notifications = true"));
     }
 
     #[test]

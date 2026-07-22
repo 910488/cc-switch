@@ -78,7 +78,7 @@ impl ProxyServer {
 
         let compaction_service = Arc::new(CompactionService::new(db.clone()));
         let state = ProxyState {
-            db,
+            db: db.clone(),
             config: Arc::new(RwLock::new(config.clone())),
             status: Arc::new(RwLock::new(ProxyStatus::default())),
             start_time: Arc::new(RwLock::new(None)),
@@ -87,7 +87,7 @@ impl ProxyServer {
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             compaction_service,
-            auto_review_runtime: Arc::new(AutoReviewRuntime::default()),
+            auto_review_runtime: Arc::new(AutoReviewRuntime::new(db.clone())),
             app_handle,
             failover_manager,
         };
@@ -203,6 +203,7 @@ impl ProxyServer {
                             if let Err(e) = hyper::server::conn::http1::Builder::new()
                                 .preserve_header_case(true)
                                 .serve_connection(TokioIo::new(stream), service)
+                                .with_upgrades()
                                 .await
                             {
                                 // Connection reset / broken pipe 等在代理场景下很常见，debug 级别
@@ -337,10 +338,22 @@ impl ProxyServer {
             .route("/models", get(handlers::handle_models))
             .route("/v1/models", get(handlers::handle_models))
             // OpenAI Responses API (Codex CLI，支持带前缀和不带前缀)
-            .route("/responses", post(handlers::handle_responses))
-            .route("/v1/responses", post(handlers::handle_responses))
-            .route("/v1/v1/responses", post(handlers::handle_responses))
-            .route("/codex/v1/responses", post(handlers::handle_responses))
+            .route(
+                "/responses",
+                get(handlers::handle_responses_websocket).post(handlers::handle_responses),
+            )
+            .route(
+                "/v1/responses",
+                get(handlers::handle_responses_websocket).post(handlers::handle_responses),
+            )
+            .route(
+                "/v1/v1/responses",
+                get(handlers::handle_responses_websocket).post(handlers::handle_responses),
+            )
+            .route(
+                "/codex/v1/responses",
+                get(handlers::handle_responses_websocket).post(handlers::handle_responses),
+            )
             // Grok Build uses the Responses protocol but has an independent
             // provider namespace and failover queue.
             .route(
@@ -424,10 +437,9 @@ mod continuity_e2e_tests {
     use axum::{extract::State, response::IntoResponse, routing::post, Json};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use bytes::Bytes;
-    use futures::StreamExt;
+    use futures::{SinkExt, StreamExt};
     use serde_json::{json, Value};
     use serial_test::serial;
-    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
@@ -477,8 +489,22 @@ mod continuity_e2e_tests {
     async fn mock_chat(
         State(captured): State<Arc<Mutex<Vec<Value>>>>,
         Json(body): Json<Value>,
-    ) -> Json<Value> {
+    ) -> axum::response::Response {
+        let streaming = body.get("stream").and_then(Value::as_bool) == Some(true);
         captured.lock().expect("capture lock").push(body);
+        if streaming {
+            let wire = concat!(
+                "data: {\"id\":\"chatcmpl-e2e\",\"object\":\"chat.completion.chunk\",\"model\":\"mock-chat\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl-e2e\",\"object\":\"chat.completion.chunk\",\"model\":\"mock-chat\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"HANDOFF_E2E_SUMMARY: durable context retained\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl-e2e\",\"object\":\"chat.completion.chunk\",\"model\":\"mock-chat\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":8,\"total_tokens\":28}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            return (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                wire,
+            )
+                .into_response();
+        }
         Json(json!({
             "id": "chatcmpl-e2e",
             "object": "chat.completion",
@@ -493,6 +519,7 @@ mod continuity_e2e_tests {
             }],
             "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28}
         }))
+        .into_response()
     }
 
     async fn start_mock_chat_upstream() -> (
@@ -519,6 +546,170 @@ mod continuity_e2e_tests {
                 .expect("mock upstream server");
         });
         (format!("http://{address}/v1"), captured, shutdown_tx, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn responses_websocket_bridges_to_http_pipeline_without_405() {
+        let _environment = TestEnvironment::new();
+        let (upstream, _captured, shutdown_tx, upstream_task) = start_mock_chat_upstream().await;
+        let db = Arc::new(Database::init().expect("websocket bridge database"));
+        let provider = crate::provider::Provider::with_id(
+            "ws-chat".to_string(),
+            "WS Chat".to_string(),
+            json!({
+                "base_url": upstream,
+                "api_format": "openai_chat",
+                "auth": {"OPENAI_API_KEY": "ws-key"}
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        select_codex_provider(&db, "ws-chat");
+        let server = ProxyServer::new(test_proxy_config(), db, None);
+        let info = server.start().await.unwrap();
+
+        let (mut socket, upgrade) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+                .await
+                .expect("upgrade local Responses websocket");
+        assert_eq!(upgrade.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"mock-chat",
+                    "stream":true,
+                    "input":[{"type":"message","role":"user","content":"hello over ws"}],
+                    "client_metadata":{
+                        "session_id":"ws-session",
+                        "thread_id":"ws-thread"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(message) = socket.next().await {
+                let message = message.unwrap();
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    let event: Value = serde_json::from_str(text.as_ref()).unwrap();
+                    if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                        return event;
+                    }
+                }
+            }
+            panic!("websocket closed before response.completed");
+        })
+        .await
+        .expect("websocket response timeout");
+        assert_eq!(completed["type"], "response.completed");
+
+        let _ = socket.close(None).await;
+        server.stop().await.unwrap();
+        let _ = shutdown_tx.send(());
+        upstream_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn official_responses_websocket_is_relayed_end_to_end() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let _environment = TestEnvironment::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        std::env::set_var(
+            "CC_SWITCH_TEST_OFFICIAL_WS_URL",
+            format!("ws://{upstream_addr}/responses"),
+        );
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get(http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer test-official-token")
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let first = socket.next().await.unwrap().unwrap();
+            let text = first.into_text().unwrap();
+            let body: Value = serde_json::from_str(text.as_ref()).unwrap();
+            assert_eq!(body["type"], "response.create");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":"resp-official-ws","status":"completed","output":[]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = socket.close(None).await;
+        });
+
+        let db = Arc::new(Database::init().expect("official websocket database"));
+        let mut provider = crate::provider::Provider::with_id(
+            crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            "OpenAI Official".to_string(),
+            json!({"auth":{},"config":""}),
+            None,
+        );
+        provider.category = Some("official".to_string());
+        db.save_provider("codex", &provider).unwrap();
+        select_codex_provider(&db, crate::database::CODEX_OFFICIAL_PROVIDER_ID);
+        let server = ProxyServer::new(test_proxy_config(), db, None);
+        let info = server.start().await.unwrap();
+
+        let mut request = format!("ws://127.0.0.1:{}/v1/responses", info.port)
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer test-official-token"),
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"gpt-native",
+                    "generate":false
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let completed: Value = serde_json::from_str(completed.as_ref()).unwrap();
+        assert_eq!(completed["type"], "response.completed");
+        assert_eq!(completed["response"]["id"], "resp-official-ws");
+
+        let _ = socket.close(None).await;
+        server.stop().await.unwrap();
+        upstream_task.await.unwrap();
+        std::env::remove_var("CC_SWITCH_TEST_OFFICIAL_WS_URL");
     }
 
     #[derive(Default)]
@@ -627,6 +818,26 @@ mod continuity_e2e_tests {
         }))
     }
 
+    async fn realm_native_compact_replacement_history(
+        State(state): State<Arc<Mutex<RealmMockState>>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        state
+            .lock()
+            .expect("realm state")
+            .native_requests
+            .push(body);
+        Json(json!({
+            "output": [{
+                "id": "msg-compacted-history",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type":"output_text","text":"replacement compact history","annotations":[]}]
+            }]
+        }))
+    }
+
     async fn realm_native_response(
         State(state): State<Arc<Mutex<RealmMockState>>>,
         Json(body): Json<Value>,
@@ -709,6 +920,10 @@ mod continuity_e2e_tests {
             .route("/chat/v1/chat/completions", post(realm_chat))
             .route("/native/v1/responses/compact", post(realm_native_compact))
             .route("/native/v1/responses", post(realm_native_response))
+            .route(
+                "/replacement/v1/responses/compact",
+                post(realm_native_compact_replacement_history),
+            )
             .route(
                 "/failing-native/v1/responses/compact",
                 post(realm_native_compact_unavailable),
@@ -1156,6 +1371,55 @@ mod continuity_e2e_tests {
 
         let _ = shutdown_tx.send(());
         upstream_task.await.expect("join hierarchical upstream");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn native_compaction_accepts_replacement_history_without_opaque_item() {
+        let _environment = TestEnvironment::new();
+        let (origin, _captured, shutdown_tx, upstream_task) = start_realm_upstream().await;
+        let db = Arc::new(Database::init().expect("replacement compact database"));
+        let provider = crate::provider::Provider::with_id(
+            "replacement-native".to_string(),
+            "Replacement Native".to_string(),
+            json!({
+                "base_url": format!("{origin}/replacement/v1"),
+                "api_format": "openai_responses",
+                "auth": {"OPENAI_API_KEY": "replacement-key"}
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        select_codex_provider(&db, "replacement-native");
+        let server = ProxyServer::new(test_proxy_config(), db, None);
+        let info = server.start().await.unwrap();
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{}/v1/responses/compact",
+                info.port
+            ))
+            .header("thread-id", "replacement-thread")
+            .header("session-id", "replacement-session")
+            .json(&json!({
+                "model":"native-model",
+                "stream":false,
+                "input":[{"type":"message","role":"user","content":"compact me"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["output"][0]["type"], "message");
+        assert_eq!(
+            body["output"][0]["content"][0]["text"],
+            "replacement compact history"
+        );
+
+        server.stop().await.unwrap();
+        let _ = shutdown_tx.send(());
+        upstream_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

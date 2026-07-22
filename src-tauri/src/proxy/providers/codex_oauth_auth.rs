@@ -555,6 +555,42 @@ impl CodexOAuthManager {
             }
         }
 
+        self.refresh_account_token_locked(account_id).await
+    }
+
+    /// Refresh an access token that an upstream endpoint rejected before its
+    /// locally decoded expiry. The rejected token is used as a compare value so
+    /// concurrent 401 responses only rotate the refresh token once.
+    pub async fn refresh_token_after_rejection(
+        &self,
+        account_id: &str,
+        rejected_token: &str,
+    ) -> Result<String, CodexOAuthError> {
+        let refresh_lock = self.get_refresh_lock(account_id).await;
+        let _guard = refresh_lock.lock().await;
+
+        // Another request may already have refreshed this account while this
+        // caller was waiting for the per-account lock. Reuse that newer token.
+        {
+            let tokens = self.access_tokens.read().await;
+            if let Some(cached) = tokens.get(account_id) {
+                if cached.token != rejected_token && !cached.is_expiring_soon() {
+                    return Ok(cached.token.clone());
+                }
+            }
+        }
+
+        log::info!(
+            "[CodexOAuth] upstream rejected access_token for account {account_id}; forcing one refresh"
+        );
+        self.refresh_account_token_locked(account_id).await
+    }
+
+    /// Refresh while the caller holds this account's refresh lock.
+    async fn refresh_account_token_locked(
+        &self,
+        account_id: &str,
+    ) -> Result<String, CodexOAuthError> {
         let refresh_token = {
             let accounts = self.accounts.read().await;
             accounts
@@ -565,7 +601,7 @@ impl CodexOAuthManager {
 
         let new_tokens = self.refresh_with_token(&refresh_token).await?;
 
-        // 如果服务端返回了新的 refresh_token，更新存储
+        // Persist refresh-token rotation before exposing the new access token.
         if let Some(new_refresh) = new_tokens.refresh_token.clone() {
             if new_refresh != refresh_token {
                 let mut accounts = self.accounts.write().await;

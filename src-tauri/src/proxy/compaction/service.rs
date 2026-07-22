@@ -828,12 +828,24 @@ impl CompactionService {
             let id = outer_id.filter(|id| !id.is_empty()).ok_or_else(|| {
                 AppError::InvalidInput("opaque compaction item has no id".to_string())
             })?;
-            ids.push(id.to_string());
-            let stored = store.get_compaction(id)?.ok_or_else(|| {
-                AppError::Message(format!(
+            let Some(stored) = store.get_compaction(id)? else {
+                // A native ChatGPT compaction may have been created while CC
+                // Switch was disabled, so it cannot exist in our journal. When
+                // routing back to the official OpenAI backend the opaque item
+                // is already canonical there and must pass through unchanged.
+                // Custom/bridge targets still fail closed because forwarding an
+                // issuer-bound token there could lose context.
+                if target.realm == ProviderRealm::Official
+                    && target.provider_id == crate::database::CODEX_OFFICIAL_PROVIDER_ID
+                {
+                    output.push(item.clone());
+                    continue;
+                }
+                return Err(AppError::Message(format!(
                     "compaction {id} has no canonical journal entry; refusing to drop context"
-                ))
-            })?;
+                )));
+            };
+            ids.push(id.to_string());
             let same_native_realm = target.realm == ProviderRealm::Official
                 && (stored.realm == target.realm_key
                     || (stored.realm == "official" && target.realm_key.starts_with("native:")));
@@ -1088,6 +1100,49 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("invalid bridge compaction"));
+    }
+
+    #[test]
+    fn unknown_native_compaction_passes_through_to_openai_official() {
+        let service = service();
+        let original = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"id":"cmp-created-with-proxy-off","type":"compaction","encrypted_content":"opaque-openai-token"},
+                {"type":"message","role":"user","content":"suffix"}
+            ]
+        });
+        let result = service
+            .materialize_for_target(
+                &original,
+                &MaterializationTarget {
+                    provider_id: crate::database::CODEX_OFFICIAL_PROVIDER_ID.into(),
+                    model: "gpt-5.6-sol".into(),
+                    realm: ProviderRealm::Official,
+                    realm_key: format!("native:{}", crate::database::CODEX_OFFICIAL_PROVIDER_ID),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.body, original);
+        assert_eq!(result.changed_items, 0);
+    }
+
+    #[test]
+    fn unknown_native_compaction_still_fails_closed_for_third_party_target() {
+        let service = service();
+        let error = service
+            .materialize_for_target(
+                &json!({"input":[{"id":"cmp-unknown","type":"compaction","encrypted_content":"opaque"}]}),
+                &MaterializationTarget {
+                    provider_id: "third-party".into(),
+                    model: "GLM-5.2".into(),
+                    realm: ProviderRealm::Bridge,
+                    realm_key: "bridge:third-party".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("no canonical journal entry"));
     }
 
     #[test]

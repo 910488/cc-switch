@@ -544,7 +544,7 @@ impl RequestForwarder {
             }
 
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
-            match self
+            let mut forward_result = self
                 .forward(
                     app_type,
                     &method,
@@ -555,8 +555,36 @@ impl RequestForwarder {
                     &extensions,
                     adapter.as_ref(),
                 )
-                .await
-            {
+                .await;
+
+            if matches!(
+                forward_result,
+                Err(ProxyError::UpstreamError { status: 401, .. })
+            ) {
+                match self
+                    .refresh_codex_managed_auth_after_rejection(app_type, provider)
+                    .await
+                {
+                    Ok(true) => {
+                        forward_result = self
+                            .forward(
+                                app_type,
+                                &method,
+                                provider,
+                                endpoint,
+                                &provider_body,
+                                &headers,
+                                &extensions,
+                                adapter.as_ref(),
+                            )
+                            .await;
+                    }
+                    Ok(false) => {}
+                    Err(error) => forward_result = Err(error),
+                }
+            }
+
+            match forward_result {
                 Ok((response, claude_api_format, outbound_model)) => {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
@@ -1218,6 +1246,65 @@ impl RequestForwarder {
     ///
     /// 成功时返回 `(response, claude_api_format, outbound_model)`，其中
     /// `outbound_model` 是最终发往上游的模型名（所有映射/改写之后）。
+    /// Force one OAuth refresh when a CC Switch-managed ChatGPT request is
+    /// rejected with HTTP 401. Native Codex authentication is deliberately not
+    /// touched because its credential belongs to the Codex app itself.
+    async fn refresh_codex_managed_auth_after_rejection(
+        &self,
+        app_type: &AppType,
+        provider: &Provider,
+    ) -> Result<bool, ProxyError> {
+        let is_managed_official = matches!(app_type, AppType::Codex)
+            && super::providers::is_codex_official_provider(provider)
+            && provider
+                .meta
+                .as_ref()
+                .map(|meta| meta.codex_official_auth_mode())
+                .unwrap_or_default()
+                != crate::provider::CodexOfficialAuthMode::Native;
+
+        if !provider.is_codex_oauth() && !is_managed_official {
+            return Ok(false);
+        }
+
+        let app_handle = self.app_handle.as_ref().ok_or_else(|| {
+            ProxyError::AuthError("Codex OAuth authentication is unavailable".to_string())
+        })?;
+        let codex_state = app_handle.state::<CodexOAuthState>();
+        let manager = codex_state.0.read().await;
+        let account_id = match provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+        {
+            Some(account_id) => account_id,
+            None => manager.default_account_id().await.ok_or_else(|| {
+                ProxyError::AuthError(
+                    "No default ChatGPT account is configured in CC Switch".to_string(),
+                )
+            })?,
+        };
+        let rejected_token = manager
+            .get_valid_token_for_account(&account_id)
+            .await
+            .map_err(|error| {
+                ProxyError::AuthError(format!(
+                    "Unable to load the rejected ChatGPT credential: {error}"
+                ))
+            })?;
+
+        manager
+            .refresh_token_after_rejection(&account_id, &rejected_token)
+            .await
+            .map_err(|error| {
+                ProxyError::AuthError(format!(
+                    "ChatGPT rejected the access token and automatic OAuth refresh failed: {error}. Please re-login via CC Switch."
+                ))
+            })?;
+
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn forward(
         &self,

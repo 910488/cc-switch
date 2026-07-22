@@ -468,6 +468,11 @@ fn codex_catalog_model_entry(
     entry_obj.insert("service_tiers".to_string(), json!([]));
     entry_obj.insert("availability_nux".to_string(), Value::Null);
     entry_obj.insert("upgrade".to_string(), Value::Null);
+    // Prefer the proxy's HTTP/SSE path for every generated entry. A WebSocket
+    // compatibility bridge handles Codex builds that attempt WS regardless,
+    // but HTTP avoids an unnecessary upgrade/prewarm round trip and remains the
+    // canonical path through all upstream format transforms.
+    entry_obj.insert("prefer_websockets".to_string(), json!(false));
 
     if let Some(level) = spec.default_reasoning_level.as_deref() {
         entry_obj.insert("default_reasoning_level".to_string(), json!(level));
@@ -1042,6 +1047,29 @@ fn set_codex_native_web_search_field(config_text: &str, disable: bool) -> Result
     Ok(doc.to_string())
 }
 
+/// Remove only the model-menu state owned by CC Switch from a Codex config.
+///
+/// A user-supplied catalog is deliberately left untouched.  `web_search` is
+/// cleaned only when the config still points at our generated catalog, which
+/// gives us an unambiguous ownership signal for the `"disabled"` sentinel.
+pub fn remove_codex_generated_model_catalog_reference(
+    config_text: &str,
+) -> Result<String, AppError> {
+    let generated_path = get_codex_model_catalog_path();
+    if resolve_cc_switch_catalog_path(config_text, &generated_path).is_none() {
+        return Ok(config_text.to_string());
+    }
+
+    let config_text = set_codex_model_catalog_json_field(config_text, None)?;
+    set_codex_native_web_search_field(&config_text, false)
+}
+
+/// Delete the generated catalog itself.  This is intentionally safe to call
+/// on every disable path; `delete_file` treats an absent file as success.
+pub fn delete_codex_generated_model_catalog() -> Result<(), AppError> {
+    delete_file(&get_codex_model_catalog_path())
+}
+
 /// Generate Codex `model_catalog_json` from provider settings and inject/remove
 /// the top-level TOML field that points Codex to the generated file.
 pub fn prepare_codex_config_text_with_model_catalog(
@@ -1424,13 +1452,7 @@ pub fn read_codex_live_settings() -> Result<Value, AppError> {
     Ok(json!({ "auth": auth, "config": cfg_text }))
 }
 
-/// `[model_providers.openai]` entry that routes the official (ChatGPT OAuth)
-/// provider through CC Switch without changing Codex's provider identity.
-/// `requires_openai_auth` routes auth to the ChatGPT
-/// login in `auth.json` (base_url then defaults to the official Codex
-/// backend), `name = "OpenAI"` keeps Codex's `is_openai()` feature gates
-/// (web search, remote compaction), and `supports_websockets` restores the
-/// built-in default that custom entries otherwise lose.
+/// Provider table used only for the separate unified custom-provider path.
 fn codex_official_provider_table(
     base_url: Option<&str>,
     supports_websockets: bool,
@@ -1511,12 +1533,22 @@ pub fn apply_codex_official_proxy_route(
     // user bearer tokens are preserved, as are all unrelated provider fields.
     remove_codex_proxy_placeholders_from_providers(&mut providers);
 
-    // The local proxy currently exposes HTTP/SSE, not Codex websocket routes.
-    let table = codex_official_provider_table(Some(proxy_base_url), false);
-
+    // Current Codex rejects user-defined entries whose id is the reserved
+    // built-in `openai`. Route that built-in provider with its supported
+    // top-level base URL override instead. This preserves provider identity,
+    // and therefore the Desktop conversation/project history bucket.
     providers.remove(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID);
-    providers.insert("openai", toml_edit::Item::Table(table));
-    doc["model_providers"] = toml_edit::Item::Table(providers);
+    let remove_legacy_openai = providers
+        .get("openai")
+        .and_then(|item| item.as_table())
+        .is_some_and(table_matches_codex_official_proxy_provider);
+    if remove_legacy_openai {
+        providers.remove("openai");
+    }
+    if !providers.is_empty() {
+        doc["model_providers"] = toml_edit::Item::Table(providers);
+    }
+    doc["openai_base_url"] = toml_edit::value(proxy_base_url.trim_end_matches('/'));
     Ok(doc.to_string())
 }
 
@@ -1528,11 +1560,9 @@ pub fn codex_config_has_official_proxy_route(config_text: &str) -> bool {
     if doc.get("model_provider").and_then(|item| item.as_str()) != Some("openai") {
         return false;
     }
-    doc.get("model_providers")
-        .and_then(|item| item.as_table())
-        .and_then(|providers| providers.get("openai"))
-        .and_then(|item| item.as_table())
-        .is_some_and(table_matches_codex_official_proxy_provider)
+    doc.get("openai_base_url")
+        .and_then(|item| item.as_str())
+        .is_some_and(is_loopback_codex_proxy_url)
 }
 
 /// Remove the provider alias emitted by CC Switch 3.17.0 prerelease builds.
@@ -1562,6 +1592,13 @@ pub fn ensure_codex_official_proxy_history_alias(config_text: &str) -> Result<St
         }
     };
     providers.remove(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID);
+    let remove_legacy_openai = providers
+        .get("openai")
+        .and_then(|item| item.as_table())
+        .is_some_and(table_matches_codex_official_proxy_provider);
+    if remove_legacy_openai {
+        providers.remove("openai");
+    }
     if !providers.is_empty() {
         doc["model_providers"] = toml_edit::Item::Table(providers);
     }
@@ -1582,6 +1619,13 @@ pub fn remove_codex_official_proxy_route(config_text: &str) -> Result<String, Ap
     }
 
     doc["model_provider"] = toml_edit::value("openai");
+    let remove_base_url = doc
+        .get("openai_base_url")
+        .and_then(|item| item.as_str())
+        .is_some_and(is_loopback_codex_proxy_url);
+    if remove_base_url {
+        doc.as_table_mut().remove("openai_base_url");
+    }
     if let Some(item) = doc.as_table_mut().remove("model_providers") {
         let mut providers = item.into_table().map_err(|_| {
             AppError::Message(
@@ -1890,7 +1934,8 @@ pub fn prepare_codex_provider_live_config(
 /// makes all tasks created under another provider appear deleted.
 ///
 /// Stored provider templates remain unchanged; only the generated live TOML is
-/// canonicalized. Routing and credentials are moved with the active table.
+/// canonicalized. Custom provider tables remain valid inactive definitions;
+/// they must never be moved to the reserved built-in `openai` id.
 pub fn canonicalize_codex_live_provider_id(config_text: &str) -> Result<String, AppError> {
     let mut doc = config_text
         .parse::<DocumentMut>()
@@ -1906,17 +1951,27 @@ pub fn canonicalize_codex_live_provider_id(config_text: &str) -> Result<String, 
         return Ok(config_text.to_string());
     }
 
+    let active_base_url = doc
+        .get("model_providers")
+        .and_then(|item| item.as_table())
+        .and_then(|providers| providers.get(&active))
+        .and_then(|item| item.as_table())
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(|item| item.as_str())
+        .map(str::to_string);
     doc["model_provider"] = toml_edit::value("openai");
+    if let Some(base_url) = active_base_url {
+        doc["openai_base_url"] = toml_edit::value(base_url);
+    }
     if let Some(item) = doc.as_table_mut().remove("model_providers") {
-        let mut providers = item.into_table().map_err(|_| {
+        let providers = item.into_table().map_err(|_| {
             AppError::Message(
                 "Invalid Codex config.toml: model_providers must be a table".to_string(),
             )
         })?;
-        if let Some(active_table) = providers.remove(&active) {
-            providers.insert("openai", active_table);
+        if !providers.is_empty() {
+            doc["model_providers"] = toml_edit::Item::Table(providers);
         }
-        doc["model_providers"] = toml_edit::Item::Table(providers);
     }
     if let Some(profiles) = doc.get_mut("profiles").and_then(|item| item.as_table_mut()) {
         for (_, profile) in profiles.iter_mut() {
@@ -2174,23 +2229,11 @@ command = "example"
             "unrelated config survives"
         );
 
-        let provider = &doc["model_providers"]["openai"];
         assert_eq!(
-            provider.get("base_url").and_then(toml::Value::as_str),
+            doc.get("openai_base_url").and_then(toml::Value::as_str),
             Some("http://127.0.0.1:15721/v1")
         );
-        assert_eq!(
-            provider
-                .get("requires_openai_auth")
-                .and_then(toml::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            provider
-                .get("supports_websockets")
-                .and_then(toml::Value::as_bool),
-            Some(false)
-        );
+        assert!(doc.get("model_providers").is_none());
         assert!(codex_config_has_official_proxy_route(&output));
     }
 
@@ -2206,6 +2249,7 @@ command = "example"
             Some("openai")
         );
         assert!(doc.get("model_providers").is_none());
+        assert!(doc.get("openai_base_url").is_none());
         assert_eq!(
             doc.get("model").and_then(toml::Value::as_str),
             Some("gpt-5.4")
@@ -2252,7 +2296,13 @@ model_providers = { rightcode = { name = "RightCode", experimental_bearer_token 
         assert!(projected_doc["model_providers"]["rightcode"]
             .get("experimental_bearer_token")
             .is_none());
-        assert!(projected_doc["model_providers"].get("openai").is_some());
+        assert!(projected_doc["model_providers"].get("openai").is_none());
+        assert_eq!(
+            projected_doc
+                .get("openai_base_url")
+                .and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:15721/v1")
+        );
 
         let cleaned = remove_codex_official_proxy_route(&projected).expect("clean projected");
         let cleaned_doc: toml::Value = toml::from_str(&cleaned).expect("parse cleaned");
@@ -2264,6 +2314,7 @@ model_providers = { rightcode = { name = "RightCode", experimental_bearer_token 
         );
         assert!(cleaned_doc["model_providers"].get("rightcode").is_some());
         assert!(cleaned_doc["model_providers"].get("openai").is_none());
+        assert!(cleaned_doc.get("openai_base_url").is_none());
     }
 
     #[test]
@@ -2287,18 +2338,18 @@ trust_level = "trusted"
             .expect("enable route");
         let proxied_doc: toml::Value = toml::from_str(&proxied).expect("parse proxy config");
         assert_eq!(proxied_doc["model_provider"].as_str(), Some("openai"));
-        let proxied_alias = &proxied_doc["model_providers"]["openai"];
         assert_eq!(
-            proxied_alias["base_url"].as_str(),
+            proxied_doc["openai_base_url"].as_str(),
             Some("http://127.0.0.1:15721/v1")
         );
-        assert_eq!(proxied_alias["supports_websockets"].as_bool(), Some(false));
+        assert!(proxied_doc.get("model_providers").is_none());
 
         let direct_again = remove_codex_official_proxy_route(&proxied).expect("disable route");
         let direct_again_doc: toml::Value =
             toml::from_str(&direct_again).expect("parse restored direct config");
         assert_eq!(direct_again_doc["model_provider"].as_str(), Some("openai"));
         assert!(direct_again_doc.get("model_providers").is_none());
+        assert!(direct_again_doc.get("openai_base_url").is_none());
         assert_eq!(
             direct_again_doc["projects"]["C:/work/demo"]["trust_level"].as_str(),
             Some("trusted")
@@ -2609,21 +2660,18 @@ model = "gpt-5.4"
             Some("cc-switch-model-catalog.json"),
             "catalog injection must survive provider canonicalization"
         );
-        assert!(
-            parsed
-                .get("model_providers")
-                .and_then(|v| v.get("vendor_alpha"))
-                .is_none(),
-            "live provider writes must not leave provider-scoped history ids"
-        );
+        assert!(parsed
+            .get("model_providers")
+            .and_then(|v| v.get("vendor_alpha"))
+            .is_some());
         assert_eq!(
-            parsed
-                .get("model_providers")
-                .and_then(|v| v.get("openai"))
-                .and_then(|v| v.get("base_url"))
-                .and_then(|v| v.as_str()),
+            parsed.get("openai_base_url").and_then(|v| v.as_str()),
             Some("https://alpha.example/v1")
         );
+        assert!(parsed
+            .get("model_providers")
+            .and_then(|v| v.get("openai"))
+            .is_none());
         assert_eq!(
             parsed
                 .get("experimental_bearer_token")
@@ -3247,6 +3295,13 @@ base_url = "https://production.api/v1"
             base.is_some_and(|s| !s.trim().is_empty()),
             "every native entry must carry a non-empty base_instructions (Codex requires it)"
         );
+        assert_eq!(
+            catalog["models"][0]
+                .get("prefer_websockets")
+                .and_then(Value::as_bool),
+            Some(false),
+            "a native-upstream catalog should still prefer the proxy's canonical HTTP path"
+        );
     }
 
     #[test]
@@ -3280,6 +3335,13 @@ base_url = "https://production.api/v1"
                 .and_then(|v| v.as_str()),
             Some("freeform"),
             "ProxyChat must preserve apply_patch_tool_type (no native stripping)"
+        );
+        assert_eq!(
+            catalog["models"][0]
+                .get("prefer_websockets")
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "the local proxy should prefer HTTP/SSE for transformed providers"
         );
     }
 
@@ -3808,6 +3870,32 @@ model = "glm-5"
             Some("/Users/me/.codex/my-custom-catalog.json"),
             "None arm should NOT remove user-owned catalog"
         );
+    }
+
+    #[test]
+    fn direct_restore_removes_only_cc_switch_catalog_state() {
+        let input = r#"model_provider = "openai"
+model_catalog_json = "/home/user/.codex/cc-switch-model-catalog.json"
+web_search = "disabled"
+model = "gpt-5.4"
+"#;
+        let result = remove_codex_generated_model_catalog_reference(input).unwrap();
+        let parsed: toml::Value = toml::from_str(&result).unwrap();
+        assert!(parsed.get("model_catalog_json").is_none());
+        assert!(parsed.get("web_search").is_none());
+        assert_eq!(
+            parsed.get("model").and_then(|v| v.as_str()),
+            Some("gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn direct_restore_preserves_user_catalog_and_web_search_setting() {
+        let input = r#"model_catalog_json = "/Users/me/.codex/my-catalog.json"
+web_search = "disabled"
+"#;
+        let result = remove_codex_generated_model_catalog_reference(input).unwrap();
+        assert_eq!(result, input);
     }
 
     #[test]

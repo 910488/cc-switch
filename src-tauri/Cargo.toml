@@ -46,9 +46,10 @@ brotli = "7"
 zstd = "0.13"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 futures = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 async-stream = "0.3"
 bytes = "1.5"
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
 hyper = { version = "1.0", features = ["full"] }

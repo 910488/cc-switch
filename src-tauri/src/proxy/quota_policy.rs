@@ -61,12 +61,15 @@ impl QuotaPolicy {
     /// weekly/monthly pools even though they share one API key and endpoint.
     pub(crate) fn is_model_scoped_quota_error(error: &ProxyError) -> bool {
         let ProxyError::UpstreamError {
-            status: 429,
+            status,
             body: Some(body),
         } = error
         else {
             return false;
         };
+        if !matches!(*status, 400 | 429) {
+            return false;
+        }
         let body = body.to_ascii_lowercase();
         [
             "received model group=",
@@ -86,12 +89,18 @@ impl QuotaPolicy {
     /// behind generic retry exhaustion.
     pub(crate) fn is_hard_quota_error(error: &ProxyError) -> bool {
         let ProxyError::UpstreamError {
-            status: 429,
+            status,
             body: Some(body),
         } = error
         else {
             return false;
         };
+        // Some OpenAI-compatible gateways incorrectly encode subscription
+        // exhaustion as HTTP 400 (not 429). Classify only explicit quota/balance
+        // wording so an ordinary malformed request remains a normal 400.
+        if !matches!(*status, 400 | 429) {
+            return false;
+        }
         let body = body.to_ascii_lowercase();
         [
             "insufficient_quota",
@@ -102,6 +111,10 @@ impl QuotaPolicy {
             "weekly/monthly limit",
             "credit balance",
             "billing",
+            "配额不足",
+            "额度不足",
+            "餘額不足",
+            "余额不足",
         ]
         .iter()
         .any(|needle| body.contains(needle))
@@ -395,6 +408,19 @@ mod tests {
         };
         assert!(!QuotaPolicy::is_hard_quota_error(&error));
         assert!(!QuotaPolicy::is_model_scoped_quota_error(&error));
+    }
+
+    #[test]
+    fn chinese_model_quota_reported_as_http_400_is_classified() {
+        let error = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(
+                json!({"error":{"message":"当前codeplan或资源包订阅，所剩配额不足～. Received Model Group=GLM-5.2"}})
+                    .to_string(),
+            ),
+        };
+        assert!(QuotaPolicy::is_hard_quota_error(&error));
+        assert!(QuotaPolicy::is_model_scoped_quota_error(&error));
     }
 
     #[test]

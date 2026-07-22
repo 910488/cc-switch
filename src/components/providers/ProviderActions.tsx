@@ -345,7 +345,7 @@ export function ProviderActions({
             size="icon"
             variant="ghost"
             onClick={onConfigureModels}
-            title="設定並注入 Codex 模型"
+            title="設定 Codex 模型"
             className={cn(iconButtonClass, "hover:text-sky-500")}
           >
             <ListPlus className="h-4 w-4" />

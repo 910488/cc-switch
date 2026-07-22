@@ -231,12 +231,41 @@ pub async fn get_codex_oauth_quota(
     };
 
     // 瞬时传输失败以 Err 传播（前端 reject → retry + 保留上次成功值）。
-    query_codex_quota(
+    let quota = query_codex_quota(
         &token,
         Some(&id),
         "codex_oauth",
         "Codex OAuth access token expired or rejected. Please re-login via cc-switch.",
         force_refresh.unwrap_or(false),
+    )
+    .await?;
+
+    if !matches!(quota.credential_status, CredentialStatus::Expired) {
+        return Ok(quota);
+    }
+
+    // JWT expiry is only a local hint. OpenAI can invalidate an otherwise
+    // unexpired access token server-side. Force one refresh after a 401/403 and
+    // retry the quota request once before asking the user to sign in again.
+    let refreshed_token = match manager.refresh_token_after_rejection(&id, &token).await {
+        Ok(token) => token,
+        Err(error) => {
+            return Ok(SubscriptionQuota::error(
+                "codex_oauth",
+                CredentialStatus::Expired,
+                format!(
+                    "Codex OAuth refresh failed after the access token was rejected: {error}. Please re-login via cc-switch."
+                ),
+            ));
+        }
+    };
+
+    query_codex_quota(
+        &refreshed_token,
+        Some(&id),
+        "codex_oauth",
+        "Codex OAuth access token remained rejected after one automatic refresh. Please re-login via cc-switch.",
+        true,
     )
     .await
 }

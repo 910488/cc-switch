@@ -435,10 +435,30 @@ impl ProxyService {
 
     fn ensure_codex_official_history_alias_in_settings(settings: &mut Value) -> Result<(), String> {
         let config_text = settings.get("config").and_then(Value::as_str).unwrap_or("");
-        let updated = crate::codex_config::ensure_codex_official_proxy_history_alias(config_text)
-            .map_err(|e| format!("建立 Codex 官方聊天历史兼容路由失败: {e}"))?;
-        let updated = crate::codex_config::canonicalize_codex_live_provider_id(&updated)
-            .map_err(|e| format!("统一 Codex 聊天历史 provider 失败: {e}"))?;
+        let mut updated =
+            crate::codex_config::ensure_codex_official_proxy_history_alias(config_text)
+                .map_err(|e| format!("建立 Codex 官方聊天历史兼容路由失败: {e}"))?;
+        let active_is_third_party = updated
+            .parse::<toml::Value>()
+            .ok()
+            .and_then(|doc| {
+                doc.get("model_provider")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .is_some_and(|provider| provider != "openai");
+        let auth = settings.get("auth").cloned().unwrap_or_else(|| json!({}));
+        let has_provider_credential = crate::codex_config::extract_codex_auth_api_key(&auth)
+            .is_some()
+            || crate::codex_config::extract_codex_experimental_bearer_token(&updated).is_some();
+        if active_is_third_party && has_provider_credential {
+            // A genuine direct API-key profile can safely share the built-in
+            // `openai` history bucket as long as its third-party bearer travels
+            // with the route. OAuth-only profiles must never take this branch:
+            // doing so would send the ChatGPT JWT to the third-party base URL.
+            updated = crate::codex_config::prepare_codex_provider_live_config(&auth, &updated)
+                .map_err(|e| format!("统一 Codex API-key 聊天历史 provider 失败: {e}"))?;
+        }
         let target = settings
             .as_object_mut()
             .ok_or_else(|| "Codex 设置必须是 JSON 对象".to_string())?;
@@ -446,12 +466,21 @@ impl ProxyService {
         Ok(())
     }
 
-    fn ensure_codex_official_history_alias_in_live(&self) -> Result<(), String> {
+    /// Finish every transition back to direct Codex mode.  Backups from older
+    /// builds can legitimately contain CC Switch's generated catalog pointer,
+    /// so cleanup must run after *all* restore branches, including the
+    /// idempotent "already disabled" path.
+    fn finalize_codex_direct_restore(&self) -> Result<(), String> {
         let mut live = self.read_codex_live()?;
         Self::ensure_codex_official_history_alias_in_settings(&mut live)?;
         let config_text = live.get("config").and_then(Value::as_str).unwrap_or("");
-        crate::codex_config::write_codex_live_config_atomic(Some(config_text))
-            .map_err(|e| format!("写入 Codex 官方聊天历史兼容路由失败: {e}"))
+        let cleaned =
+            crate::codex_config::remove_codex_generated_model_catalog_reference(config_text)
+                .map_err(|e| format!("清理 Codex 第三方模型目录引用失败: {e}"))?;
+        crate::codex_config::write_codex_live_config_atomic(Some(&cleaned))
+            .map_err(|e| format!("写入 Codex 直接连接配置失败: {e}"))?;
+        crate::codex_config::delete_codex_generated_model_catalog()
+            .map_err(|e| format!("删除 Codex 第三方模型目录失败: {e}"))
     }
 
     pub async fn sync_grok_live_from_provider_while_proxy_active(
@@ -808,6 +837,11 @@ impl ProxyService {
                 self.start().await?;
             }
 
+            if matches!(app, AppType::Codex) {
+                crate::proxy::model_routes::ensure_configured_for_takeover(&self.db)
+                    .map_err(|error| format!("Unable to prepare Codex model menu: {error}"))?;
+            }
+
             // 2) 已接管则直接返回（幂等）；但如果缺少备份或占位符残留，需要重建接管
             let current_config = self
                 .db
@@ -931,7 +965,7 @@ impl ProxyService {
             if matches!(app, AppType::Codex)
                 && crate::codex_config::get_codex_config_path().exists()
             {
-                self.ensure_codex_official_history_alias_in_live()?;
+                self.finalize_codex_direct_restore()?;
             }
             return Ok(()); // DB 与 Live 都未接管，幂等返回
         }
@@ -1894,7 +1928,7 @@ impl ProxyService {
             } else {
                 self.write_live_config_for_app(app_type, &config)?;
                 if matches!(app_type, AppType::Codex) {
-                    self.ensure_codex_official_history_alias_in_live()?;
+                    self.finalize_codex_direct_restore()?;
                 }
                 self.ensure_takeover_cleared_for_app(app_type)?;
                 log::info!("{app_type_str} Live 配置已从备份恢复");
@@ -1907,7 +1941,7 @@ impl ProxyService {
             if matches!(app_type, AppType::Codex)
                 && crate::codex_config::get_codex_config_path().exists()
             {
-                self.ensure_codex_official_history_alias_in_live()?;
+                self.finalize_codex_direct_restore()?;
             }
             return Ok(());
         }
@@ -1916,7 +1950,7 @@ impl ProxyService {
         match self.restore_live_from_ssot_for_app(app_type) {
             Ok(true) => {
                 if matches!(app_type, AppType::Codex) {
-                    self.ensure_codex_official_history_alias_in_live()?;
+                    self.finalize_codex_direct_restore()?;
                 }
                 self.ensure_takeover_cleared_for_app(app_type)?;
                 log::info!("{app_type_str} Live 配置已从 SSOT 恢复（无备份兜底）");
@@ -1937,7 +1971,7 @@ impl ProxyService {
         // 2.2) 最后兜底：尽力清理占位符与本地代理地址，避免长期卡在代理占位符状态
         self.cleanup_takeover_placeholders_in_live_for_app(app_type)?;
         if matches!(app_type, AppType::Codex) {
-            self.ensure_codex_official_history_alias_in_live()?;
+            self.finalize_codex_direct_restore()?;
         }
         self.ensure_takeover_cleared_for_app(app_type)?;
         log::info!("{app_type_str} Live 接管占位符已清理（无备份兜底）");
@@ -2890,12 +2924,12 @@ impl ProxyService {
 
         let canonical = crate::codex_config::canonicalize_codex_live_provider_id(toml_str)
             .map_err(|e| format!("统一 Codex 聊天历史 provider 失败: {e}"))?;
-        let updated =
-            crate::codex_config::update_codex_toml_field(&canonical, "base_url", proxy_url)
-                .map_err(|e| format!("更新 Codex 代理地址失败: {e}"))?;
+        // Keep Desktop on the built-in `openai` provider/history bucket, but
+        // use its supported top-level URL override. Current Codex rejects a
+        // user-defined `[model_providers.openai]` because that id is reserved.
         let mut updated =
-            crate::codex_config::update_codex_toml_field(&updated, "wire_api", "responses")
-                .map_err(|e| format!("更新 Codex wire_api 失败: {e}"))?;
+            crate::codex_config::apply_codex_official_proxy_route(&canonical, proxy_url)
+                .map_err(|e| format!("更新 Codex 代理地址失败: {e}"))?;
 
         if let Some(upstream_model) =
             provider.and_then(crate::proxy::providers::codex_provider_upstream_model)
@@ -3219,7 +3253,7 @@ impl ProxyService {
         if let Some(server) = self.server.read().await.as_ref() {
             server.get_auto_review_stats().await
         } else {
-            crate::proxy::auto_review::AutoReviewStats::default()
+            crate::proxy::auto_review::load_stats(&self.db)
         }
     }
 
@@ -3447,6 +3481,59 @@ mod tests {
             .expect("set test proxy config to an ephemeral port");
     }
 
+    #[test]
+    fn direct_history_cleanup_does_not_relabel_third_party_as_openai() {
+        let mut settings = json!({
+            "auth": {
+                "auth_mode":"chatgpt",
+                "tokens":{"access_token":"oauth-jwt"}
+            },
+            "config": r#"model_provider = "weikuwu"
+
+[model_providers.weikuwu]
+name = "weikuwu"
+base_url = "https://llm.weikuwu.me/v1"
+wire_api = "responses"
+"#
+        });
+
+        ProxyService::ensure_codex_official_history_alias_in_settings(&mut settings)
+            .expect("normalize only legacy CC Switch alias");
+        let config = settings["config"].as_str().unwrap();
+        let parsed: toml::Value = toml::from_str(config).unwrap();
+        assert_eq!(parsed["model_provider"].as_str(), Some("weikuwu"));
+        assert!(parsed.get("openai_base_url").is_none());
+        assert_eq!(
+            parsed["model_providers"]["weikuwu"]["base_url"].as_str(),
+            Some("https://llm.weikuwu.me/v1")
+        );
+    }
+
+    #[test]
+    fn direct_api_key_profile_keeps_history_bucket_with_scoped_bearer() {
+        let mut settings = json!({
+            "auth": {"OPENAI_API_KEY":"sk-third-party"},
+            "config": r#"model_provider = "weikuwu"
+
+[model_providers.weikuwu]
+name = "weikuwu"
+base_url = "https://llm.weikuwu.me/v1"
+wire_api = "responses"
+"#
+        });
+        ProxyService::ensure_codex_official_history_alias_in_settings(&mut settings).unwrap();
+        let parsed: toml::Value = toml::from_str(settings["config"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["model_provider"].as_str(), Some("openai"));
+        assert_eq!(
+            parsed["openai_base_url"].as_str(),
+            Some("https://llm.weikuwu.me/v1")
+        );
+        assert_eq!(
+            parsed["experimental_bearer_token"].as_str(),
+            Some("sk-third-party")
+        );
+    }
+
     async fn running_codex_base_url(service: &ProxyService) -> String {
         let status = service.get_status().await.expect("get proxy status");
         format!("http://127.0.0.1:{}/v1", status.port)
@@ -3461,26 +3548,16 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some(route_id)
         );
-        let route = parsed
-            .get("model_providers")
-            .and_then(|value| value.get(route_id))
-            .expect("managed official proxy provider");
         assert_eq!(
-            route.get("base_url").and_then(|value| value.as_str()),
+            parsed
+                .get("openai_base_url")
+                .and_then(|value| value.as_str()),
             Some(expected_base_url)
         );
-        assert_eq!(
-            route
-                .get("supports_websockets")
-                .and_then(|value| value.as_bool()),
-            Some(false)
-        );
-        assert_eq!(
-            route
-                .get("requires_openai_auth")
-                .and_then(|value| value.as_bool()),
-            Some(true)
-        );
+        assert!(parsed
+            .get("model_providers")
+            .and_then(|value| value.get(route_id))
+            .is_none());
     }
 
     fn assert_codex_third_party_proxy_route(
@@ -3495,18 +3572,16 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("openai")
         );
-        let route = parsed
-            .get("model_providers")
-            .and_then(|value| value.get("openai"))
-            .expect("selected third-party provider route");
         assert_eq!(
-            route.get("base_url").and_then(|value| value.as_str()),
+            parsed
+                .get("openai_base_url")
+                .and_then(|value| value.as_str()),
             Some(expected_base_url)
         );
-        assert_eq!(
-            route.get("wire_api").and_then(|value| value.as_str()),
-            Some("responses")
-        );
+        assert!(parsed
+            .get("model_providers")
+            .and_then(|value| value.get("openai"))
+            .is_none());
     }
 
     fn assert_codex_direct_history_alias(config_text: &str) {
@@ -3948,7 +4023,6 @@ mod tests {
         let db = Arc::new(Database::memory().expect("init db"));
         use_ephemeral_proxy_port(&db).await;
         let service = ProxyService::new(db.clone());
-
         let provider = Provider::with_id(
             "p1".to_string(),
             "P1".to_string(),
@@ -4784,6 +4858,11 @@ wire_api = "responses"
         let db = Arc::new(Database::memory().expect("init db"));
         use_ephemeral_proxy_port(&db).await;
         let service = ProxyService::new(db.clone());
+        db.set_config_snippet(
+            "codex",
+            Some("[windows]\nsandbox = \"elevated\"\n".to_string()),
+        )
+        .expect("seed legacy device-local common config");
 
         let live_auth = json!({
             "auth_mode": "chatgpt",
@@ -4796,6 +4875,9 @@ wire_api = "responses"
 
 [windows]
 sandbox = "elevated"
+
+[desktop]
+appearance_theme = "dark"
 "#;
         crate::codex_config::write_codex_live_atomic(&live_auth, Some(live_config))
             .expect("seed current Codex profile");
@@ -4860,6 +4942,7 @@ sandbox = "elevated"
         let routed_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
             .expect("read routed config");
         assert!(routed_config.contains("sandbox = \"elevated\""));
+        assert!(routed_config.contains("appearance_theme = \"dark\""));
         assert!(!routed_config.contains("stale-account"));
         assert!(!routed_config.contains("gpt-old"));
         assert_eq!(
@@ -4892,6 +4975,7 @@ sandbox = "elevated"
             .expect("read restored config");
         assert_eq!(restored_auth, live_auth);
         assert!(restored_config.contains("sandbox = \"elevated\""));
+        assert!(restored_config.contains("appearance_theme = \"dark\""));
         assert!(!restored_config.contains("gpt-old"));
         assert_eq!(
             std::fs::read(&global_state_path).expect("read restored Desktop state"),
@@ -5557,19 +5641,14 @@ wire_api = "chat"
         let parsed: toml::Value =
             toml::from_str(&output).expect("updated config should be valid TOML");
 
-        let provider = parsed
-            .get("model_providers")
-            .and_then(|v| v.get("openai"))
-            .expect("model_providers.openai should be the canonical live route");
-
         assert_eq!(
-            provider.get("base_url").and_then(|v| v.as_str()),
+            parsed.get("openai_base_url").and_then(|v| v.as_str()),
             Some(proxy_url)
         );
-        assert_eq!(
-            provider.get("wire_api").and_then(|v| v.as_str()),
-            Some("responses")
-        );
+        assert!(parsed
+            .get("model_providers")
+            .and_then(|v| v.get("openai"))
+            .is_none());
         assert_codex_direct_history_alias(&output);
     }
 
@@ -5652,11 +5731,7 @@ wire_api = "responses"
             Some("deepseek-v4-flash")
         );
         assert_eq!(
-            parsed
-                .get("model_providers")
-                .and_then(|v| v.get("openai"))
-                .and_then(|v| v.get("base_url"))
-                .and_then(|v| v.as_str()),
+            parsed.get("openai_base_url").and_then(|v| v.as_str()),
             Some(proxy_url)
         );
         assert_codex_direct_history_alias(&output);
@@ -7200,15 +7275,12 @@ requires_openai_auth = true
         );
     }
 
-    /// Regression: turning proxy takeover off restores Live from the backup. The
-    /// backup snapshot is `read_codex_live_settings()` output (`{auth, config}`,
-    /// never an inline `modelCatalog`). The restore must NOT route the config
-    /// through catalog projection, which would see no specs and strip the
-    /// `model_catalog_json` pointer — silently dropping the user's Codex model
-    /// mapping from Live even though the DB SSOT still holds it.
+    /// Turning proxy takeover off restores the direct profile but must remove
+    /// CC Switch's generated model menu. Older backups can themselves contain
+    /// the generated pointer, so restoring bytes alone is insufficient.
     #[tokio::test]
     #[serial]
-    async fn codex_restore_from_backup_preserves_model_catalog_pointer() {
+    async fn codex_restore_from_backup_removes_generated_model_catalog() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
 
@@ -7255,31 +7327,59 @@ requires_openai_auth = true
         let restored = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
             .expect("read restored config.toml");
         assert!(
-            restored.contains("model_catalog_json"),
-            "restore must preserve the model_catalog_json pointer, got:\n{restored}"
+            !restored.contains("model_catalog_json"),
+            "direct restore must remove the generated model menu pointer, got:\n{restored}"
         );
         let restored_doc: toml::Value =
             toml::from_str(&restored).expect("parse restored config.toml");
-        let restored_pointer = restored_doc
-            .get("model_catalog_json")
-            .and_then(|value| value.as_str())
-            .expect("restored catalog pointer");
-        assert_eq!(
-            std::path::Path::new(restored_pointer),
-            catalog_path,
-            "restored pointer must reference the cc-switch generated catalog file"
+        assert!(restored_doc.get("model_catalog_json").is_none());
+        assert!(
+            !catalog_path.exists(),
+            "generated catalog file must be deleted"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_idempotent_disable_cleans_stale_catalog_without_touching_oauth() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        let oauth = json!({
+            "auth_mode":"chatgpt",
+            "tokens":{"access_token":"oauth-access","refresh_token":"oauth-refresh"}
+        });
+        let catalog_path = crate::codex_config::get_codex_model_catalog_path();
+        std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        std::fs::write(&catalog_path, r#"{"models":[{"slug":"glm-5.2"}]}"#).unwrap();
+        let pointer = catalog_path.to_string_lossy().replace('\\', "/");
+        crate::codex_config::write_codex_live_atomic(
+            &oauth,
+            Some(&format!(
+                "model_provider = \"openai\"\nmodel = \"gpt-5.4\"\nmodel_catalog_json = \"{pointer}\"\n"
+            )),
+        )
+        .unwrap();
+
+        service.set_takeover_for_app("codex", false).await.unwrap();
+
+        let live = service.read_codex_live().unwrap();
+        assert_eq!(live.get("auth"), Some(&oauth));
+        assert!(!live["config"]
+            .as_str()
+            .unwrap()
+            .contains("model_catalog_json"));
+        assert!(!catalog_path.exists());
     }
 
     /// Regression: a hot-switch during takeover rebuilds the backup from the DB
     /// provider (`update_live_backup_from_provider`), so the backup carries an
-    /// inline `modelCatalog` (DB SSOT) but a `config.toml` text WITHOUT a
-    /// `model_catalog_json` pointer. Restoring that backup must project the
-    /// inline catalog — (re)generating both the catalog file and the pointer —
-    /// or the Codex model mapping vanishes from Live after takeover-off.
+    /// inline `modelCatalog` (DB SSOT). It remains available for the next proxy
+    /// activation, but direct mode must not project it into Codex's live menu.
     #[tokio::test]
     #[serial]
-    async fn codex_restore_from_backup_projects_inline_model_catalog() {
+    async fn codex_restore_from_backup_keeps_inline_catalog_out_of_direct_mode() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
 
@@ -7319,40 +7419,18 @@ requires_openai_auth = true
         let restored = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
             .expect("read restored config.toml");
         let catalog_path = crate::codex_config::get_codex_model_catalog_path();
-        assert!(
-            restored.contains("model_catalog_json"),
-            "restore must (re)generate the model_catalog_json pointer from inline catalog, got:\n{restored}"
-        );
-        assert!(
-            catalog_path.exists(),
-            "restore must generate the cc-switch catalog file on disk"
-        );
-        let catalog: Value = serde_json::from_str(
-            &std::fs::read_to_string(&catalog_path).expect("read generated catalog"),
-        )
-        .expect("parse generated catalog");
-        let slugs: Vec<&str> = catalog
-            .get("models")
-            .and_then(|m| m.as_array())
-            .expect("catalog models")
-            .iter()
-            .filter_map(|m| m.get("slug").and_then(|s| s.as_str()))
-            .collect();
-        assert!(
-            slugs.contains(&"deepseek-v4-flash"),
-            "generated catalog must contain the inline model, got slugs: {slugs:?}"
-        );
+        assert!(!restored.contains("model_catalog_json"));
+        assert!(!catalog_path.exists());
     }
 
     /// Regression: a provider-rebuilt backup can pair an inline `modelCatalog`
     /// with EMPTY `auth.json` (`{}`) — the bearer-token / Mobile-compat shape
     /// where the API key lives in the config's `experimental_bearer_token`. The
-    /// empty-auth restore branch deletes `auth.json` and writes config raw; it
-    /// must still project the inline catalog (decision is orthogonal to auth), or
-    /// the model mapping vanishes on takeover-off for this provider shape.
+    /// empty-auth restore branch deletes `auth.json` and writes config raw; the
+    /// direct-mode cleanup must still remove the generated catalog projection.
     #[tokio::test]
     #[serial]
-    async fn codex_restore_empty_auth_backup_still_projects_inline_catalog() {
+    async fn codex_restore_empty_auth_backup_removes_generated_catalog() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
 
@@ -7388,14 +7466,8 @@ requires_openai_auth = true
 
         let restored = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
             .expect("read restored config.toml");
-        assert!(
-            restored.contains("model_catalog_json"),
-            "empty-auth restore must still project the inline catalog pointer, got:\n{restored}"
-        );
-        assert!(
-            crate::codex_config::get_codex_model_catalog_path().exists(),
-            "empty-auth restore must generate the cc-switch catalog file"
-        );
+        assert!(!restored.contains("model_catalog_json"));
+        assert!(!crate::codex_config::get_codex_model_catalog_path().exists());
         assert!(
             !crate::codex_config::get_codex_auth_path().exists(),
             "empty-auth restore must delete auth.json rather than write an empty one"

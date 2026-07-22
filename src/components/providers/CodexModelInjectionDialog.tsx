@@ -17,16 +17,13 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
-  fetchCodexOauthModels,
   fetchModelsForConfig,
   showFetchModelsError,
   type FetchedModel,
 } from "@/lib/api/model-fetch";
 import { codexModelRoutesApi } from "@/lib/api/codexModelRoutes";
-import { useUpdateProviderMutation } from "@/lib/query/mutations";
 import type { CodexCatalogModel, Provider } from "@/types";
 import {
-  buildCodexInjectedProvider,
   codexProviderConnection,
   configuredCodexModels,
 } from "./codexModelInjection";
@@ -44,7 +41,6 @@ export function CodexModelInjectionDialog({
 }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const updateProvider = useUpdateProviderMutation("codex");
   const connection = useMemo(
     () => codexProviderConnection(provider),
     [provider],
@@ -54,6 +50,7 @@ export function CodexModelInjectionDialog({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [manualModel, setManualModel] = useState("");
   const [fetching, setFetching] = useState(false);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -130,30 +127,18 @@ export function CodexModelInjectionDialog({
       toast.error("請至少選擇一個第三方模型");
       return;
     }
+    setSaving(true);
     try {
-      const updated = buildCodexInjectedProvider(provider, selectedModels);
-      await updateProvider.mutateAsync({ provider: updated });
       const cachedOfficialModels =
         await codexModelRoutesApi.getCachedOfficialModels();
-      const oauthModels =
-        cachedOfficialModels.length > 0
-          ? []
-          : await fetchCodexOauthModels().catch(() => []);
-      const officialCatalog =
-        cachedOfficialModels.length > 0
-          ? cachedOfficialModels
-          : oauthModels.map((entry) => ({
-              model: entry.id,
-              displayName: entry.ownedBy || entry.id,
-            }));
-      if (officialCatalog.length === 0) {
+      if (cachedOfficialModels.length === 0) {
         throw new Error(
-          "找不到官方 Codex 模型清單，請先在 Codex App 使用一次官方模型後再試。",
+          "找不到 Codex Desktop 的官方模型快取。請先關閉 Proxy、啟動 Codex 並確認原生模型清單載入完成後再試。",
         );
       }
       await codexModelRoutesApi.apply(
         provider.id,
-        officialCatalog,
+        cachedOfficialModels,
         selectedModels.map((entry) => ({
           model: entry.model,
           displayName: entry.displayName,
@@ -165,35 +150,38 @@ export function CodexModelInjectionDialog({
       );
       await refreshProxyQueries();
       onOpenChange(false);
-      toast.success(t("providerForm.modelMappingHint"));
+      toast.success("Codex 模型設定已儲存；Proxy 開啟時會自動套用。");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSaving(false);
     }
   };
 
   const rollback = async () => {
+    setSaving(true);
     try {
       await codexModelRoutesApi.rollback();
       await refreshProxyQueries();
       onOpenChange(false);
-      toast.success(t("providerForm.modelMappingHint"));
+      toast.success("Codex 第三方模型設定已清除。");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSaving(false);
     }
   };
 
-  const pending = fetching || updateProvider.isPending;
+  const pending = fetching || saving;
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Codex 模型共生 · {provider.name}</DialogTitle>
+          <DialogTitle>設定 Codex 模型 · {provider.name}</DialogTitle>
           <DialogDescription>
-            將選定的第三方模型加入 Codex App，同時保留官方模型。選官方模型會走
-            OpenAI，選第三方模型才會走此
-            Provider。套用只更新設定檔，不會終止或重啟 Codex App，因此不會觸發
-            Windows 首次設定。已開啟的 Codex
-            會沿用目前清單；請在方便時正常關閉後再開啟以載入新清單。
+            設定要在 Codex App 顯示的第三方模型，並保留官方模型。Codex Proxy
+            開啟時會自動套用此設定：官方模型走 OpenAI，第三方模型走此 Provider。
+            若 Codex App 已開啟，請正常關閉後再開啟以載入更新後的模型清單。
           </DialogDescription>
         </DialogHeader>
 
@@ -291,7 +279,7 @@ export function CodexModelInjectionDialog({
             disabled={pending}
           >
             <RotateCcw className="mr-2 h-4 w-4" />
-            還原官方設定
+            清除第三方模型設定
           </Button>
           <Button
             type="button"
@@ -303,7 +291,7 @@ export function CodexModelInjectionDialog({
             ) : (
               <Save className="mr-2 h-4 w-4" />
             )}
-            套用共生模型清單
+            儲存 Codex 模型設定
           </Button>
         </DialogFooter>
       </DialogContent>

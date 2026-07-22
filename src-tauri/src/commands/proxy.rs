@@ -137,6 +137,23 @@ pub async fn apply_codex_model_routes(
     if provider.category.as_deref() == Some("official") {
         return Err("Model injection requires a third-party provider".to_string());
     }
+    let updated_provider =
+        crate::proxy::model_routes::with_provider_model_catalog(&provider, &third_party_models)
+            .map_err(|error| error.to_string())?;
+    // Never trust an account `/models` response for the official section of
+    // the Desktop menu. It may contain rollout/legacy GPT ids that the native
+    // Codex UI intentionally hides. Its own models_cache.json is the SSOT.
+    // Keep accepting the argument for command/API compatibility, but do not
+    // use it as a source of truth.
+    drop(official_models);
+    let official_models =
+        crate::proxy::model_routes::cached_official_models().map_err(|error| error.to_string())?;
+    if official_models.is_empty() {
+        return Err(
+            "Codex Desktop official model cache is empty; load the native model menu first"
+                .to_string(),
+        );
+    }
     let next = crate::proxy::model_routes::build_settings(
         &provider.id,
         &provider.name,
@@ -146,7 +163,19 @@ pub async fn apply_codex_model_routes(
     .map_err(|error| error.to_string())?;
     let previous =
         crate::proxy::model_routes::load(&state.db).map_err(|error| error.to_string())?;
-    crate::proxy::model_routes::save(&state.db, &next).map_err(|error| error.to_string())?;
+    // Save only to the database SSOT. Do not use ProviderService::update here:
+    // it can sync a current third-party provider into live auth.json and change
+    // Codex from ChatGPT authentication to API-key authentication.
+    state
+        .db
+        .save_provider("codex", &updated_provider)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = crate::proxy::model_routes::save(&state.db, &next) {
+        let _ = state.db.save_provider("codex", &provider);
+        return Err(error.to_string());
+    }
+    crate::proxy::model_routes::remember_provider(&state.db, &provider.id)
+        .map_err(|error| error.to_string())?;
 
     let result: Result<(), String> = async {
         let takeover = state.proxy_service.get_takeover_status().await?.codex;
@@ -166,6 +195,7 @@ pub async fn apply_codex_model_routes(
     .await;
     if let Err(error) = result {
         let _ = crate::proxy::model_routes::save(&state.db, &previous);
+        let _ = state.db.save_provider("codex", &provider);
         return Err(error);
     }
     Ok(next)
@@ -173,18 +203,59 @@ pub async fn apply_codex_model_routes(
 
 #[tauri::command]
 pub async fn rollback_codex_model_routes(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    crate::proxy::model_routes::clear(&state.db).map_err(|error| error.to_string())?;
-    let takeover = state.proxy_service.get_takeover_status().await?.codex;
-    if takeover {
+    let previous =
+        crate::proxy::model_routes::load(&state.db).map_err(|error| error.to_string())?;
+    let previous_provider = if let Some(provider_id) = previous
+        .routes
+        .first()
+        .map(|route| route.provider_id.as_str())
+    {
         state
-            .proxy_service
-            .switch_proxy_target("codex", crate::database::CODEX_OFFICIAL_PROVIDER_ID)
-            .await?;
+            .db
+            .get_provider_by_id(provider_id, "codex")
+            .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+    if let Some(provider) = previous_provider.as_ref() {
+        let updated = crate::proxy::model_routes::without_provider_model_catalog(provider);
+        state
+            .db
+            .save_provider("codex", &updated)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Err(error) = crate::proxy::model_routes::clear(&state.db) {
+        if let Some(provider) = previous_provider.as_ref() {
+            let _ = state.db.save_provider("codex", provider);
+        }
+        return Err(error.to_string());
+    }
+    let result: Result<(), String> = async {
+        let takeover = state.proxy_service.get_takeover_status().await?.codex;
+        if takeover {
+            state
+                .proxy_service
+                .switch_proxy_target("codex", crate::database::CODEX_OFFICIAL_PROVIDER_ID)
+                .await?;
+        }
+        // Also run the idempotent disable cleanup when the DB already says
+        // takeover is off. Older builds could leave the generated catalog
+        // pointer/file behind in precisely that state.
         state
             .proxy_service
             .set_takeover_for_app("codex", false)
             .await?;
+        Ok(())
     }
+    .await;
+    if let Err(error) = result {
+        let _ = crate::proxy::model_routes::save(&state.db, &previous);
+        if let Some(provider) = previous_provider.as_ref() {
+            let _ = state.db.save_provider("codex", provider);
+        }
+        return Err(error);
+    }
+    crate::proxy::model_routes::forget_provider(&state.db).map_err(|error| error.to_string())?;
     Ok(())
 }
 

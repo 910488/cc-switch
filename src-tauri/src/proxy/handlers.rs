@@ -58,9 +58,17 @@ use super::{
 use crate::app_config::AppType;
 use crate::database::PRICING_SOURCE_REQUEST;
 use crate::provider::Provider;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{
+        ws::{Message as WebSocketMessage, WebSocket, WebSocketUpgrade},
+        OriginalUri, State,
+    },
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    Json,
+};
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::pin::Pin;
@@ -776,6 +784,402 @@ pub async fn handle_responses(
     request: axum::extract::Request,
 ) -> Result<axum::response::Response, ProxyError> {
     handle_responses_for_app(state, request, AppType::Codex, "Codex", "codex").await
+}
+
+/// Bridge Codex's Responses WebSocket transport onto the same HTTP/SSE proxy
+/// pipeline used by `/v1/responses`.  Codex's built-in `openai` provider tries
+/// WebSocket before HTTP even when a generated model entry prefers HTTP; without
+/// this GET upgrade route Axum answers 405 and Codex visibly retries the first
+/// turn before falling back.
+pub async fn handle_responses_websocket(
+    State(state): State<ProxyState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> axum::response::Response {
+    ws.on_upgrade(move |socket| responses_websocket_session(socket, state, uri, headers))
+        .into_response()
+}
+
+async fn responses_websocket_session(
+    mut socket: WebSocket,
+    state: ProxyState,
+    uri: axum::http::Uri,
+    handshake_headers: HeaderMap,
+) {
+    let mut first_message = true;
+    while let Some(message) = socket.recv().await {
+        let text = match message {
+            Ok(WebSocketMessage::Text(text)) => text,
+            Ok(WebSocketMessage::Close(_)) | Err(_) => break,
+            Ok(WebSocketMessage::Binary(_)) => {
+                let _ = send_websocket_error(
+                    &mut socket,
+                    StatusCode::BAD_REQUEST,
+                    "binary Responses WebSocket requests are not supported",
+                )
+                .await;
+                continue;
+            }
+            Ok(WebSocketMessage::Ping(_)) | Ok(WebSocketMessage::Pong(_)) => continue,
+        };
+
+        let mut body: Value = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = send_websocket_error(
+                    &mut socket,
+                    StatusCode::BAD_REQUEST,
+                    &format!("invalid Responses WebSocket JSON: {error}"),
+                )
+                .await;
+                continue;
+            }
+        };
+
+        // The official Responses WebSocket is more than an alternate transport
+        // for POST /responses: it carries desktop-presence state used by mobile
+        // pairing and the native remote-compaction v2 protocol.  Terminating it
+        // locally and translating it to HTTP makes the paired computer appear
+        // offline and can turn a valid compact response into zero recognized
+        // compaction items.  Once the first request resolves to an official
+        // catalog entry, keep the whole socket native and relay it end-to-end.
+        if first_message && websocket_model_uses_official_route(&state, &body) {
+            if let Err(error) =
+                relay_official_responses_websocket(&mut socket, text.as_str(), &handshake_headers)
+                    .await
+            {
+                let _ = send_websocket_error(
+                    &mut socket,
+                    StatusCode::BAD_GATEWAY,
+                    &format!("official Responses WebSocket relay failed: {error}"),
+                )
+                .await;
+            }
+            return;
+        }
+        first_message = false;
+
+        if body.get("type").and_then(Value::as_str) != Some("response.create") {
+            let _ = send_websocket_error(
+                &mut socket,
+                StatusCode::BAD_REQUEST,
+                "expected a response.create WebSocket request",
+            )
+            .await;
+            continue;
+        }
+        if let Some(object) = body.as_object_mut() {
+            object.remove("type");
+            // `generate` is a WebSocket-only control.  For the v2 prewarm form
+            // (`false`) we deliberately execute the full HTTP request so the
+            // returned response id remains a valid continuation anchor for
+            // both native and Chat-transformed upstreams.
+            object.remove("generate");
+        }
+
+        let request = match responses_websocket_http_request(&uri, &handshake_headers, &body) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ =
+                    send_websocket_error(&mut socket, StatusCode::BAD_REQUEST, &error.to_string())
+                        .await;
+                continue;
+            }
+        };
+        let response = match handle_responses(State(state.clone()), request).await {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
+        };
+        if stream_http_response_to_websocket(&mut socket, response)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn websocket_model_uses_official_route(state: &ProxyState, body: &Value) -> bool {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match model_routes::resolve(&state.db, model) {
+        Ok(Some(ResolvedModelRoute::ThirdParty(_))) => false,
+        // With a coexistence route table, older native model slugs and the
+        // model-less desktop-presence prewarm resolve as official. Managed
+        // third-party menu entries always have an explicit `ccs-*` route.
+        Ok(Some(ResolvedModelRoute::Official)) => true,
+        Ok(None) => crate::settings::get_current_provider(&AppType::Codex)
+            .and_then(|provider_id| {
+                state
+                    .db
+                    .get_provider_by_id(&provider_id, "codex")
+                    .ok()
+                    .flatten()
+            })
+            .is_some_and(|provider| super::providers::is_codex_official_provider(&provider)),
+        Err(error) => {
+            log::warn!("[Codex] unable to resolve WebSocket model route: {error}");
+            false
+        }
+    }
+}
+
+async fn relay_official_responses_websocket(
+    local: &mut WebSocket,
+    first_message: &str,
+    client_headers: &HeaderMap,
+) -> Result<(), String> {
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+    let upstream_url = official_responses_websocket_url();
+    let mut request = upstream_url
+        .into_client_request()
+        .map_err(|error| error.to_string())?;
+
+    // Keep Codex auth/account/feature headers, while allowing tungstenite to
+    // generate a valid upstream handshake instead of forwarding the localhost
+    // Host, Origin, connection and Sec-WebSocket key material.
+    for (name, value) in client_headers {
+        if matches!(
+            name.as_str(),
+            "host"
+                | "origin"
+                | "connection"
+                | "upgrade"
+                | "sec-websocket-key"
+                | "sec-websocket-version"
+                | "sec-websocket-accept"
+                | "sec-websocket-extensions"
+        ) {
+            continue;
+        }
+        request.headers_mut().insert(name.clone(), value.clone());
+    }
+
+    let (upstream, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (mut upstream_write, mut upstream_read) = upstream.split();
+    upstream_write
+        .send(Message::Text(first_message.to_string().into()))
+        .await
+        .map_err(|error| error.to_string())?;
+
+    loop {
+        tokio::select! {
+            local_message = local.recv() => {
+                let Some(local_message) = local_message else { break };
+                let local_message = local_message.map_err(|error| error.to_string())?;
+                let upstream_message = match local_message {
+                    WebSocketMessage::Text(text) => Message::Text(text.to_string().into()),
+                    WebSocketMessage::Binary(bytes) => Message::Binary(bytes),
+                    WebSocketMessage::Ping(bytes) => Message::Ping(bytes),
+                    WebSocketMessage::Pong(bytes) => Message::Pong(bytes),
+                    WebSocketMessage::Close(frame) => {
+                        let frame = frame.map(|frame| tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                            code: frame.code.into(),
+                            reason: frame.reason.to_string().into(),
+                        });
+                        Message::Close(frame)
+                    }
+                };
+                let closing = upstream_message.is_close();
+                upstream_write.send(upstream_message).await.map_err(|error| error.to_string())?;
+                if closing { break; }
+            }
+            upstream_message = upstream_read.next() => {
+                let Some(upstream_message) = upstream_message else { break };
+                let upstream_message = upstream_message.map_err(|error| error.to_string())?;
+                let local_message = match upstream_message {
+                    Message::Text(text) => WebSocketMessage::Text(text.to_string().into()),
+                    Message::Binary(bytes) => WebSocketMessage::Binary(bytes),
+                    Message::Ping(bytes) => WebSocketMessage::Ping(bytes),
+                    Message::Pong(bytes) => WebSocketMessage::Pong(bytes),
+                    Message::Close(frame) => {
+                        let frame = frame.map(|frame| axum::extract::ws::CloseFrame {
+                            code: frame.code.into(),
+                            reason: frame.reason.to_string().into(),
+                        });
+                        WebSocketMessage::Close(frame)
+                    }
+                    Message::Frame(_) => continue,
+                };
+                let closing = matches!(local_message, WebSocketMessage::Close(_));
+                local.send(local_message).await.map_err(|error| error.to_string())?;
+                if closing { break; }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn official_responses_websocket_url() -> String {
+    #[cfg(test)]
+    if let Ok(url) = std::env::var("CC_SWITCH_TEST_OFFICIAL_WS_URL") {
+        return url;
+    }
+    format!(
+        "{}/responses",
+        super::providers::CHATGPT_CODEX_BASE_URL
+            .trim_end_matches('/')
+            .replacen("https://", "wss://", 1)
+    )
+}
+
+fn responses_websocket_http_request(
+    uri: &axum::http::Uri,
+    handshake_headers: &HeaderMap,
+    body: &Value,
+) -> Result<axum::extract::Request, ProxyError> {
+    let encoded = serde_json::to_vec(body)
+        .map_err(|error| ProxyError::InvalidRequest(format!("invalid request JSON: {error}")))?;
+    let mut headers = handshake_headers.clone();
+    for name in [
+        "connection",
+        "upgrade",
+        "sec-websocket-accept",
+        "sec-websocket-extensions",
+        "sec-websocket-key",
+        "sec-websocket-protocol",
+        "sec-websocket-version",
+        "content-encoding",
+        "content-length",
+    ] {
+        headers.remove(name);
+    }
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    if let Some(metadata) = body.get("client_metadata").and_then(Value::as_object) {
+        for (key, header) in [
+            ("session_id", "session-id"),
+            ("thread_id", "thread-id"),
+            ("turn_id", "x-codex-turn-id"),
+            ("traceparent", "traceparent"),
+        ] {
+            if headers.contains_key(header) {
+                continue;
+            }
+            if let Some(value) = metadata.get(key).and_then(Value::as_str) {
+                if let Ok(value) = axum::http::HeaderValue::from_str(value) {
+                    headers.insert(axum::http::HeaderName::from_static(header), value);
+                }
+            }
+        }
+    }
+
+    let mut request = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri(uri.clone())
+        .body(axum::body::Body::from(encoded))
+        .map_err(|error| ProxyError::InvalidRequest(format!("invalid bridged request: {error}")))?;
+    *request.headers_mut() = headers;
+    Ok(request)
+}
+
+async fn stream_http_response_to_websocket(
+    socket: &mut WebSocket,
+    response: axum::response::Response,
+) -> Result<(), ()> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let is_sse = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    let mut stream = response.into_body().into_data_stream();
+
+    if !status.is_success() || !is_sse {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.map_err(|_| ())?);
+        }
+        if !status.is_success() {
+            let value = serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|_| {
+                json!({"error":{"type":"proxy_error","message":String::from_utf8_lossy(&bytes)}})
+            });
+            let error = value.get("error").cloned().unwrap_or_else(|| value.clone());
+            let payload = json!({
+                "type": "error",
+                "status": status.as_u16(),
+                "error": error,
+            });
+            return socket
+                .send(WebSocketMessage::Text(payload.to_string()))
+                .await
+                .map_err(|_| ());
+        }
+
+        let response_value = serde_json::from_slice::<Value>(&bytes).map_err(|_| ())?;
+        let completed =
+            if response_value.get("type").and_then(Value::as_str) == Some("response.completed") {
+                response_value
+            } else {
+                json!({"type":"response.completed","response":response_value})
+            };
+        return socket
+            .send(WebSocketMessage::Text(completed.to_string()))
+            .await
+            .map_err(|_| ());
+    }
+
+    let mut buffer = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        buffer.extend_from_slice(&chunk.map_err(|_| ())?);
+        while let Some(frame) = take_raw_sse_frame(&mut buffer) {
+            for payload in websocket_payloads_from_sse_frame(&frame) {
+                socket
+                    .send(WebSocketMessage::Text(payload))
+                    .await
+                    .map_err(|_| ())?;
+            }
+        }
+    }
+    if !buffer.is_empty() {
+        for payload in websocket_payloads_from_sse_frame(&buffer) {
+            socket
+                .send(WebSocketMessage::Text(payload))
+                .await
+                .map_err(|_| ())?;
+        }
+    }
+    Ok(())
+}
+
+fn websocket_payloads_from_sse_frame(frame: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(frame);
+    let mut payloads = Vec::new();
+    for line in text.lines() {
+        let Some(data) = strip_sse_field(line, "data") else {
+            continue;
+        };
+        let data = data.trim();
+        if !data.is_empty() && data != "[DONE]" {
+            payloads.push(data.to_string());
+        }
+    }
+    payloads
+}
+
+async fn send_websocket_error(
+    socket: &mut WebSocket,
+    status: StatusCode,
+    message: &str,
+) -> Result<(), axum::Error> {
+    socket
+        .send(WebSocketMessage::Text(
+            json!({
+                "type":"error",
+                "status":status.as_u16(),
+                "error":{"type":"invalid_request_error","message":message}
+            })
+            .to_string(),
+        ))
+        .await
 }
 
 pub async fn handle_grokbuild_responses(
@@ -2046,11 +2450,10 @@ async fn handle_native_compaction_response(
     }
     let body_bytes = response.bytes().await?;
     let items = compaction_items_from_response_bytes(&body_bytes, &headers);
-    if items.is_empty() {
-        return Err(ProxyError::TransformError(
-            "native compact response contained no compaction item".to_string(),
-        ));
-    }
+    // Current Codex compact endpoints may return a replacement `output`
+    // history made entirely of ordinary ResponseItems.  Opaque `compaction`
+    // items are optional, so journal the ones we see and otherwise replay the
+    // successful upstream response unchanged.
     for item in &items {
         state
             .compaction_service
@@ -2114,15 +2517,6 @@ fn native_compaction_sse_stream(
             }
 
             if state.finished {
-                if state.registered_ids.is_empty() {
-                    state.registered_ids.insert("__missing__".to_string());
-                    return Some((
-                        Err(std::io::Error::other(
-                            "native compact SSE ended without a compaction item",
-                        )),
-                        state,
-                    ));
-                }
                 if !state.buffer.is_empty() {
                     let trailing = std::mem::take(&mut state.buffer);
                     return Some((Ok(Bytes::from(trailing)), state));
@@ -2957,81 +3351,42 @@ fn codex_proxy_error_json(
         return body;
     };
 
-    let message = if super::quota_policy::QuotaPolicy::is_hard_quota_error(error) {
-        let cause = error_obj
-            .get("message")
-            .and_then(|value| value.as_str())
-            .map(ToString::to_string)
-            .filter(|message| !message.trim().is_empty())
-            .unwrap_or_else(|| get_error_message(error));
-        let scope = if super::quota_policy::QuotaPolicy::is_model_scoped_quota_error(error) {
-            "model"
-        } else {
-            "provider/account"
-        };
-        format!(
-            "Upstream {scope} quota exhausted (額度不足). Provider: {provider_name}; model: {request_model}; endpoint: {endpoint}; upstream_status: HTTP 429; original error: {cause}"
-        )
-    } else if upstream_status == Some(413) {
-        // 413 来自上游渠道商的网关（典型是 nginx 的 client_max_body_size），不是 CC
-        // Switch 本地代理的限制（本地 DefaultBodyLimit 已放到 200MB）。上游响应体往往是
-        // 一整段 nginx HTML，对用户毫无价值，这里替换成明确指向上游 + 可操作的指引，
-        // 避免「以为是 CC Switch 封装了 nginx / 是本地代理的锅」这种反复出现的误解。
-        format!(
-            concat!(
-                "Upstream provider rejected the request with HTTP 413 (Payload Too Large). ",
-                "The request body exceeds the upstream gateway's size limit; this is the ",
-                "provider's server-side limit, not a CC Switch limit. ",
-                "Provider: {provider}; model: {model}; endpoint: {endpoint}. ",
-                "To recover, shrink the request: run /compact, remove large pasted logs or ",
-                "inline images, or ask the provider to raise its request body limit ",
-                "(e.g. nginx client_max_body_size)."
-            ),
-            provider = provider_name,
-            model = request_model,
-            endpoint = endpoint,
-        )
-    } else {
-        let cause = error_obj
-            .get("message")
-            .and_then(|value| value.as_str())
-            .map(ToString::to_string)
-            .filter(|message| !message.trim().is_empty())
-            .unwrap_or_else(|| get_error_message(error));
-        let status_fragment = upstream_status
-            .map(|status| format!("; upstream_status: HTTP {status}"))
-            .unwrap_or_default();
-        format!(
-            "CC Switch local proxy failed while handling Codex endpoint {endpoint}. Provider: {provider_name}; model: {request_model}{status_fragment}; cause: {cause}"
-        )
-    };
+    // Keep the upstream's wording authoritative. HTTP 429 can mean a transient
+    // request-rate throttle or a persistent account limit, and even explicit
+    // quota text can mean only that this particular request is too large. CC
+    // Switch must not replace that message with a guessed diagnosis. Route
+    // metadata is appended separately so the original text remains first and
+    // directly searchable when debugging with the provider.
+    let cause = error_obj
+        .get("message")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| get_error_message(error));
+    let status_fragment = upstream_status
+        .map(|status| format!("; upstream_status=HTTP {status}"))
+        .unwrap_or_default();
+    let message = format!(
+        "{cause}\nCC Switch route context: provider={provider_name}; model={request_model}; endpoint={endpoint}{status_fragment}"
+    );
 
     error_obj.insert(
         "message".to_string(),
         Value::String(compact_error_message(&message, 1800)),
     );
 
-    if error_obj
-        .get("type")
-        .and_then(|value| value.as_str())
-        .map(|value| value.trim().is_empty())
-        .unwrap_or(true)
+    let is_upstream_error = matches!(error, ProxyError::UpstreamError { .. });
+    if !is_upstream_error
+        && error_obj
+            .get("type")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
     {
         error_obj.insert("type".to_string(), Value::String("proxy_error".to_string()));
     }
 
-    if super::quota_policy::QuotaPolicy::is_model_scoped_quota_error(error) {
-        error_obj.insert(
-            "type".to_string(),
-            Value::String("insufficient_quota".to_string()),
-        );
-        error_obj.insert(
-            "code".to_string(),
-            Value::String("model_quota_exhausted".to_string()),
-        );
-    }
-
-    if error_obj.get("code").map(Value::is_null).unwrap_or(true) {
+    if !is_upstream_error && error_obj.get("code").map(Value::is_null).unwrap_or(true) {
         error_obj.insert(
             "code".to_string(),
             Value::String(codex_proxy_error_code(error).to_string()),
@@ -3088,12 +3443,11 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
 }
 
 fn compact_error_message(message: &str, max_chars: usize) -> String {
-    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= max_chars {
-        return normalized;
+    if message.chars().count() <= max_chars {
+        return message.to_string();
     }
 
-    let truncated = normalized
+    let truncated = message
         .chars()
         .take(max_chars)
         .collect::<String>()
@@ -4444,7 +4798,11 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         let body = codex_proxy_error_json("DeepSeek", "deepseek-chat", "/responses", &error);
 
         let message = body["error"]["message"].as_str().unwrap();
-        assert!(message.contains("CC Switch local proxy failed"));
+        assert!(
+            message.find("dns lookup failed").unwrap()
+                < message.find("CC Switch route context:").unwrap()
+        );
+        assert!(message.contains("CC Switch route context:"));
         assert!(message.contains("DeepSeek"));
         assert!(message.contains("deepseek-chat"));
         assert!(message.contains("/responses"));
@@ -4466,7 +4824,7 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         let body = codex_proxy_error_json("MiniMax", "abab6.5s", "/responses", &error);
 
         let message = body["error"]["message"].as_str().unwrap();
-        assert!(message.contains("upstream_status: HTTP 502"));
+        assert!(message.contains("upstream_status=HTTP 502"));
         assert!(message.contains("upstream gateway failed"));
         assert_eq!(body["error"]["code"], 2013);
         assert_eq!(body["error"]["upstream_status"], 502);
@@ -4497,11 +4855,39 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         assert_eq!(codex_proxy_response_status(&provider, &error), 400);
         let body = codex_proxy_error_json("weikuwu", "GLM-5.2p", "/responses", &error);
         let message = body["error"]["message"].as_str().unwrap();
-        assert!(message.contains("quota exhausted"));
-        assert!(message.contains("額度不足"));
+        assert!(message.starts_with("Weekly/Monthly Limit Exhausted"));
         assert!(message.contains("Weekly/Monthly Limit Exhausted"));
-        assert_eq!(body["error"]["code"], "model_quota_exhausted");
+        assert!(!message.contains("quota exhausted ("));
+        assert_eq!(body["error"]["type"], "throttling_error");
+        assert_eq!(body["error"]["code"], "429");
         assert_eq!(body["error"]["upstream_status"], 429);
+    }
+
+    #[test]
+    fn codex_proxy_preserves_http_400_chinese_quota_detail() {
+        let provider = Provider::with_id(
+            "weikuwu".to_string(),
+            "weikuwu".to_string(),
+            serde_json::json!({}),
+            None,
+        );
+        let error = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(
+                serde_json::json!({"error":{"message":"当前codeplan或资源包订阅，所剩配额不足～. Received Model Group=GLM-5.2"}})
+                    .to_string(),
+            ),
+        };
+
+        assert_eq!(codex_proxy_response_status(&provider, &error), 400);
+        let body = codex_proxy_error_json("weikuwu", "GLM-5.2", "/responses", &error);
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("当前codeplan或资源包订阅，所剩配额不足～"));
+        assert!(message.contains("配额不足"));
+        assert!(!message.contains("quota insufficient for this request"));
+        assert!(message.contains("upstream_status=HTTP 400"));
+        assert_eq!(body["error"]["code"], serde_json::Value::Null);
+        assert_eq!(body["error"]["upstream_status"], 400);
     }
 
     #[test]
@@ -4520,19 +4906,43 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         let body = codex_proxy_error_json("HCAI", "gpt-5.5", "/responses", &error);
 
         let message = body["error"]["message"].as_str().unwrap();
-        // 不再误导成「本地代理失败」
+        // Upstream text stays authoritative and appears before route metadata.
         assert!(!message.contains("CC Switch local proxy failed"));
-        // 明确指向上游 + 体积超限 + 可操作指引
         assert!(message.contains("413"));
-        assert!(message.to_lowercase().contains("upstream"));
-        assert!(message.contains("/compact"));
-        // 关键：不把整段 nginx HTML 回显给用户
-        assert!(!message.contains("<html>"));
-        assert!(!message.contains("nginx/1.29.6"));
+        assert!(message.contains("<html>"));
+        assert!(message.contains("nginx/1.29.6"));
+        assert!(message.contains("CC Switch route context:"));
+        assert!(
+            message.find("<html>").unwrap() < message.find("CC Switch route context:").unwrap(),
+            "raw upstream body must precede CC Switch metadata"
+        );
         // 结构化字段仍然保留，便于程序化消费 / UI 呈现
         assert_eq!(body["error"]["upstream_status"], 413);
         assert_eq!(body["error"]["provider"], "HCAI");
         assert_eq!(body["error"]["model"], "gpt-5.5");
         assert_eq!(body["error"]["endpoint"], "/responses");
+    }
+
+    #[test]
+    fn codex_proxy_does_not_relabel_too_many_requests_as_quota_exhaustion() {
+        let error = ProxyError::UpstreamError {
+            status: 429,
+            body: Some(
+                serde_json::json!({"error": {
+                    "message": "Too many requests. Please retry after 2 seconds.",
+                    "type": "rate_limit_error",
+                    "code": "rate_limit_exceeded"
+                }})
+                .to_string(),
+            ),
+        };
+        let body = codex_proxy_error_json("example", "model-a", "/responses", &error);
+        let message = body["error"]["message"].as_str().unwrap();
+
+        assert!(message.starts_with("Too many requests. Please retry after 2 seconds."));
+        assert!(!message.to_ascii_lowercase().contains("quota exhausted"));
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+        assert_eq!(body["error"]["upstream_status"], 429);
     }
 }

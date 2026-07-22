@@ -903,6 +903,10 @@ experimental_bearer_token = "sk-live-secret"
 model_catalog_json = "cc-switch-model-catalog.json"
 web_search = "disabled"
 
+[windows]
+sandbox = "elevated"
+terminal = "powershell"
+
 [model_providers.azure]
 name = "Azure OpenAI"
 base_url = "https://azure.example/v1"
@@ -959,6 +963,14 @@ command = "legacy-cmd"
         assert!(
             !extracted.contains("model_catalog_json"),
             "should strip catalog projection pointer, got: {extracted}"
+        );
+        assert!(
+            !extracted.contains("sandbox = \"elevated\""),
+            "device-local Windows sandbox mode must not be shared, got: {extracted}"
+        );
+        assert!(
+            extracted.contains("terminal = \"powershell\""),
+            "unrelated Windows preferences should survive, got: {extracted}"
         );
         assert!(
             !extracted.contains("web_search"),
@@ -3225,6 +3237,20 @@ impl ProviderService {
         root.remove("experimental_bearer_token");
         // - model_catalog_json 指向按供应商生成的 catalog 投影文件（DB 为 SSOT）。
         root.remove("model_catalog_json");
+        // Windows sandbox provisioning is device-local. Sharing an elevated
+        // selection can force a new PC into runtime onboarding before its
+        // runtime is installed and disable the limited-access fallback.
+        let mut remove_windows_table = false;
+        if let Some(windows) = root
+            .get_mut("windows")
+            .and_then(|item| item.as_table_like_mut())
+        {
+            windows.remove("sandbox");
+            remove_windows_table = windows.is_empty();
+        }
+        if remove_windows_table {
+            root.remove("windows");
+        }
         // - web_search 只剥 cc-switch 注入的 "disabled" 哨兵；用户手设的其它值
         //   属于可共享偏好，保留。
         if root
