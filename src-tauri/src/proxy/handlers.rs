@@ -38,7 +38,7 @@ use super::{
             create_responses_sse_stream_from_anthropic_with_context,
             responses_sse_events_from_anthropic_message,
         },
-        streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
+        streaming_codex_chat::create_responses_sse_stream_from_chat_with_context_and_reasoning_visibility,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_responses::create_anthropic_sse_stream_from_responses,
         transform, transform_codex_anthropic, transform_codex_chat, transform_gemini,
@@ -2742,7 +2742,12 @@ async fn handle_codex_chat_to_responses_transform(
 
     if is_stream || response.is_sse() {
         let stream = response.bytes_stream();
-        let sse_stream = create_responses_sse_stream_from_chat_with_context(stream, tool_context);
+        let sse_stream =
+            create_responses_sse_stream_from_chat_with_context_and_reasoning_visibility(
+                stream,
+                tool_context,
+                false,
+            );
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
 
         let usage_collector = if usage_logging_enabled(state) {

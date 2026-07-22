@@ -154,6 +154,73 @@ pub struct RequestForwarder {
 }
 
 impl RequestForwarder {
+    fn codex_tool_result_retry_should_trigger(
+        app_type: &AppType,
+        provider: &Provider,
+        endpoint: &str,
+        provider_body: &Value,
+        error: &ProxyError,
+    ) -> bool {
+        if !matches!(app_type, AppType::Codex | AppType::GrokBuild)
+            || !super::providers::should_convert_codex_responses_to_chat(provider, endpoint)
+        {
+            return false;
+        }
+
+        let ProxyError::UpstreamError {
+            status: 400,
+            body: Some(error_body),
+        } = error
+        else {
+            return false;
+        };
+        if !error_body
+            .to_ascii_lowercase()
+            .contains("messages parameter is illegal")
+        {
+            return false;
+        }
+
+        let last_item = match provider_body.get("input") {
+            Some(Value::Array(items)) => items.last(),
+            Some(Value::Object(_)) => provider_body.get("input"),
+            _ => None,
+        };
+        last_item
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|item_type| {
+                matches!(
+                    item_type,
+                    "function_call_output" | "custom_tool_call_output" | "tool_search_output"
+                )
+            })
+    }
+
+    fn append_codex_tool_result_continuation(body: &mut Value) -> bool {
+        let Some(input) = body.get_mut("input") else {
+            return false;
+        };
+        let continuation = serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": "Continue using the tool result above."
+            }]
+        });
+
+        match input {
+            Value::Array(items) => items.push(continuation),
+            Value::Object(_) => {
+                let original = std::mem::take(input);
+                *input = Value::Array(vec![original, continuation]);
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// 预防式 media 降级：发送前对 text-only 模型把图片块替换为标记。
     ///
     /// 受 `enabled && request_media_fallback` 管辖；其中"启发式模型名单预测"
@@ -581,6 +648,36 @@ impl RequestForwarder {
                     }
                     Ok(false) => {}
                     Err(error) => forward_result = Err(error),
+                }
+            }
+
+            if forward_result.as_ref().is_err_and(|error| {
+                Self::codex_tool_result_retry_should_trigger(
+                    app_type,
+                    provider,
+                    endpoint,
+                    &provider_body,
+                    error,
+                )
+            }) {
+                let mut continuation_body = provider_body.clone();
+                if Self::append_codex_tool_result_continuation(&mut continuation_body) {
+                    log::warn!(
+                        "[{app_type_str}] upstream rejected a Chat tool-result tail; retrying provider={} with a minimal continuation message",
+                        provider.id
+                    );
+                    forward_result = self
+                        .forward(
+                            app_type,
+                            &method,
+                            provider,
+                            endpoint,
+                            &continuation_body,
+                            &headers,
+                            &extensions,
+                            adapter.as_ref(),
+                        )
+                        .await;
                 }
             }
 
@@ -5226,5 +5323,68 @@ mod tests {
         });
         let body = body_with_image("any-model");
         assert!(fwd.media_retry_should_trigger("Claude", false, &body, &image_unsupported_error()));
+    }
+
+    #[test]
+    fn codex_chat_tool_result_illegal_messages_error_triggers_continuation_retry() {
+        let mut provider = test_provider_with_type(None);
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..Default::default()
+        });
+        let mut body = json!({
+            "model": "GLM-5.2",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok"
+            }]
+        });
+        let error = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(
+                r#"{"error":{"message":"The messages parameter is illegal. Please check the documentation."}}"#
+                    .to_string(),
+            ),
+        };
+
+        assert!(RequestForwarder::codex_tool_result_retry_should_trigger(
+            &AppType::Codex,
+            &provider,
+            "/responses",
+            &body,
+            &error,
+        ));
+        assert!(RequestForwarder::append_codex_tool_result_continuation(
+            &mut body
+        ));
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[1]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn codex_chat_tool_result_retry_ignores_unrelated_bad_requests() {
+        let mut provider = test_provider_with_type(None);
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..Default::default()
+        });
+        let body = json!({
+            "input": [{"type": "function_call_output", "call_id": "call_1", "output": "ok"}]
+        });
+        let error = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(r#"{"error":{"message":"invalid model"}}"#.to_string()),
+        };
+
+        assert!(!RequestForwarder::codex_tool_result_retry_should_trigger(
+            &AppType::Codex,
+            &provider,
+            "/responses",
+            &body,
+            &error,
+        ));
     }
 }
