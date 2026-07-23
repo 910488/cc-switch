@@ -1539,6 +1539,9 @@ pub fn run() {
             commands::enter_lightweight_mode,
             commands::exit_lightweight_mode,
             commands::is_lightweight_mode,
+            // Grok CLI proxy commands
+            commands::refresh_grok_cli_auth,
+            commands::open_grok_login,
         ]);
 
     let app = builder

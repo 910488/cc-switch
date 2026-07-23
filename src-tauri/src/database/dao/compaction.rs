@@ -387,6 +387,33 @@ impl Database {
             .map_err(|e| AppError::Database(format!("解析 compaction task state 失败: {e}")))
     }
 
+    pub(crate) fn compaction_task_state_row_by_compaction_id(
+        &self,
+        compaction_id: &str,
+    ) -> Result<Option<TaskStateRow>, AppError> {
+        let conn = lock_conn!(self.conn);
+        conn.query_row(
+            "SELECT thread_id, session_id, state_blob
+             FROM compaction_task_states
+             WHERE compaction_id = ?1
+             LIMIT 1",
+            [compaction_id],
+            |row| {
+                Ok(TaskStateRow {
+                    thread_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    state_blob: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| {
+            AppError::Database(format!(
+                "failed to read compaction task state for {compaction_id}: {e}"
+            ))
+        })
+    }
+
     pub(crate) fn compaction_counts(&self) -> Result<CompactionCounts, AppError> {
         let conn = lock_conn!(self.conn);
         let count = |table: &str| -> Result<i64, AppError> {

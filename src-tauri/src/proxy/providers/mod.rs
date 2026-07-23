@@ -24,6 +24,8 @@ pub mod copilot_model_map;
 mod gemini;
 pub(crate) mod gemini_schema;
 pub mod gemini_shadow;
+pub mod grok_cli_proxy;
+pub(crate) mod grok_credential_broker;
 pub mod models;
 pub(crate) mod reasoning_bridge;
 pub mod streaming;
@@ -60,6 +62,15 @@ pub use codex::{
 };
 pub use gemini::GeminiAdapter;
 
+pub use grok_cli_proxy::{
+    build_grok_identity_headers, next_grok_turn_idx, GrokCliProxyAdapter,
+    GROK_CLI_PROXY_PROVIDER_TYPE,
+};
+#[allow(unused_imports)]
+pub use grok_credential_broker::{
+    GrokAuthMode, GrokCliProxyConfig, GrokCredential, GrokCredentialBroker,
+};
+
 /// 供应商类型枚举
 ///
 /// 区分不同供应商的具体实现方式，决定认证和请求处理逻辑。
@@ -83,6 +94,8 @@ pub enum ProviderType {
     GitHubCopilot,
     /// OpenAI Codex (ChatGPT Plus/Pro OAuth，需要 Anthropic ↔ Responses API 转换)
     CodexOAuth,
+    /// Grok CLI chat proxy (local session or API key, Responses → Responses)
+    GrokCliProxy,
 }
 
 impl ProviderType {
@@ -113,6 +126,7 @@ impl ProviderType {
             ProviderType::OpenRouter => "https://openrouter.ai/api",
             ProviderType::GitHubCopilot => "https://api.githubcopilot.com",
             ProviderType::CodexOAuth => CHATGPT_CODEX_BASE_URL,
+            ProviderType::GrokCliProxy => "https://cli-chat-proxy.grok.com",
         }
     }
 
@@ -175,7 +189,17 @@ impl ProviderType {
                 }
                 ProviderType::Claude
             }
-            AppType::Codex => ProviderType::Codex,
+            AppType::Codex => {
+                if provider
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.provider_type.as_deref())
+                    == Some(GROK_CLI_PROXY_PROVIDER_TYPE)
+                {
+                    return ProviderType::GrokCliProxy;
+                }
+                ProviderType::Codex
+            }
             AppType::Gemini => {
                 // 检测是否为 CLI 模式（OAuth）
                 let adapter = GeminiAdapter::new();
@@ -208,6 +232,7 @@ impl ProviderType {
             ProviderType::OpenRouter => "openrouter",
             ProviderType::GitHubCopilot => "github_copilot",
             ProviderType::CodexOAuth => "codex_oauth",
+            ProviderType::GrokCliProxy => GROK_CLI_PROXY_PROVIDER_TYPE,
         }
     }
 }
@@ -233,6 +258,9 @@ impl std::str::FromStr for ProviderType {
                 Ok(ProviderType::GitHubCopilot)
             }
             "codex_oauth" | "codex-oauth" | "codexoauth" => Ok(ProviderType::CodexOAuth),
+            GROK_CLI_PROXY_PROVIDER_TYPE | "grok-cli-proxy" | "grokliproxy" => {
+                Ok(ProviderType::GrokCliProxy)
+            }
             _ => Err(format!("Invalid provider type: {s}")),
         }
     }
@@ -242,7 +270,7 @@ impl std::str::FromStr for ProviderType {
 pub fn get_adapter(app_type: &AppType) -> Box<dyn ProviderAdapter> {
     match app_type {
         AppType::Claude | AppType::ClaudeDesktop => Box::new(ClaudeAdapter::new()),
-        AppType::Codex => Box::new(CodexAdapter::new()),
+        AppType::Codex => Box::new(GrokCliProxyAdapter::new()),
         AppType::Gemini => Box::new(GeminiAdapter::new()),
         AppType::GrokBuild => Box::new(CodexAdapter::new()),
         AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => Box::new(CodexAdapter::new()),
@@ -259,6 +287,7 @@ pub fn get_adapter_for_provider_type(provider_type: &ProviderType) -> Box<dyn Pr
         | ProviderType::GitHubCopilot
         | ProviderType::CodexOAuth => Box::new(ClaudeAdapter::new()),
         ProviderType::Codex => Box::new(CodexAdapter::new()),
+        ProviderType::GrokCliProxy => Box::new(GrokCliProxyAdapter::new()),
         ProviderType::Gemini | ProviderType::GeminiCli => Box::new(GeminiAdapter::new()),
     }
 }

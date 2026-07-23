@@ -616,10 +616,13 @@ mod continuity_e2e_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn official_responses_websocket_is_relayed_end_to_end() {
+    async fn official_responses_websocket_retokenizes_bridge_for_remote_compaction_v2() {
+        use crate::proxy::compaction::{CompactionContext, MaterializationTarget, ProviderRealm};
+        use crate::proxy::model_routes::{self, CatalogModelInput, ModelRoute, ModelRouteSettings};
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
         let _environment = TestEnvironment::new();
+        let (chat_url, captured_chat, chat_shutdown, chat_task) = start_mock_chat_upstream().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = listener.local_addr().unwrap();
         std::env::set_var(
@@ -644,15 +647,63 @@ mod continuity_e2e_tests {
             )
             .await
             .unwrap();
-            let first = socket.next().await.unwrap().unwrap();
-            let text = first.into_text().unwrap();
-            let body: Value = serde_json::from_str(text.as_ref()).unwrap();
-            assert_eq!(body["type"], "response.create");
+
+            let first = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let first: Value = serde_json::from_str(first.as_ref()).unwrap();
+            assert_eq!(first["type"], "response.create");
+            assert_eq!(first["generate"], false);
             socket
                 .send(tokio_tungstenite::tungstenite::Message::Text(
                     json!({
                         "type":"response.completed",
                         "response":{"id":"resp-official-ws","status":"completed","output":[]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let compact = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let compact: Value = serde_json::from_str(compact.as_ref()).unwrap();
+            assert_eq!(compact["type"], "response.create");
+            assert_eq!(compact["generate"], true);
+            assert_eq!(compact["input"][0]["id"], "cmp-native-ws");
+            assert_eq!(compact["input"][0]["encrypted_content"], "opaque-native-ws");
+            assert_eq!(compact["input"][1]["type"], "compaction_trigger");
+            assert!(
+                !compact.to_string().contains("bcmp1."),
+                "CC Switch bridge ciphertext must never reach OpenAI"
+            );
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{
+                            "id":"resp-remote-compact",
+                            "status":"completed",
+                            "output":[{
+                                "id":"cmp-remote-result",
+                                "type":"compaction",
+                                "encrypted_content":"opaque-remote-result"
+                            }]
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            // The native socket must remain usable after compact completion.
+            let follow_up = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let follow_up: Value = serde_json::from_str(follow_up.as_ref()).unwrap();
+            assert_eq!(follow_up["input"][0]["content"], "still connected");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":"resp-follow-up","status":"completed","output":[]}
                     })
                     .to_string()
                     .into(),
@@ -671,6 +722,459 @@ mod continuity_e2e_tests {
         );
         provider.category = Some("official".to_string());
         db.save_provider("codex", &provider).unwrap();
+        let third_party = crate::provider::Provider::with_id(
+            "compact-ws-chat".to_string(),
+            "Compact WS Chat".to_string(),
+            json!({
+                "base_url":chat_url,
+                "api_format":"openai_chat",
+                "auth":{"OPENAI_API_KEY":"compact-ws-key"}
+            }),
+            None,
+        );
+        db.save_provider("codex", &third_party).unwrap();
+        model_routes::save(
+            &db,
+            &ModelRouteSettings {
+                official_models: vec![CatalogModelInput {
+                    model: "gpt-native".to_string(),
+                    display_name: Some("GPT Native".to_string()),
+                    ..Default::default()
+                }],
+                routes: vec![ModelRoute {
+                    alias: "ccs-compact-0-third-model".to_string(),
+                    provider_id: third_party.id.clone(),
+                    upstream_model: "third-model".to_string(),
+                    display_name: "[Compact] Third Model".to_string(),
+                    context_window: Some(64_000),
+                }],
+            },
+        )
+        .unwrap();
+        select_codex_provider(&db, crate::database::CODEX_OFFICIAL_PROVIDER_ID);
+        let server = ProxyServer::new(test_proxy_config(), db, None);
+
+        let continuity_context = CompactionContext {
+            thread_id: "ws-compact-thread".to_string(),
+            session_id: "ws-compact-session".to_string(),
+            request_id: "ws-compact-seed".to_string(),
+        };
+        let source = json!({
+            "model":"gpt-native",
+            "input":[{"type":"message","role":"user","content":"canonical history"}]
+        });
+        let snapshot = server
+            .state
+            .compaction_service
+            .save_snapshot(&continuity_context, &source, ProviderRealm::Bridge)
+            .unwrap();
+        let bridge_item = server
+            .state
+            .compaction_service
+            .create_bridge_compaction(
+                &continuity_context,
+                &snapshot,
+                "test-bridge-provider",
+                "canonical history summary",
+            )
+            .unwrap();
+        let compact_request = json!({
+            "model":"gpt-native",
+            "stream":true,
+            "input":[bridge_item.clone(),{"type":"compaction_trigger"}]
+        });
+        let target = MaterializationTarget {
+            provider_id: crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            model: "gpt-native".to_string(),
+            realm: ProviderRealm::Official,
+            realm_key: format!("native:{}", crate::database::CODEX_OFFICIAL_PROVIDER_ID),
+        };
+        let plan = server
+            .state
+            .compaction_service
+            .prepare_official_recompact(&compact_request, &target)
+            .unwrap()
+            .expect("bridge request needs official re-compaction");
+        server
+            .state
+            .compaction_service
+            .finish_official_recompact(
+                &continuity_context,
+                &plan,
+                &target,
+                &json!({
+                    "id":"cmp-native-ws",
+                    "type":"compaction",
+                    "encrypted_content":"opaque-native-ws"
+                }),
+            )
+            .unwrap();
+
+        let info = server.start().await.unwrap();
+        let mut request = format!("ws://127.0.0.1:{}/v1/responses", info.port)
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer test-official-token"),
+        );
+        request.headers_mut().insert(
+            http::HeaderName::from_static("thread-id"),
+            http::HeaderValue::from_static("ws-compact-thread"),
+        );
+        request.headers_mut().insert(
+            http::HeaderName::from_static("session-id"),
+            http::HeaderValue::from_static("ws-compact-session"),
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"gpt-native",
+                    "generate":false
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let prewarm = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let prewarm: Value = serde_json::from_str(prewarm.as_ref()).unwrap();
+        assert_eq!(prewarm["response"]["id"], "resp-official-ws");
+
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"gpt-native",
+                    "generate":true,
+                    "stream":true,
+                    "input":[bridge_item,{"type":"compaction_trigger"}]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let compact = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let compact: Value = serde_json::from_str(compact.as_ref()).unwrap();
+        let output = compact["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "compaction");
+        let compact_item = output[0].clone();
+
+        // Reproduce the production transition: the native compaction token
+        // returned over the official WebSocket must resolve through the durable
+        // journal when the next turn selects a third-party Chat model.
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"ccs-compact-0-third-model",
+                    "generate":true,
+                    "stream":true,
+                    "input":[
+                        compact_item,
+                        {"type":"message","role":"user","content":"THIRD_PARTY_AFTER_OFFICIAL_COMPACT"}
+                    ]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let third_party_completed =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while let Some(message) = socket.next().await {
+                    let message = message.unwrap();
+                    if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                        let event: Value = serde_json::from_str(text.as_ref()).unwrap();
+                        if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                            return event;
+                        }
+                    }
+                }
+                panic!("socket closed before third-party compact continuation completed");
+            })
+            .await
+            .expect("third-party compact continuation timeout");
+        let third_party_response_id = third_party_completed
+            .pointer("/response/id")
+            .and_then(Value::as_str)
+            .expect("third-party response id")
+            .to_string();
+        let chat_wire = captured_chat
+            .lock()
+            .unwrap()
+            .last()
+            .expect("third-party continuation request")
+            .to_string();
+        assert!(chat_wire.contains("canonical history"));
+        assert!(chat_wire.contains("THIRD_PARTY_AFTER_OFFICIAL_COMPACT"));
+        assert!(!chat_wire.contains("opaque-remote-result"));
+
+        // The Chat bridge records the original Responses exchange so it can
+        // hydrate a later previous_response_id. That cached exchange still
+        // contains the native compaction item. It must be materialized again
+        // after history hydration, not allowed to reach the Chat transform.
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"ccs-compact-0-third-model",
+                    "generate":true,
+                    "stream":true,
+                    "previous_response_id":third_party_response_id,
+                    "input":[
+                        {"type":"message","role":"user","content":"FOLLOW_UP_AFTER_CHAT_HISTORY_HYDRATION"}
+                    ]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(message) = socket.next().await {
+                let message = message.unwrap();
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    let event: Value = serde_json::from_str(text.as_ref()).unwrap();
+                    if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                        return;
+                    }
+                }
+            }
+            panic!("socket closed before hydrated third-party continuation completed");
+        })
+        .await
+        .expect("hydrated third-party continuation timeout");
+        let hydrated_chat_wire = captured_chat
+            .lock()
+            .unwrap()
+            .last()
+            .expect("hydrated third-party continuation request")
+            .to_string();
+        assert!(hydrated_chat_wire.contains("canonical history"));
+        assert!(hydrated_chat_wire.contains("FOLLOW_UP_AFTER_CHAT_HISTORY_HYDRATION"));
+        assert!(!hydrated_chat_wire.contains("\"type\":\"compaction\""));
+        assert!(!hydrated_chat_wire.contains("opaque-remote-result"));
+
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"gpt-native",
+                    "generate":true,
+                    "stream":true,
+                    "input":[{"type":"message","role":"user","content":"still connected"}]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let follow_up = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let follow_up: Value = serde_json::from_str(follow_up.as_ref()).unwrap();
+        assert_eq!(follow_up["response"]["id"], "resp-follow-up");
+
+        let _ = socket.close(None).await;
+        server.stop().await.unwrap();
+        upstream_task.await.unwrap();
+        let _ = chat_shutdown.send(());
+        chat_task.await.unwrap();
+        std::env::remove_var("CC_SWITCH_TEST_OFFICIAL_WS_URL");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn legacy_unjournaled_official_compaction_recovers_from_codex_session() {
+        use crate::proxy::compaction::{
+            CompactionContext, CompactionService, MaterializationTarget, ProviderRealm,
+        };
+
+        let environment = TestEnvironment::new();
+        let db = Arc::new(Database::init().expect("legacy recovery database"));
+        let service = CompactionService::new(db);
+        let session_id = "legacy-session-019f";
+        let sessions = environment
+            ._home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("23");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let native_item = json!({
+            "id":"cmp-legacy-session",
+            "type":"compaction",
+            "encrypted_content":"opaque-legacy-session"
+        });
+        let record = json!({
+            "timestamp":"2026-07-23T08:02:07.229Z",
+            "type":"compacted",
+            "payload":{
+                "replacement_history":[
+                    {"type":"message","role":"user","content":"RECOVERED_CANONICAL_HISTORY"},
+                    native_item.clone()
+                ]
+            }
+        });
+        std::fs::write(
+            sessions.join(format!("rollout-{session_id}.jsonl")),
+            format!("{}\n", record),
+        )
+        .unwrap();
+
+        let context = CompactionContext {
+            thread_id: "legacy-thread".to_string(),
+            session_id: session_id.to_string(),
+            request_id: "legacy-request".to_string(),
+        };
+        let body = json!({
+            "model":"third-model",
+            "input":[
+                native_item,
+                {"type":"message","role":"user","content":"LEGACY_SUFFIX"}
+            ]
+        });
+        assert_eq!(
+            service
+                .recover_native_compactions_from_codex_session(
+                    &context,
+                    &body,
+                    crate::database::CODEX_OFFICIAL_PROVIDER_ID,
+                )
+                .unwrap(),
+            1
+        );
+        let materialized = service
+            .materialize_for_target(
+                &body,
+                &MaterializationTarget {
+                    provider_id: "third-provider".to_string(),
+                    model: "third-model".to_string(),
+                    realm: ProviderRealm::Bridge,
+                    realm_key: "bridge".to_string(),
+                },
+            )
+            .unwrap();
+        let wire = materialized.body.to_string();
+        assert!(wire.contains("RECOVERED_CANONICAL_HISTORY"));
+        assert!(wire.contains("LEGACY_SUFFIX"));
+        assert!(!wire.contains("opaque-legacy-session"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn official_websocket_routes_later_third_party_model_and_can_switch_back() {
+        use crate::proxy::model_routes::{self, CatalogModelInput, ModelRoute, ModelRouteSettings};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let _environment = TestEnvironment::new();
+        let (chat_url, captured_chat, chat_shutdown, chat_task) = start_mock_chat_upstream().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        std::env::set_var(
+            "CC_SWITCH_TEST_OFFICIAL_WS_URL",
+            format!("ws://{upstream_addr}/responses"),
+        );
+        let official_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let prewarm = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let prewarm: Value = serde_json::from_str(prewarm.as_ref()).unwrap();
+            assert_eq!(prewarm["model"], "gpt-native");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":"resp-route-prewarm","status":"completed","output":[]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            // The ccs-* request must be handled by the HTTP Chat bridge and
+            // must not appear here. The next native message is the explicit
+            // switch back to the official model.
+            let switched_back = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let switched_back: Value = serde_json::from_str(switched_back.as_ref()).unwrap();
+            assert_eq!(switched_back["model"], "gpt-native");
+            assert_eq!(switched_back["input"][0]["content"], "back to official");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":"resp-route-official","status":"completed","output":[]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = socket.close(None).await;
+        });
+
+        let db = Arc::new(Database::init().expect("dynamic websocket route database"));
+        let mut official = crate::provider::Provider::with_id(
+            crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            "OpenAI Official".to_string(),
+            json!({"auth":{},"config":""}),
+            None,
+        );
+        official.category = Some("official".to_string());
+        db.save_provider("codex", &official).unwrap();
+        let third_party = crate::provider::Provider::with_id(
+            "dynamic-ws-chat".to_string(),
+            "Dynamic WS Chat".to_string(),
+            json!({
+                "base_url":chat_url,
+                "api_format":"openai_chat",
+                "auth":{"OPENAI_API_KEY":"dynamic-ws-key"}
+            }),
+            None,
+        );
+        db.save_provider("codex", &third_party).unwrap();
+        model_routes::save(
+            &db,
+            &ModelRouteSettings {
+                official_models: vec![CatalogModelInput {
+                    model: "gpt-native".to_string(),
+                    display_name: Some("GPT Native".to_string()),
+                    ..Default::default()
+                }],
+                routes: vec![ModelRoute {
+                    alias: "ccs-dynamic-0-third-model".to_string(),
+                    provider_id: third_party.id.clone(),
+                    upstream_model: "third-model".to_string(),
+                    display_name: "[Dynamic] Third Model".to_string(),
+                    context_window: Some(64_000),
+                }],
+            },
+        )
+        .unwrap();
         select_codex_provider(&db, crate::database::CODEX_OFFICIAL_PROVIDER_ID);
         let server = ProxyServer::new(test_proxy_config(), db, None);
         let info = server.start().await.unwrap();
@@ -695,20 +1199,78 @@ mod continuity_e2e_tests {
             ))
             .await
             .unwrap();
-        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"ccs-dynamic-0-third-model",
+                    "generate":true,
+                    "stream":true,
+                    "input":[{"type":"message","role":"user","content":"use third party"}]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let third_party_completed =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while let Some(message) = socket.next().await {
+                    let message = message.unwrap();
+                    if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                        let event: Value = serde_json::from_str(text.as_ref()).unwrap();
+                        if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                            return event;
+                        }
+                    }
+                }
+                panic!("socket closed before third-party response.completed");
+            })
+            .await
+            .expect("third-party websocket bridge timeout");
+        assert_eq!(third_party_completed["type"], "response.completed");
+
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"gpt-native",
+                    "generate":true,
+                    "stream":true,
+                    "input":[{"type":"message","role":"user","content":"back to official"}]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let official = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap()
             .into_text()
             .unwrap();
-        let completed: Value = serde_json::from_str(completed.as_ref()).unwrap();
-        assert_eq!(completed["type"], "response.completed");
-        assert_eq!(completed["response"]["id"], "resp-official-ws");
+        let official: Value = serde_json::from_str(official.as_ref()).unwrap();
+        assert_eq!(official["response"]["id"], "resp-route-official");
+
+        let captured = captured_chat.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["model"], "third-model");
+        assert!(captured[0].to_string().contains("use third party"));
+        drop(captured);
 
         let _ = socket.close(None).await;
         server.stop().await.unwrap();
-        upstream_task.await.unwrap();
+        official_task.await.unwrap();
+        let _ = chat_shutdown.send(());
+        chat_task.await.unwrap();
         std::env::remove_var("CC_SWITCH_TEST_OFFICIAL_WS_URL");
     }
 

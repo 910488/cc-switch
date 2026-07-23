@@ -658,7 +658,8 @@ export function ProxyPanel({
                               </span>
                               <span>
                                 reduction{" "}
-                                {task.inputTokensBefore > 0
+                                {task.summaryCreated &&
+                                task.inputTokensBefore > 0
                                   ? `${Math.max(
                                       0,
                                       100 -

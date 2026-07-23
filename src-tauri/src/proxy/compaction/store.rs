@@ -334,6 +334,29 @@ impl CompactionStore {
             .collect()
     }
 
+    pub(crate) fn mark_resume_verified(&self, compaction_id: &str) -> Result<bool, AppError> {
+        let Some(row) = self
+            .db
+            .compaction_task_state_row_by_compaction_id(compaction_id)?
+        else {
+            return Ok(false);
+        };
+        let aad = format!("{}:{}", row.thread_id, row.session_id);
+        let plaintext = self.cipher.open(&row.state_blob, aad.as_bytes())?;
+        let mut state: CompactionTaskState = serde_json::from_slice(&plaintext)
+            .map_err(|e| AppError::Message(format!("invalid compaction task state JSON: {e}")))?;
+        if state.compaction_id.as_deref() != Some(compaction_id) {
+            return Ok(false);
+        }
+        state.state = "success".to_string();
+        state.phase = "resume_verified".to_string();
+        state.resume_verified = true;
+        state.error_code = None;
+        state.updated_at = now_iso();
+        self.save_task_state(&state)?;
+        Ok(true)
+    }
+
     pub(crate) fn make_envelope(
         &self,
         compaction_id: &str,
@@ -520,6 +543,11 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+        assert!(store.mark_resume_verified("cmp-a").unwrap());
+        let verified = store.recent_task_states(8).unwrap().remove(0);
+        assert_eq!(verified.state, "success");
+        assert_eq!(verified.phase, "resume_verified");
+        assert!(verified.resume_verified);
 
         assert_eq!(
             store.get_snapshot(&first.id).unwrap().unwrap().payload["input"],

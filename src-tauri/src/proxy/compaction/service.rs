@@ -13,6 +13,8 @@ use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::io::BufRead;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(crate) const COMPACTION_SUMMARY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
@@ -196,6 +198,20 @@ impl CompactionService {
         limit: usize,
     ) -> Result<Vec<super::model::CompactionTaskState>, AppError> {
         self.store()?.recent_task_states(limit.clamp(1, 200))
+    }
+
+    pub(crate) fn mark_resume_verified(
+        &self,
+        compaction_ids: &[String],
+    ) -> Result<usize, AppError> {
+        let store = self.store()?;
+        let mut updated = 0usize;
+        for compaction_id in compaction_ids {
+            if store.mark_resume_verified(compaction_id)? {
+                updated += 1;
+            }
+        }
+        Ok(updated)
     }
 
     pub(crate) fn delete_thread(&self, thread_id: &str) -> Result<usize, AppError> {
@@ -552,6 +568,130 @@ impl CompactionService {
         )
     }
 
+    /// Upgrade recovery for compaction tokens produced by an older CC Switch
+    /// build that relayed the official WebSocket without journaling its compact
+    /// response. Codex persists the exact replacement_history locally; recover
+    /// only an exact id/ciphertext match and encrypt it into the normal journal.
+    pub(crate) fn recover_native_compactions_from_codex_session(
+        &self,
+        context: &CompactionContext,
+        body: &Value,
+        provider_id: &str,
+    ) -> Result<usize, AppError> {
+        let store = self.store()?;
+        let unknown = body
+            .get("input")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+            .filter_map(|item| {
+                let id = item.get("id").and_then(Value::as_str)?;
+                let encrypted = item.get("encrypted_content").and_then(Value::as_str)?;
+                if encrypted.starts_with(ENVELOPE_PREFIX) {
+                    return None;
+                }
+                match store.get_compaction(id) {
+                    Ok(None) => Some(Ok((id.to_string(), encrypted.to_string()))),
+                    Ok(Some(_)) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        if unknown.is_empty() {
+            return Ok(0);
+        }
+
+        let session_key = if !context.session_id.trim().is_empty()
+            && context.session_id != "unknown"
+            && context.session_id != "websocket"
+        {
+            context.session_id.trim()
+        } else {
+            context.thread_id.trim()
+        };
+        if session_key.is_empty() || session_key == "unknown" {
+            return Ok(0);
+        }
+        let sessions_root = crate::codex_config::get_codex_config_dir().join("sessions");
+        let mut candidates = Vec::new();
+        collect_matching_session_files(&sessions_root, session_key, &mut candidates);
+        candidates.sort_by_key(|path| {
+            std::fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        });
+        candidates.reverse();
+
+        let mut recovered = 0usize;
+        let mut remaining = unknown
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        for path in candidates {
+            let file = match std::fs::File::open(&path) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+            for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+                let Ok(record) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if record.get("type").and_then(Value::as_str) != Some("compacted") {
+                    continue;
+                }
+                let Some(history) = record
+                    .pointer("/payload/replacement_history")
+                    .and_then(Value::as_array)
+                else {
+                    continue;
+                };
+                let pending_ids = remaining.keys().cloned().collect::<Vec<_>>();
+                for id in pending_ids {
+                    let Some(index) = history.iter().position(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("compaction")
+                            && item.get("id").and_then(Value::as_str) == Some(id.as_str())
+                            && item.get("encrypted_content").and_then(Value::as_str)
+                                == remaining.get(&id).map(String::as_str)
+                    }) else {
+                        continue;
+                    };
+                    let item = history[index].clone();
+                    let canonical_prefix = history[..index]
+                        .iter()
+                        .filter(|entry| {
+                            entry.get("type").and_then(Value::as_str) != Some("compaction_trigger")
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if canonical_prefix.is_empty() {
+                        continue;
+                    }
+                    let mut recovered_body = body.clone();
+                    recovered_body["input"] = Value::Array(canonical_prefix);
+                    if let Some(object) = recovered_body.as_object_mut() {
+                        object.remove("previous_response_id");
+                        object.remove("client_metadata");
+                        object.remove("_cc_switch_model_override");
+                    }
+                    let snapshot =
+                        self.save_snapshot(context, &recovered_body, ProviderRealm::Official)?;
+                    self.register_native_compaction(context, &snapshot, provider_id, &item)?;
+                    remaining.remove(&id);
+                    recovered += 1;
+                    log::warn!(
+                        "[Compaction] recovered legacy official token {} from Codex session {}",
+                        id,
+                        path.display()
+                    );
+                }
+                if remaining.is_empty() {
+                    return Ok(recovered);
+                }
+            }
+        }
+        Ok(recovered)
+    }
+
     pub(crate) fn materialize_for_target(
         &self,
         body: &Value,
@@ -650,9 +790,14 @@ impl CompactionService {
             ));
         }
         compact_input.truncate(compact_input.len() - suffix.len());
-        // ChatGPT's native `/responses/compact` endpoint requires streaming.
-        // The handler buffers its SSE response and extracts the completed
-        // compaction item before resuming the original request.
+        // ChatGPT's native `/responses/compact` endpoint requires streaming,
+        // but does not accept transport-only WebSocket metadata. The durable
+        // thread/session identifiers have already been captured in the journal
+        // and request headers, so removing client_metadata does not lose
+        // continuity information.
+        if let Some(object) = compact_body.as_object_mut() {
+            object.remove("client_metadata");
+        }
         compact_body["stream"] = Value::Bool(true);
         let snapshot = store.get_snapshot(&envelope.snapshot_id)?.ok_or_else(|| {
             AppError::InvalidInput(format!(
@@ -810,13 +955,24 @@ impl CompactionService {
                         )));
                     }
                     output.clear();
-                    output.extend(self.materialize_snapshot(
+                    let materialized = self.materialize_snapshot(
                         store,
                         &envelope.snapshot_id,
                         target,
                         visited,
                         ids,
-                    )?);
+                    )?;
+                    if materialized.is_empty() {
+                        // Older bridge snapshots could contain only a
+                        // provider-local previous_response_id. They cannot be
+                        // replayed in the official realm, but the encrypted
+                        // bridge envelope still carries the durable summary.
+                        // Preserve that summary as canonical input instead of
+                        // sending an empty compact request or dropping context.
+                        output.push(summary_message(&envelope.summary));
+                    } else {
+                        output.extend(materialized);
+                    }
                 }
                 continue;
             }
@@ -917,20 +1073,24 @@ impl CompactionService {
 }
 
 fn is_bridge_summary_provider(provider: &Provider) -> bool {
+    if crate::proxy::providers::GrokCliProxyAdapter::is_grok_provider(provider) {
+        return true;
+    }
     let endpoint = "/responses/compact";
     crate::proxy::providers::should_convert_codex_responses_to_chat(provider, endpoint)
         || crate::proxy::providers::should_convert_codex_responses_to_anthropic(provider, endpoint)
 }
-
 fn summary_target_from_provider(provider: &Provider) -> CompactionSummaryTarget {
     let endpoint = "/responses/compact";
-    let protocol =
-        if crate::proxy::providers::should_convert_codex_responses_to_anthropic(provider, endpoint)
-        {
-            "anthropic"
-        } else {
-            "openai_chat"
-        };
+    let protocol = if crate::proxy::providers::GrokCliProxyAdapter::is_grok_provider(provider) {
+        "openai_responses"
+    } else if crate::proxy::providers::should_convert_codex_responses_to_anthropic(
+        provider, endpoint,
+    ) {
+        "anthropic"
+    } else {
+        "openai_chat"
+    };
     let default_model = crate::proxy::providers::codex_provider_upstream_model(provider);
     let mut models = Vec::new();
     let mut seen = HashSet::new();
@@ -967,6 +1127,25 @@ fn summary_target_from_provider(provider: &Provider) -> CompactionSummaryTarget 
 
 fn is_compaction_item(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("compaction")
+}
+
+fn collect_matching_session_files(root: &Path, needle: &str, output: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_matching_session_files(&path, needle, output);
+        } else if path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+            && path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.contains(needle))
+        {
+            output.push(path);
+        }
+    }
 }
 
 fn summary_message(summary: &str) -> Value {
@@ -1189,6 +1368,63 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("no canonical journal entry"));
+    }
+
+    #[test]
+    fn official_recompact_uses_bridge_summary_when_legacy_snapshot_input_is_empty() {
+        let service = service();
+        let context = CompactionContext {
+            thread_id: "thread-empty-snapshot".into(),
+            session_id: "session-empty-snapshot".into(),
+            request_id: "request-empty-snapshot".into(),
+        };
+        let snapshot = service
+            .save_snapshot(
+                &context,
+                &json!({
+                    "model":"bridge-model",
+                    "previous_response_id":"resp-provider-local",
+                    "client_metadata":{"thread_id":"transport-only"},
+                    "input":[]
+                }),
+                ProviderRealm::Bridge,
+            )
+            .unwrap();
+        let bridge = service
+            .create_bridge_compaction(
+                &context,
+                &snapshot,
+                "bridge-provider",
+                "DURABLE_BRIDGE_SUMMARY",
+            )
+            .unwrap();
+        let original = json!({
+            "model":"official-model",
+            "input":[
+                bridge,
+                {"type":"message","role":"user","content":"NEW_SUFFIX"}
+            ]
+        });
+        let target = MaterializationTarget {
+            provider_id: "official-provider".into(),
+            model: "official-model".into(),
+            realm: ProviderRealm::Official,
+            realm_key: "native:official-provider".into(),
+        };
+
+        let plan = service
+            .prepare_official_recompact(&original, &target)
+            .unwrap()
+            .expect("plan");
+        let compact_input = plan.compact_body["input"].as_array().unwrap();
+        assert_eq!(compact_input.len(), 1);
+        assert!(plan
+            .compact_body
+            .to_string()
+            .contains("DURABLE_BRIDGE_SUMMARY"));
+        assert!(!plan.compact_body.to_string().contains("NEW_SUFFIX"));
+        assert!(plan.fallback_body.to_string().contains("NEW_SUFFIX"));
+        assert!(plan.compact_body.get("client_metadata").is_none());
     }
 
     #[test]

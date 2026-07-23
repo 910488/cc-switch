@@ -14,7 +14,7 @@ use super::{
     provider_router::ProviderRouter,
     providers::{
         codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore, get_adapter,
-        AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
+        AuthInfo, AuthStrategy, GrokCliProxyAdapter, ProviderAdapter, ProviderType,
     },
     thinking_budget_rectifier::{rectify_thinking_budget, should_rectify_thinking_budget},
     thinking_rectifier::{
@@ -1351,6 +1351,11 @@ impl RequestForwarder {
         app_type: &AppType,
         provider: &Provider,
     ) -> Result<bool, ProxyError> {
+        if matches!(app_type, AppType::Codex) && GrokCliProxyAdapter::is_grok_provider(provider) {
+            GrokCliProxyAdapter::new().refresh_session(provider).await?;
+            return Ok(true);
+        }
+
         let is_managed_official = matches!(app_type, AppType::Codex)
             && super::providers::is_codex_official_provider(provider)
             && provider
@@ -1520,17 +1525,22 @@ impl RequestForwarder {
                 super::model_mapper::strip_one_m_suffix_for_upstream_from_body(mapped_body);
         }
 
+        let is_grok_cli_proxy =
+            GrokCliProxyAdapter::is_grok_provider(provider) && app_type == &AppType::Codex;
+        let mut materialized_compaction_ids = Vec::new();
+
         // Materialization is intentionally per provider attempt. A failover chain can
         // cross protocol/realm boundaries, so doing this once in the handler would let
         // an opaque token leak into a later Chat/Anthropic transform (which historically
         // dropped it silently). The canonical suffix remains in the outer request and is
         // therefore appended exactly once.
         if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
-            let realm = if codex_responses_to_chat || codex_responses_to_anthropic {
-                ProviderRealm::Bridge
-            } else {
-                ProviderRealm::Official
-            };
+            let realm =
+                if codex_responses_to_chat || codex_responses_to_anthropic || is_grok_cli_proxy {
+                    ProviderRealm::Bridge
+                } else {
+                    ProviderRealm::Official
+                };
             let realm_key = match realm {
                 ProviderRealm::Bridge => format!("bridge:{}", provider.id),
                 ProviderRealm::Official => format!("native:{}", provider.id),
@@ -1545,19 +1555,26 @@ impl RequestForwarder {
                 realm,
                 realm_key,
             };
-            let materialized = self
-                .compaction_service
-                .materialize_for_target(&mapped_body, &target)
-                .map_err(|error| ProxyError::TransformError(error.to_string()))?;
-            if materialized.changed_items > 0 {
-                log::info!(
-                    "[Codex] materialized {} compaction item(s) for provider={} realm={}",
-                    materialized.changed_items,
-                    provider.id,
-                    target.realm.as_str()
-                );
+            // Chat history hydration happens later because it needs the
+            // provider-local previous_response_id cache. That hydration may
+            // reintroduce a compaction item saved with an earlier request, so
+            // defer Chat materialization until after enrich_request().
+            if !codex_responses_to_chat {
+                let materialized = self
+                    .compaction_service
+                    .materialize_for_target(&mapped_body, &target)
+                    .map_err(|error| ProxyError::TransformError(error.to_string()))?;
+                if materialized.changed_items > 0 {
+                    log::info!(
+                        "[Codex] materialized {} compaction item(s) for provider={} realm={}",
+                        materialized.changed_items,
+                        provider.id,
+                        target.realm.as_str()
+                    );
+                }
+                materialized_compaction_ids.extend(materialized.compaction_ids);
+                mapped_body = materialized.body;
             }
-            mapped_body = materialized.body;
             if target.realm == ProviderRealm::Bridge
                 && !headers.contains_key(INTERNAL_SUMMARY_HEADER)
                 && (endpoint
@@ -1815,6 +1832,36 @@ impl RequestForwarder {
             if let Some(model) = pinned_model {
                 mapped_body["model"] = Value::String(model.clone());
             }
+            // This must be the final Responses-level operation before the Chat
+            // transform. enrich_request() can restore cached input/output items
+            // from previous_response_id, including a native compaction token
+            // that was already materialized on the preceding turn. Running the
+            // continuity bridge here prevents that hydrated token from leaking
+            // into responses_to_chat_completions().
+            let target = MaterializationTarget {
+                provider_id: provider.id.clone(),
+                model: mapped_body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                realm: ProviderRealm::Bridge,
+                realm_key: format!("bridge:{}", provider.id),
+            };
+            let materialized = self
+                .compaction_service
+                .materialize_for_target(&mapped_body, &target)
+                .map_err(|error| ProxyError::TransformError(error.to_string()))?;
+            if materialized.changed_items > 0 {
+                log::info!(
+                    "[Codex] materialized {} history-hydrated compaction item(s) for provider={} realm={}",
+                    materialized.changed_items,
+                    provider.id,
+                    target.realm.as_str()
+                );
+            }
+            materialized_compaction_ids.extend(materialized.compaction_ids);
+            mapped_body = materialized.body;
             let reasoning_config =
                 super::providers::resolve_codex_chat_reasoning_config(provider, &mapped_body);
             let mut chat_body = super::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning(
@@ -2078,6 +2125,35 @@ impl RequestForwarder {
         };
 
         // The fixed OpenAI Official provider normally forwards Codex's native
+        // Grok CLI proxy session-managed auth: when the adapter returned the
+        // GROK_SESSION_MANAGED placeholder, resolve the real access token and
+        // identity headers via the credential broker.
+        if is_grok_cli_proxy {
+            if auth_headers.is_empty() {
+                // Session-managed mode: resolve real headers from the broker.
+                let grok_adapter = GrokCliProxyAdapter::new();
+                auth_headers = grok_adapter
+                    .resolve_session_headers(provider, &self.session_id)
+                    .await?;
+            } else {
+                // API key mode already has Authorization but still needs Grok
+                // identity headers. Session mode receives both sets above.
+                let grok_adapter = GrokCliProxyAdapter::new();
+                let broker = grok_adapter.get_broker_for_headers(provider).await?;
+                let model = broker.broker.model().to_string();
+                let identity = super::providers::build_grok_identity_headers(
+                    &broker.client_version,
+                    broker.agent_id.as_deref(),
+                    None,
+                    &self.session_id,
+                    &self.session_id,
+                    super::providers::next_grok_turn_idx(&self.session_id),
+                    &model,
+                );
+                auth_headers.extend(identity);
+            }
+        }
+
         // Authorization header. In an explicitly selected managed mode, replace
         // it with the chosen CC Switch account instead. The token remains in the
         // OAuth manager and is never persisted in provider configuration.
@@ -2668,6 +2744,36 @@ impl RequestForwarder {
                     // either productive output or a valid non-failure terminal event.
                     // A response.failed/error before output remains failover-safe.
                     response = self.validate_responses_stream_start(response).await?;
+                }
+            }
+            // Wrap Grok CLI proxy SSE streams with a normalizer that filters
+            // xAI-specific events and supplements missing lifecycle events.
+            if is_grok_cli_proxy && request_is_streaming {
+                if let crate::proxy::hyper_client::ProxyResponse::Streamed {
+                    status,
+                    headers,
+                    stream,
+                } = response
+                {
+                    let normalized =
+                        super::providers::grok_cli_proxy::normalize_grok_sse_stream(stream);
+                    response = crate::proxy::hyper_client::ProxyResponse::streamed(
+                        status, headers, normalized,
+                    );
+                }
+            }
+            if !materialized_compaction_ids.is_empty() {
+                match self
+                    .compaction_service
+                    .mark_resume_verified(&materialized_compaction_ids)
+                {
+                    Ok(updated) if updated > 0 => log::info!(
+                        "[Compaction] verified resume for {updated} materialized compaction item(s)"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => log::warn!(
+                        "[Compaction] response succeeded but resume verification state could not be persisted: {error}"
+                    ),
                 }
             }
             Ok((response, resolved_claude_api_format, outbound_model))
