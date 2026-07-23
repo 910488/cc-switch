@@ -846,7 +846,16 @@ async fn responses_websocket_session(
         // offline and can turn a valid compact response into zero recognized
         // compaction items.  Once the first request resolves to an official
         // catalog entry, keep the whole socket native and relay it end-to-end.
-        if first_message && websocket_model_uses_official_route(&state, &body) {
+        // A bridge compaction token is encrypted by CC Switch, not OpenAI.
+        // Relaying it directly on the native official socket makes OpenAI
+        // reject it as `invalid_encrypted_content`. Route this request through
+        // the HTTP continuity pipeline so it can be materialized or re-compacted
+        // into an official token first. A later fresh socket can return to the
+        // native relay after Codex receives the official checkpoint.
+        if first_message
+            && websocket_model_uses_official_route(&state, &body)
+            && !contains_bridge_compaction(&body)
+        {
             if let Err(error) = relay_official_responses_websocket(
                 &mut socket,
                 text.as_str(),
@@ -930,6 +939,24 @@ fn websocket_model_uses_official_route(state: &ProxyState, body: &Value) -> bool
             log::warn!("[Codex] unable to resolve WebSocket model route: {error}");
             false
         }
+    }
+}
+
+fn contains_bridge_compaction(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            let is_bridge_compaction = object.get("type").and_then(Value::as_str)
+                == Some("compaction")
+                && object
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|encrypted| {
+                        encrypted.starts_with(crate::proxy::compaction::model::ENVELOPE_PREFIX)
+                    });
+            is_bridge_compaction || object.values().any(contains_bridge_compaction)
+        }
+        Value::Array(items) => items.iter().any(contains_bridge_compaction),
+        _ => false,
     }
 }
 
@@ -4414,14 +4441,16 @@ mod tests {
     use super::{
         apply_official_websocket_headers, body_looks_like_sse, body_snippet,
         chat_sse_to_response_value, codex_proxy_error_json, codex_proxy_response_status,
-        is_transient_official_compaction_error, official_compaction_quota_exhausted,
-        responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
-        upstream_body_parse_error, OfficialWebsocketManagedAuth,
+        contains_bridge_compaction, is_transient_official_compaction_error,
+        official_compaction_quota_exhausted, responses_sse_to_response_value,
+        should_use_claude_transform_streaming, transform, upstream_body_parse_error,
+        OfficialWebsocketManagedAuth,
     };
     use crate::{
         provider::Provider,
         proxy::{forwarder::ForwardError, ProxyError},
     };
+    use serde_json::json;
 
     fn official_provider() -> Provider {
         let mut provider = Provider::with_id(
@@ -4584,6 +4613,31 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("native-account")
         );
+    }
+
+    #[test]
+    fn official_websocket_detects_bridge_compaction_before_native_relay() {
+        let bridge = json!({
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "id": "cmp_bridge",
+                "type": "compaction",
+                "encrypted_content": "bcmp1.local-envelope"
+            }]
+        });
+        assert!(contains_bridge_compaction(&bridge));
+
+        let native = json!({
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "id": "cmp_native",
+                "type": "compaction",
+                "encrypted_content": "opaque-openai-token"
+            }]
+        });
+        assert!(!contains_bridge_compaction(&native));
     }
 
     #[test]

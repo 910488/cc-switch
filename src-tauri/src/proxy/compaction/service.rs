@@ -650,7 +650,10 @@ impl CompactionService {
             ));
         }
         compact_input.truncate(compact_input.len() - suffix.len());
-        compact_body["stream"] = Value::Bool(false);
+        // ChatGPT's native `/responses/compact` endpoint requires streaming.
+        // The handler buffers its SSE response and extracts the completed
+        // compaction item before resuming the original request.
+        compact_body["stream"] = Value::Bool(true);
         let snapshot = store.get_snapshot(&envelope.snapshot_id)?.ok_or_else(|| {
             AppError::InvalidInput(format!(
                 "canonical snapshot {} is unavailable",
@@ -1222,6 +1225,7 @@ mod tests {
             .prepare_official_recompact(&original, &target)
             .unwrap()
             .expect("plan");
+        assert_eq!(plan.compact_body["stream"], true);
         assert!(plan.compact_body.to_string().contains("CANONICAL_HISTORY"));
         assert!(!plan.compact_body.to_string().contains("NEW_SUFFIX"));
         assert!(plan.fallback_body.to_string().contains("NEW_SUFFIX"));
