@@ -20,8 +20,8 @@ use super::{
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
     forwarder::{
-        ActiveConnectionGuard, RequestForwarder, INTERNAL_MODEL_OVERRIDE_FIELD,
-        INTERNAL_MODEL_OVERRIDE_HEADER, INTERNAL_SUMMARY_HEADER,
+        ActiveConnectionGuard, ForwardError, ForwardResult, RequestForwarder,
+        INTERNAL_MODEL_OVERRIDE_FIELD, INTERNAL_MODEL_OVERRIDE_HEADER, INTERNAL_SUMMARY_HEADER,
     },
     handler_config::{
         claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
@@ -56,8 +56,9 @@ use super::{
     ProxyError,
 };
 use crate::app_config::AppType;
+use crate::commands::CodexOAuthState;
 use crate::database::PRICING_SOURCE_REQUEST;
-use crate::provider::Provider;
+use crate::provider::{CodexOfficialAuthMode, Provider};
 use axum::{
     extract::{
         ws::{Message as WebSocketMessage, WebSocket, WebSocketUpgrade},
@@ -72,6 +73,7 @@ use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::pin::Pin;
+use tauri::Manager;
 
 // ============================================================================
 // 健康检查和状态查询（简单端点）
@@ -845,9 +847,13 @@ async fn responses_websocket_session(
         // compaction items.  Once the first request resolves to an official
         // catalog entry, keep the whole socket native and relay it end-to-end.
         if first_message && websocket_model_uses_official_route(&state, &body) {
-            if let Err(error) =
-                relay_official_responses_websocket(&mut socket, text.as_str(), &handshake_headers)
-                    .await
+            if let Err(error) = relay_official_responses_websocket(
+                &mut socket,
+                text.as_str(),
+                &handshake_headers,
+                &state,
+            )
+            .await
             {
                 let _ = send_websocket_error(
                     &mut socket,
@@ -931,6 +937,7 @@ async fn relay_official_responses_websocket(
     local: &mut WebSocket,
     first_message: &str,
     client_headers: &HeaderMap,
+    state: &ProxyState,
 ) -> Result<(), String> {
     use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
@@ -938,25 +945,14 @@ async fn relay_official_responses_websocket(
     let mut request = upstream_url
         .into_client_request()
         .map_err(|error| error.to_string())?;
+    let managed_auth = resolve_official_websocket_managed_auth(state).await?;
 
-    // Keep Codex auth/account/feature headers, while allowing tungstenite to
-    // generate a valid upstream handshake instead of forwarding the localhost
-    // Host, Origin, connection and Sec-WebSocket key material.
-    for (name, value) in client_headers {
-        if matches!(
-            name.as_str(),
-            "host"
-                | "origin"
-                | "connection"
-                | "upgrade"
-                | "sec-websocket-key"
-                | "sec-websocket-version"
-                | "sec-websocket-accept"
-                | "sec-websocket-extensions"
-        ) {
-            continue;
-        }
-        request.headers_mut().insert(name.clone(), value.clone());
+    apply_official_websocket_headers(request.headers_mut(), client_headers, managed_auth.as_ref())?;
+    if let Some(managed_auth) = managed_auth {
+        log::info!(
+            "[Codex] official Responses WebSocket uses managed ChatGPT account {}",
+            managed_auth.account_id
+        );
     }
 
     let (upstream, _) = tokio_tungstenite::connect_async(request)
@@ -1014,6 +1010,105 @@ async fn relay_official_responses_websocket(
         }
     }
     Ok(())
+}
+
+struct OfficialWebsocketManagedAuth {
+    access_token: String,
+    account_id: String,
+}
+
+fn apply_official_websocket_headers(
+    upstream_headers: &mut HeaderMap,
+    client_headers: &HeaderMap,
+    managed_auth: Option<&OfficialWebsocketManagedAuth>,
+) -> Result<(), String> {
+    // Keep Codex feature headers, while allowing tungstenite to generate a
+    // valid upstream handshake instead of forwarding localhost Host, Origin,
+    // connection and Sec-WebSocket key material. A managed official binding
+    // owns both account headers, so the Codex app's native identity is removed.
+    for (name, value) in client_headers {
+        if matches!(
+            name.as_str(),
+            "host"
+                | "origin"
+                | "connection"
+                | "upgrade"
+                | "sec-websocket-key"
+                | "sec-websocket-version"
+                | "sec-websocket-accept"
+                | "sec-websocket-extensions"
+        ) {
+            continue;
+        }
+        if managed_auth.is_some()
+            && (name == http::header::AUTHORIZATION
+                || name.as_str().eq_ignore_ascii_case("chatgpt-account-id"))
+        {
+            continue;
+        }
+        upstream_headers.insert(name.clone(), value.clone());
+    }
+    if let Some(managed_auth) = managed_auth {
+        upstream_headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(&format!("Bearer {}", managed_auth.access_token))
+                .map_err(|error| error.to_string())?,
+        );
+        upstream_headers.insert(
+            http::HeaderName::from_static("chatgpt-account-id"),
+            http::HeaderValue::from_str(&managed_auth.account_id)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(())
+}
+
+async fn resolve_official_websocket_managed_auth(
+    state: &ProxyState,
+) -> Result<Option<OfficialWebsocketManagedAuth>, String> {
+    let provider = state
+        .db
+        .get_provider_by_id(crate::database::CODEX_OFFICIAL_PROVIDER_ID, "codex")
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "OpenAI Official provider is unavailable".to_string())?;
+    let mode = provider
+        .meta
+        .as_ref()
+        .map(|meta| meta.codex_official_auth_mode())
+        .unwrap_or_default();
+    if mode == CodexOfficialAuthMode::Native {
+        return Ok(None);
+    }
+
+    let app_handle = state
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| "Codex OAuth authentication is unavailable".to_string())?;
+    let codex_state = app_handle.state::<CodexOAuthState>();
+    let manager = codex_state.0.read().await;
+    let bound_account_id = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.managed_account_id_for("codex_oauth"));
+    let account_id = match mode {
+        CodexOfficialAuthMode::ManagedAccount => bound_account_id.ok_or_else(|| {
+            "OpenAI Official is configured for a selected account but has no account binding"
+                .to_string()
+        })?,
+        CodexOfficialAuthMode::ManagedDefault => manager
+            .default_account_id()
+            .await
+            .ok_or_else(|| "No default ChatGPT account is configured in CC Switch".to_string())?,
+        CodexOfficialAuthMode::Native => unreachable!(),
+    };
+    let access_token = manager
+        .get_valid_token_for_account(&account_id)
+        .await
+        .map_err(|error| format!("Unable to authenticate the selected ChatGPT account: {error}"))?;
+    Ok(Some(OfficialWebsocketManagedAuth {
+        access_token,
+        account_id,
+    }))
 }
 
 fn official_responses_websocket_url() -> String {
@@ -1330,8 +1425,9 @@ async fn handle_responses_for_app(
     } else {
         (all_providers, Vec::new())
     };
-    let mut result = match forwarder
-        .forward_with_retry(
+    let forward_result = if is_compaction {
+        forward_official_compaction_with_retry(
+            &forwarder,
             &app_type,
             method.clone(),
             &endpoint,
@@ -1341,21 +1437,41 @@ async fn handle_responses_for_app(
             forward_providers,
         )
         .await
-    {
+    } else {
+        forwarder
+            .forward_with_retry(
+                &app_type,
+                method.clone(),
+                &endpoint,
+                body.clone(),
+                headers.clone(),
+                extensions,
+                forward_providers,
+            )
+            .await
+    };
+    let mut result = match forward_result {
         Ok(result) => result,
         Err(mut err) => {
-            if is_compaction
+            let bridge_providers = if is_compaction
                 && rollout_mode.allows_cross_realm()
-                && !bridge_providers.is_empty()
-                && forwarder.can_fail_over_after(&err)
+                && official_compaction_quota_exhausted(&err)
             {
+                state
+                    .compaction_service
+                    .resolve_summary_providers(&app_type, bridge_providers)
+                    .map_err(|error| ProxyError::ConfigError(error.to_string()))?
+            } else {
+                Vec::new()
+            };
+            if !bridge_providers.is_empty() {
                 let snapshot = snapshot.as_ref().ok_or_else(|| {
                     ProxyError::Internal(
                         "official compaction fallback has no durable snapshot".to_string(),
                     )
                 })?;
                 log::warn!(
-                    "[Compaction] official providers failed; continuing through hierarchical bridge execution"
+                    "Official compaction quota exhausted; using configured third-party summarizer"
                 );
                 return execute_local_compaction(
                     &forwarder,
@@ -1450,6 +1566,7 @@ async fn handle_responses_for_app(
             is_stream,
             connection_guard,
             codex_tool_context,
+            &body,
         )
         .await;
     }
@@ -1629,6 +1746,13 @@ async fn handle_auto_review_request(
         ProxyError::TransformError(format!("Failed to parse Auto Review response: {error}"))
     })?;
     auto_review::strip_json_fence_from_response(&mut value);
+    if let Err(error) = auto_review::validate_assessment_response(&value) {
+        state
+            .auto_review_runtime
+            .record_fallback_failure(&error)
+            .await;
+        return Err(error);
+    }
     let output = if original_stream {
         auto_review::response_to_sse(&value)?
     } else {
@@ -1689,6 +1813,7 @@ async fn finish_codex_pinned_response(
             is_stream,
             connection_guard,
             tool_context,
+            request_body,
         )
         .await;
     }
@@ -1815,31 +1940,37 @@ async fn handle_responses_compact_for_app(
     }
     let (official_providers, bridge_providers) =
         partition_compaction_providers(all_providers, &endpoint);
-    let mut result = match forwarder
-        .forward_with_retry(
-            &app_type,
-            method.clone(),
-            &endpoint,
-            body.clone(),
-            headers.clone(),
-            extensions,
-            official_providers,
-        )
-        .await
+    let mut result = match forward_official_compaction_with_retry(
+        &forwarder,
+        &app_type,
+        method.clone(),
+        &endpoint,
+        body.clone(),
+        headers.clone(),
+        extensions,
+        official_providers,
+    )
+    .await
     {
         Ok(result) => result,
         Err(mut err) => {
-            if rollout_mode.allows_cross_realm()
-                && !bridge_providers.is_empty()
-                && forwarder.can_fail_over_after(&err)
-            {
+            let bridge_providers =
+                if rollout_mode.allows_cross_realm() && official_compaction_quota_exhausted(&err) {
+                    state
+                        .compaction_service
+                        .resolve_summary_providers(&app_type, bridge_providers)
+                        .map_err(|error| ProxyError::ConfigError(error.to_string()))?
+                } else {
+                    Vec::new()
+                };
+            if !bridge_providers.is_empty() {
                 let snapshot = snapshot.as_ref().ok_or_else(|| {
                     ProxyError::Internal(
                         "official compaction fallback has no durable snapshot".to_string(),
                     )
                 })?;
                 log::warn!(
-                    "[Compaction] official compact endpoint failed; continuing through hierarchical bridge execution"
+                    "Official compaction quota exhausted; using configured third-party summarizer"
                 );
                 return execute_local_compaction(
                     &forwarder,
@@ -1966,17 +2097,17 @@ async fn try_official_recompact(
         return Ok(plan.resumed_body(original_body, item));
     }
 
-    let compact_result = forwarder
-        .forward_with_retry(
-            app_type,
-            method,
-            "/responses/compact",
-            plan.compact_body.clone(),
-            headers,
-            http::Extensions::new(),
-            vec![provider.clone()],
-        )
-        .await;
+    let compact_result = forward_official_compaction_with_retry(
+        forwarder,
+        app_type,
+        method,
+        "/responses/compact",
+        plan.compact_body.clone(),
+        headers,
+        http::Extensions::new(),
+        vec![provider.clone()],
+    )
+    .await;
     let mut result = match compact_result {
         Ok(result) => result,
         Err(error) => {
@@ -2070,6 +2201,74 @@ fn partition_compaction_providers(
         !super::providers::should_convert_codex_responses_to_chat(provider, endpoint)
             && !super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint)
     })
+}
+
+const MAX_OFFICIAL_COMPACTION_RETRIES: usize = 3;
+const OFFICIAL_COMPACTION_BACKOFF_SECONDS: [u64; MAX_OFFICIAL_COMPACTION_RETRIES] = [1, 2, 4];
+
+fn official_compaction_quota_exhausted(failure: &ForwardError) -> bool {
+    failure
+        .provider
+        .as_ref()
+        .is_some_and(super::providers::is_codex_official_provider)
+        && super::quota_policy::QuotaPolicy::is_hard_quota_error(&failure.error)
+}
+
+fn is_transient_official_compaction_error(error: &ProxyError) -> bool {
+    match error {
+        ProxyError::UpstreamError { status: 429, .. } => {
+            !super::quota_policy::QuotaPolicy::is_hard_quota_error(error)
+        }
+        ProxyError::UpstreamError { status, .. } => (500..=599).contains(status),
+        ProxyError::Timeout(_)
+        | ProxyError::ForwardFailed(_)
+        | ProxyError::ProviderUnhealthy(_)
+        | ProxyError::StreamIdleTimeout(_) => true,
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_official_compaction_with_retry(
+    forwarder: &RequestForwarder,
+    app_type: &AppType,
+    method: http::Method,
+    endpoint: &str,
+    body: Value,
+    headers: axum::http::HeaderMap,
+    extensions: http::Extensions,
+    providers: Vec<Provider>,
+) -> Result<ForwardResult, ForwardError> {
+    let mut retries = 0usize;
+    loop {
+        match forwarder
+            .forward_with_retry(
+                app_type,
+                method.clone(),
+                endpoint,
+                body.clone(),
+                headers.clone(),
+                extensions.clone(),
+                providers.clone(),
+            )
+            .await
+        {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if retries < MAX_OFFICIAL_COMPACTION_RETRIES
+                    && is_transient_official_compaction_error(&error.error) =>
+            {
+                let delay = OFFICIAL_COMPACTION_BACKOFF_SECONDS[retries];
+                retries += 1;
+                log::warn!(
+                    "[Compaction] transient official compact failure; retrying official route {retries}/{MAX_OFFICIAL_COMPACTION_RETRIES} in {delay}s: {}",
+                    error.error
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2206,19 +2405,44 @@ impl SummaryClient for ForwarderSummaryClient<'_> {
             }
             let mut headers = self.headers.clone();
             headers.insert(INTERNAL_SUMMARY_HEADER, http::HeaderValue::from_static("1"));
-            let mut result = self
-                .forwarder
-                .forward_with_retry(
-                    self.app_type,
-                    self.method.clone(),
-                    self.endpoint,
-                    prepared,
-                    headers,
-                    http::Extensions::new(),
-                    self.providers.clone(),
-                )
-                .await
-                .map_err(|error| summary_call_error(error.error))?;
+            // A saturated NVIDIA worker is temporary capacity pressure, not a
+            // quota failure. Retry the same summary call locally so Codex's
+            // remote-compaction task does not have to tear down and reconnect.
+            const MAX_TRANSIENT_RETRIES: usize = 3;
+            const BACKOFF_SECONDS: [u64; MAX_TRANSIENT_RETRIES] = [1, 2, 4];
+            let mut transient_retries = 0usize;
+            let mut result = loop {
+                match self
+                    .forwarder
+                    .forward_with_retry(
+                        self.app_type,
+                        self.method.clone(),
+                        self.endpoint,
+                        prepared.clone(),
+                        headers.clone(),
+                        http::Extensions::new(),
+                        self.providers.clone(),
+                    )
+                    .await
+                {
+                    Ok(result) => break result,
+                    Err(error)
+                        if transient_retries < MAX_TRANSIENT_RETRIES
+                            && super::quota_policy::QuotaPolicy::is_transient_capacity_error(
+                                &error.error,
+                            ) =>
+                    {
+                        let delay = BACKOFF_SECONDS[transient_retries];
+                        transient_retries += 1;
+                        log::warn!(
+                            "[Compaction] transient worker capacity error; retrying summary call {transient_retries}/{MAX_TRANSIENT_RETRIES} in {delay}s: {}",
+                            error.error
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    }
+                    Err(error) => return Err(summary_call_error(error.error)),
+                }
+            };
             let protocol = if super::providers::should_convert_codex_responses_to_anthropic(
                 &result.provider,
                 self.endpoint,
@@ -2730,6 +2954,7 @@ async fn handle_codex_chat_to_responses_transform(
     is_stream: bool,
     connection_guard: Option<ActiveConnectionGuard>,
     tool_context: transform_codex_chat::CodexToolContext,
+    request_body: &Value,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
 
@@ -2748,7 +2973,11 @@ async fn handle_codex_chat_to_responses_transform(
                 tool_context,
                 false,
             );
-        let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
+        let sse_stream = record_responses_sse_stream(
+            sse_stream,
+            state.codex_chat_history.clone(),
+            request_body.clone(),
+        );
 
         let usage_collector = if usage_logging_enabled(state) {
             let state = state.clone();
@@ -2878,7 +3107,7 @@ async fn handle_codex_chat_to_responses_transform(
     })?;
     state
         .codex_chat_history
-        .record_response(&responses_response)
+        .record_exchange(request_body, &responses_response)
         .await;
 
     // 上游非流式 Chat 省略 usage 时，chat_usage_to_responses_usage 会合成全 0 usage
@@ -4183,11 +4412,179 @@ async fn log_usage(
 #[cfg(test)]
 mod tests {
     use super::{
-        body_looks_like_sse, body_snippet, chat_sse_to_response_value, codex_proxy_error_json,
-        codex_proxy_response_status, responses_sse_to_response_value,
-        should_use_claude_transform_streaming, transform, upstream_body_parse_error,
+        apply_official_websocket_headers, body_looks_like_sse, body_snippet,
+        chat_sse_to_response_value, codex_proxy_error_json, codex_proxy_response_status,
+        is_transient_official_compaction_error, official_compaction_quota_exhausted,
+        responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
+        upstream_body_parse_error, OfficialWebsocketManagedAuth,
     };
-    use crate::{provider::Provider, proxy::ProxyError};
+    use crate::{
+        provider::Provider,
+        proxy::{forwarder::ForwardError, ProxyError},
+    };
+
+    fn official_provider() -> Provider {
+        let mut provider = Provider::with_id(
+            crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            "OpenAI Official".to_string(),
+            serde_json::json!({}),
+            None,
+        );
+        provider.category = Some("official".to_string());
+        provider
+    }
+
+    #[test]
+    fn only_explicit_official_hard_quota_can_cross_compaction_realm() {
+        let hard_quota = ForwardError {
+            error: ProxyError::UpstreamError {
+                status: 429,
+                body: Some(serde_json::json!({"error":{"code":"insufficient_quota"}}).to_string()),
+            },
+            provider: Some(official_provider()),
+        };
+        assert!(official_compaction_quota_exhausted(&hard_quota));
+
+        for error in [
+            ProxyError::UpstreamError {
+                status: 429,
+                body: Some(
+                    serde_json::json!({"error":{"message":"Too many requests"}}).to_string(),
+                ),
+            },
+            ProxyError::UpstreamError {
+                status: 503,
+                body: Some("temporarily unavailable".to_string()),
+            },
+            ProxyError::UpstreamError {
+                status: 401,
+                body: Some("unauthorized".to_string()),
+            },
+            ProxyError::UpstreamError {
+                status: 422,
+                body: Some("invalid request".to_string()),
+            },
+        ] {
+            assert!(!official_compaction_quota_exhausted(&ForwardError {
+                error,
+                provider: Some(official_provider()),
+            }));
+        }
+    }
+
+    #[test]
+    fn official_compaction_retries_only_transient_failures() {
+        assert!(is_transient_official_compaction_error(
+            &ProxyError::UpstreamError {
+                status: 429,
+                body: Some("Too many requests".to_string()),
+            }
+        ));
+        assert!(is_transient_official_compaction_error(
+            &ProxyError::UpstreamError {
+                status: 503,
+                body: None,
+            }
+        ));
+        assert!(is_transient_official_compaction_error(
+            &ProxyError::ForwardFailed("connection reset".to_string())
+        ));
+        assert!(!is_transient_official_compaction_error(
+            &ProxyError::UpstreamError {
+                status: 429,
+                body: Some(serde_json::json!({"error":{"code":"insufficient_quota"}}).to_string(),),
+            }
+        ));
+        assert!(!is_transient_official_compaction_error(
+            &ProxyError::UpstreamError {
+                status: 401,
+                body: None,
+            }
+        ));
+        assert!(!is_transient_official_compaction_error(
+            &ProxyError::UpstreamError {
+                status: 422,
+                body: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn managed_official_websocket_replaces_native_account_headers() {
+        let mut client = http::HeaderMap::new();
+        client.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer native-token"),
+        );
+        client.insert(
+            http::HeaderName::from_static("chatgpt-account-id"),
+            http::HeaderValue::from_static("native-account"),
+        );
+        client.insert(
+            http::HeaderName::from_static("openai-beta"),
+            http::HeaderValue::from_static("responses_websockets=2026-02-06"),
+        );
+        client.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("127.0.0.1:15721"),
+        );
+        let managed = OfficialWebsocketManagedAuth {
+            access_token: "managed-token".to_string(),
+            account_id: "managed-account".to_string(),
+        };
+        let mut upstream = http::HeaderMap::new();
+
+        apply_official_websocket_headers(&mut upstream, &client, Some(&managed)).unwrap();
+
+        assert_eq!(
+            upstream
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer managed-token")
+        );
+        assert_eq!(
+            upstream
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("managed-account")
+        );
+        assert_eq!(
+            upstream
+                .get("openai-beta")
+                .and_then(|value| value.to_str().ok()),
+            Some("responses_websockets=2026-02-06")
+        );
+        assert!(upstream.get(http::header::HOST).is_none());
+    }
+
+    #[test]
+    fn native_official_websocket_preserves_codex_account_headers() {
+        let mut client = http::HeaderMap::new();
+        client.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer native-token"),
+        );
+        client.insert(
+            http::HeaderName::from_static("chatgpt-account-id"),
+            http::HeaderValue::from_static("native-account"),
+        );
+        let mut upstream = http::HeaderMap::new();
+
+        apply_official_websocket_headers(&mut upstream, &client, None).unwrap();
+
+        assert_eq!(
+            upstream
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer native-token")
+        );
+        assert_eq!(
+            upstream
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("native-account")
+        );
+    }
 
     #[test]
     fn body_looks_like_sse_detects_unlabeled_sse_prefixes() {

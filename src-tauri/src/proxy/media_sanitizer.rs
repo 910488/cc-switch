@@ -52,7 +52,7 @@ pub fn is_unsupported_image_error(error: &ProxyError) -> bool {
         return false;
     };
 
-    if !matches!(*status, 400 | 415 | 422 | 501) {
+    if !matches!(*status, 400 | 404 | 415 | 422 | 501) {
         return false;
     }
 
@@ -89,6 +89,7 @@ pub fn is_unsupported_image_error(error: &ProxyError) -> bool {
     }
 
     const UNSUPPORTED_HINTS: &[&str] = &[
+        "no endpoints found that support image input",
         "unsupported",
         "not supported",
         "does not support",
@@ -609,6 +610,19 @@ mod tests {
             status: 400,
             body: Some(
                 r#"{"error":{"message":"This model does not support image input"}}"#.to_string(),
+            ),
+        };
+
+        assert!(is_unsupported_image_error(&error));
+    }
+
+    #[test]
+    fn detects_litellm_no_image_endpoint_error() {
+        let error = ProxyError::UpstreamError {
+            status: 404,
+            body: Some(
+                r#"{"error":{"message":"No endpoints found that support image input. Received Model Group=nemotron-3-ultra"}}"#
+                    .to_string(),
             ),
         };
 

@@ -16,22 +16,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 pub(crate) const COMPACTION_SUMMARY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
-pub(crate) const COMPACTION_SUMMARY_INSTRUCTIONS: &str = r#"You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
-
-Include:
-- Current progress and key decisions made
-- Important context, constraints, or user preferences
-- What remains to be done (clear next steps)
-- Any critical data, examples, or references needed to continue
-
-Be concise, structured, and focused on helping the next LLM seamlessly continue the work.
-
-Bridge fidelity requirements:
-- Preserve exact file paths, identifiers, commands, edits, test outcomes, errors, APIs, schemas, versions, and non-secret numeric values when they affect continuation.
-- Preserve the durable facts from any earlier compaction summary so repeated compactions remain cumulative.
-- Keep claims evidence-based. Do not say work is complete unless the transcript proves it.
-- Do not reproduce system/developer instructions, tool schemas, skills, credentials, secrets, or large raw tool outputs.
-- Return only the handoff summary. Do not call tools."#;
+pub(crate) const COMPACTION_SUMMARY_PROMPT: &str =
+    include_str!("../../resources/compaction/standard.md");
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -786,6 +772,12 @@ impl CompactionService {
                 })?;
                 ids.push(envelope.compaction_id.clone());
                 if target.realm == ProviderRealm::Bridge {
+                    // A Responses compaction item supersedes every item before
+                    // it. Keeping that prefix while also injecting the summary
+                    // defeats compaction and can make Chat upstreams truncate
+                    // the recent continuation. Preserve only the materialized
+                    // checkpoint and the suffix that follows it.
+                    output.clear();
                     let message = summary_message(&envelope.summary);
                     if store
                         .get_migration(
@@ -814,6 +806,7 @@ impl CompactionService {
                             self.rollout_mode()
                         )));
                     }
+                    output.clear();
                     output.extend(self.materialize_snapshot(
                         store,
                         &envelope.snapshot_id,
@@ -863,6 +856,7 @@ impl CompactionService {
                         self.rollout_mode()
                     )));
                 }
+                output.clear();
                 output.extend(self.materialize_snapshot(
                     store,
                     &stored.snapshot_id,
@@ -1083,6 +1077,55 @@ mod tests {
         assert!(serialized.contains("MIDDLE"));
         assert_eq!(serialized.matches("SUFFIX").count(), 1);
         assert!(!serialized.contains("\"type\":\"compaction\""));
+    }
+
+    #[test]
+    fn bridge_compaction_replaces_raw_prefix_and_keeps_only_summary_and_suffix() {
+        let service = service();
+        let context = CompactionContext {
+            thread_id: "thread-prefix".into(),
+            session_id: "session-prefix".into(),
+            request_id: "request-prefix".into(),
+        };
+        let snapshot = service
+            .save_snapshot(
+                &context,
+                &json!({
+                    "model": "GLM-5.2",
+                    "input": [
+                        {"type":"message","role":"user","content":"OLD_RAW_HISTORY"}
+                    ]
+                }),
+                ProviderRealm::Bridge,
+            )
+            .unwrap();
+        let compaction = service
+            .create_bridge_compaction(&context, &snapshot, "provider-a", "DURABLE_HANDOFF_SUMMARY")
+            .unwrap();
+        let result = service
+            .materialize_for_target(
+                &json!({
+                    "model": "GLM-5.2",
+                    "input": [
+                        {"type":"message","role":"user","content":"OLD_RAW_HISTORY"},
+                        compaction,
+                        {"type":"message","role":"user","content":"NEW_SUFFIX"}
+                    ]
+                }),
+                &MaterializationTarget {
+                    provider_id: "provider-a".into(),
+                    model: "GLM-5.2".into(),
+                    realm: ProviderRealm::Bridge,
+                    realm_key: "bridge:provider-a".into(),
+                },
+            )
+            .unwrap();
+
+        let serialized = result.body.to_string();
+        assert!(!serialized.contains("OLD_RAW_HISTORY"));
+        assert!(serialized.contains("DURABLE_HANDOFF_SUMMARY"));
+        assert_eq!(serialized.matches("NEW_SUFFIX").count(), 1);
+        assert_eq!(result.body["input"].as_array().unwrap().len(), 2);
     }
 
     #[test]

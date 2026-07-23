@@ -283,6 +283,14 @@ mod tests {
             DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS
         );
         settings.validate().unwrap();
+
+        // Older builds persisted this field. Unknown fields are ignored so
+        // those settings remain loadable and are dropped on the next save.
+        let migrated: CompactionSettings = serde_json::from_value(serde_json::json!({
+            "promptProfile": "removed-profile"
+        }))
+        .unwrap();
+        migrated.normalized().validate().unwrap();
     }
 
     #[test]

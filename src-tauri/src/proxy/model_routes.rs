@@ -145,7 +145,18 @@ fn ensure_configured_with_official_models(
         })
         .or_else(|| (candidates.len() == 1).then(|| candidates[0]));
     let Some(provider) = provider else {
-        return Ok(existing);
+        // Even without a selected third-party catalog, persist the native
+        // model identities. Request routing must still distinguish official
+        // Codex models from the currently selected third-party provider.
+        if official_models.is_empty() || existing.official_models == official_models {
+            return Ok(existing);
+        }
+        let official_only = ModelRouteSettings {
+            official_models,
+            routes: Vec::new(),
+        };
+        save(db, &official_only)?;
+        return Ok(official_only);
     };
     if official_models.is_empty() {
         return Err(AppError::Config(
@@ -316,17 +327,47 @@ pub fn resolve(
     requested_model: &str,
 ) -> Result<Option<ResolvedModelRoute>, AppError> {
     let settings = load(db)?;
-    if settings.routes.is_empty() {
-        return Ok(None);
+    if let Some(route) = resolve_from_settings(&settings, requested_model, &[]) {
+        return Ok(Some(route));
     }
+    if !settings.routes.is_empty() {
+        return Ok(Some(ResolvedModelRoute::Official));
+    }
+
+    // The durable coexistence projection can be temporarily empty after a
+    // provider/catalog reset. Do not let a native Codex model silently fall
+    // through to whichever third-party provider happens to be current. The
+    // native cache is the authoritative source for official model slugs and
+    // already excludes CC Switch virtual aliases.
+    let cached_official = cached_official_models()?;
+    Ok(resolve_from_settings(
+        &settings,
+        requested_model,
+        &cached_official,
+    ))
+}
+
+fn resolve_from_settings(
+    settings: &ModelRouteSettings,
+    requested_model: &str,
+    fallback_official_models: &[CatalogModelInput],
+) -> Option<ResolvedModelRoute> {
     if let Some(route) = settings
         .routes
-        .into_iter()
+        .iter()
         .find(|route| route.alias == requested_model)
     {
-        return Ok(Some(ResolvedModelRoute::ThirdParty(route)));
+        return Some(ResolvedModelRoute::ThirdParty(route.clone()));
     }
-    Ok(Some(ResolvedModelRoute::Official))
+    if settings
+        .official_models
+        .iter()
+        .chain(fallback_official_models)
+        .any(|model| model.model == requested_model)
+    {
+        return Some(ResolvedModelRoute::Official);
+    }
+    None
 }
 
 pub fn augment_settings(db: &Database, base: &Value) -> Result<Value, AppError> {
@@ -447,6 +488,26 @@ mod tests {
     }
 
     #[test]
+    fn takeover_persists_official_models_without_third_party_catalog() {
+        let db = Database::memory().unwrap();
+        let official = vec![CatalogModelInput {
+            model: "gpt-5.6-sol".into(),
+            display_name: Some("GPT-5.6-Sol".into()),
+            ..Default::default()
+        }];
+
+        let settings = ensure_configured_with_official_models(&db, official.clone()).unwrap();
+
+        assert_eq!(settings.official_models, official);
+        assert!(settings.routes.is_empty());
+        assert_eq!(load(&db).unwrap(), settings);
+        assert_eq!(
+            resolve(&db, "gpt-5.6-sol").unwrap(),
+            Some(ResolvedModelRoute::Official)
+        );
+    }
+
+    #[test]
     fn builds_distinct_aliases_and_keeps_official_models() {
         let settings = build_settings(
             "provider-12345678",
@@ -499,6 +560,25 @@ mod tests {
             resolve(&db, &settings.routes[0].alias).unwrap(),
             Some(ResolvedModelRoute::ThirdParty(_))
         ));
+    }
+
+    #[test]
+    fn resolves_cached_official_model_when_durable_routes_are_empty() {
+        let settings = ModelRouteSettings::default();
+        let cached_official = vec![CatalogModelInput {
+            model: "gpt-5.6-sol".into(),
+            display_name: Some("GPT-5.6-Sol".into()),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            resolve_from_settings(&settings, "gpt-5.6-sol", &cached_official),
+            Some(ResolvedModelRoute::Official)
+        );
+        assert_eq!(
+            resolve_from_settings(&settings, "nemotron-3-ultra", &cached_official),
+            None
+        );
     }
 
     #[test]

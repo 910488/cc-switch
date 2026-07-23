@@ -493,6 +493,16 @@ impl ChatToResponsesState {
             })
     }
 
+    fn has_actionable_output(&self) -> bool {
+        !self.text.text.trim().is_empty()
+            || self.tools.values().any(|state| {
+                !state.name.trim().is_empty()
+                    && (state.added
+                        || !state.call_id.trim().is_empty()
+                        || !state.arguments.trim().is_empty())
+            })
+    }
+
     fn finalize(&mut self) -> Vec<Bytes> {
         if self.completed {
             return Vec::new();
@@ -505,6 +515,18 @@ impl ChatToResponsesState {
         events.extend(self.finalize_tools());
 
         let status = response_status_from_finish_reason(self.finish_reason.as_deref());
+        if status == "completed" && !self.has_actionable_output() {
+            log::warn!(
+                "[Codex] Chat upstream ended with reasoning only; refusing to mark the task complete"
+            );
+            events.push(self.failed_event(
+                "Upstream model ended after hidden reasoning without a tool call or user-visible answer"
+                    .to_string(),
+                Some("empty_completion".to_string()),
+            ));
+            return events;
+        }
+
         let mut response = self.base_response(status, self.completed_output_items());
         if status == "incomplete" {
             response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
@@ -1329,5 +1351,26 @@ mod tests {
         assert!(!output.contains("response.reasoning_summary_text.delta"));
         assert!(!output.contains("private chain of thought"));
         assert!(output.contains("\"text\":\"Done\""));
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_stop_is_failed_instead_of_silent_completion() {
+        let output = collect_with_hidden_reasoning(vec![
+            r#"data: {"id":"chatcmpl_reasoning_only","created":123,"model":"nemotron-3-ultra","choices":[{"delta":{"reasoning_content":"I should continue with another tool."}}]}
+
+"#,
+            r#"data: {"id":"chatcmpl_reasoning_only","created":123,"model":"nemotron-3-ultra","choices":[{"delta":{},"finish_reason":"stop"}]}
+
+"#,
+            "data: [DONE]
+
+",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.failed"));
+        assert!(output.contains("\"type\":\"empty_completion\""));
+        assert!(!output.contains("event: response.completed"));
+        assert!(!output.contains("I should continue with another tool."));
     }
 }

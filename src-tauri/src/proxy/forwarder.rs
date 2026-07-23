@@ -1808,7 +1808,7 @@ impl RequestForwarder {
                 .await;
             if restored > 0 {
                 log::debug!(
-                    "[Codex] Restored or enriched {restored} cached function call item(s) for Chat upstream"
+                    "[Codex] Restored or enriched {restored} conversation history item(s) for Chat upstream"
                 );
             }
             super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
@@ -2999,18 +2999,6 @@ impl RequestForwarder {
                 );
                 false
             }
-        }
-    }
-
-    pub(crate) fn can_fail_over_after(&self, failure: &ForwardError) -> bool {
-        match failure.provider.as_ref() {
-            Some(provider) => {
-                self.categorize_proxy_error(&failure.error, provider) == ErrorCategory::Retryable
-            }
-            None => matches!(
-                &failure.error,
-                ProxyError::NoAvailableProvider | ProxyError::MaxRetriesExceeded
-            ),
         }
     }
 

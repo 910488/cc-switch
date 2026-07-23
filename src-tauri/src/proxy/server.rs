@@ -1515,4 +1515,41 @@ mod continuity_e2e_tests {
         let _ = shutdown_tx.send(());
         upstream_task.await.unwrap();
     }
+
+    /// Opt-in live evaluation host for replaying public Codex benchmarks through
+    /// the exact in-tree proxy implementation. It is ignored by normal CI and
+    /// requires an isolated `CC_SWITCH_TEST_HOME` containing the providers to
+    /// exercise. The surrounding benchmark process owns the lifetime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    #[ignore = "manual public-dataset Harness evaluation"]
+    async fn live_public_dataset_harness_proxy() {
+        assert_eq!(
+            std::env::var("CC_SWITCH_LIVE_HARNESS_PROXY").as_deref(),
+            Ok("1"),
+            "set CC_SWITCH_LIVE_HARNESS_PROXY=1 and use an isolated CC_SWITCH_TEST_HOME"
+        );
+        let port = std::env::var("CC_SWITCH_LIVE_HARNESS_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(15721);
+        let hold_seconds = std::env::var("CC_SWITCH_LIVE_HARNESS_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1_800);
+
+        let db = Arc::new(Database::init().expect("open isolated Harness database"));
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_port: port,
+                ..ProxyConfig::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start live Harness proxy");
+        eprintln!("CC_SWITCH_LIVE_HARNESS_READY={}", info.port);
+        tokio::time::sleep(std::time::Duration::from_secs(hold_seconds)).await;
+        server.stop().await.expect("stop live Harness proxy");
+    }
 }

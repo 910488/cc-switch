@@ -98,7 +98,7 @@ fn codex_native_gateway_rejects_web_search(config_text: &str) -> bool {
     }
     false
 }
-const CODEX_MODEL_CATALOG_TEMPLATE_SLUG: &str = "gpt-5.5";
+const CODEX_MODEL_CATALOG_TEMPLATE_SLUGS: &[&str] = &["gpt-5.6-sol", "gpt-5.5"];
 
 /// Which Codex tool surface the generated model catalog should target.
 ///
@@ -493,6 +493,19 @@ fn codex_catalog_model_entry(
         )),
     );
 
+    if profile == CodexCatalogToolProfile::ProxyChat {
+        // These Sol fields describe OpenAI's native code-mode / Responses-Lite
+        // transport, not model behavior. Carrying them onto a Chat Completions
+        // route makes Codex omit its normal tool definitions entirely. The
+        // bridge then receives tools=[] and coding models can only print fake
+        // `<tool_call>` text instead of executing workspace actions. Preserve
+        // Sol's instructions, model messages, tool kinds, and agent metadata,
+        // but force the classic Codex tool surface that the Chat adapter can
+        // faithfully translate.
+        entry_obj.remove("tool_mode");
+        entry_obj.remove("use_responses_lite");
+    }
+
     if profile != CodexCatalogToolProfile::ProxyChat {
         // Native `/responses` and Anthropic gateways reject / drop Codex's freeform
         // `apply_patch` (type=="custom") tool. Strip any key that would make Codex
@@ -649,14 +662,13 @@ fn codex_catalog_model_specs(settings: &Value, config_text: &str) -> Vec<CodexCa
 }
 
 fn find_codex_model_template(catalog: &Value) -> Option<Value> {
-    catalog
-        .get("models")
-        .and_then(|models| models.as_array())
-        .and_then(|models| {
-            models.iter().find(|model| {
-                model.get("slug").and_then(|slug| slug.as_str())
-                    == Some(CODEX_MODEL_CATALOG_TEMPLATE_SLUG)
-            })
+    let models = catalog.get("models").and_then(|models| models.as_array())?;
+    CODEX_MODEL_CATALOG_TEMPLATE_SLUGS
+        .iter()
+        .find_map(|slug| {
+            models
+                .iter()
+                .find(|model| model.get("slug").and_then(Value::as_str) == Some(*slug))
         })
         .cloned()
 }
@@ -870,14 +882,19 @@ fn load_codex_model_template_from_bundled() -> Result<Option<Value>, AppError> {
 }
 
 fn load_codex_model_template_static() -> Option<Value> {
-    let text = include_str!("resources/gpt5_5_template.json");
-    match serde_json::from_str(text) {
-        Ok(template) => Some(template),
-        Err(e) => {
-            log::warn!("Failed to parse bundled gpt-5.5 template: {e}");
-            None
+    for (slug, text) in [
+        (
+            "gpt-5.6-sol",
+            include_str!("resources/gpt5_6_sol_template.json"),
+        ),
+        ("gpt-5.5", include_str!("resources/gpt5_5_template.json")),
+    ] {
+        match serde_json::from_str(text) {
+            Ok(template) => return Some(template),
+            Err(error) => log::warn!("Failed to parse bundled {slug} template: {error}"),
         }
     }
+    None
 }
 
 /// Bundled clean template for native `/responses` providers. Unlike the
@@ -907,7 +924,8 @@ fn load_codex_model_catalog_template() -> Result<Value, AppError> {
     }
 
     Err(AppError::Message(format!(
-        "Codex model catalog template `{CODEX_MODEL_CATALOG_TEMPLATE_SLUG}` not found. Please start Codex once so models_cache.json is available, or ensure the `codex` CLI is on PATH."
+        "Codex model catalog template `{}` not found. Please start Codex once so models_cache.json is available, or ensure the `codex` CLI is on PATH.",
+        CODEX_MODEL_CATALOG_TEMPLATE_SLUGS.join("` or `")
     )))
 }
 
@@ -3755,8 +3773,8 @@ web_search = "disabled"
             load_codex_model_template_static().expect("static template must parse as valid JSON");
         assert_eq!(
             template.get("slug").and_then(|v| v.as_str()),
-            Some("gpt-5.5"),
-            "static template slug must be gpt-5.5"
+            Some("gpt-5.6-sol"),
+            "static proxy harness must use GPT-5.6 Sol"
         );
     }
 
@@ -3775,6 +3793,73 @@ web_search = "disabled"
                 "static template must contain key '{key}'"
             );
         }
+    }
+
+    #[test]
+    fn proxy_chat_template_prefers_gpt_56_sol_harness() {
+        let catalog = json!({
+            "models": [
+                {"slug":"gpt-5.5","base_instructions":"old","tools":["old_tool"]},
+                {"slug":"gpt-5.6-sol","base_instructions":"sol","tools":["sol_tool"]}
+            ]
+        });
+
+        let template = find_codex_model_template(&catalog).expect("template");
+        assert_eq!(template["slug"], "gpt-5.6-sol");
+        assert_eq!(template["base_instructions"], "sol");
+        assert_eq!(template["tools"], json!(["sol_tool"]));
+    }
+
+    #[test]
+    fn proxy_chat_template_falls_back_to_gpt_55_for_older_codex() {
+        let catalog = json!({
+            "models": [
+                {"slug":"gpt-5.5","base_instructions":"fallback","tools":["tool"]}
+            ]
+        });
+
+        let template = find_codex_model_template(&catalog).expect("template");
+        assert_eq!(template["slug"], "gpt-5.5");
+    }
+
+    #[test]
+    fn proxy_chat_entry_preserves_gpt_56_sol_harness_fields() {
+        let template = load_codex_model_template_static().expect("static GPT-5.6 Sol template");
+        let spec = CodexCatalogModelSpec {
+            model: "ccs-provider-model".to_string(),
+            display_name: "Third Party".to_string(),
+            context_window: 200_000,
+            supports_parallel_tool_calls: None,
+            input_modalities: Some(vec!["text".to_string()]),
+            base_instructions: None,
+            default_reasoning_level: None,
+            supported_reasoning_levels: None,
+        };
+        let entry =
+            codex_catalog_model_entry(&template, &spec, 0, CodexCatalogToolProfile::ProxyChat);
+
+        for key in [
+            "base_instructions",
+            "model_messages",
+            "apply_patch_tool_type",
+            "shell_type",
+            "web_search_tool_type",
+            "multi_agent_version",
+            "experimental_supported_tools",
+        ] {
+            assert_eq!(entry.get(key), template.get(key), "Harness field {key}");
+        }
+        assert!(
+            entry.get("tool_mode").is_none(),
+            "Chat bridge must expose the classic Codex tool surface"
+        );
+        assert!(
+            entry.get("use_responses_lite").is_none(),
+            "Chat bridge cannot advertise the native Responses-Lite transport"
+        );
+        assert_eq!(entry["slug"], "ccs-provider-model");
+        assert_eq!(entry["context_window"], 200_000);
+        assert_eq!(entry["input_modalities"], json!(["text"]));
     }
 
     #[test]

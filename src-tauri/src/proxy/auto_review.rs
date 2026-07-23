@@ -162,11 +162,45 @@ pub(crate) fn resolve_fallback_provider_for_request(
 }
 
 pub(crate) fn is_auto_review_request(body: &Value) -> bool {
-    body.get("model").and_then(Value::as_str) == Some(AUTO_REVIEW_MODEL)
+    if body.get("model").and_then(Value::as_str) == Some(AUTO_REVIEW_MODEL) {
+        return true;
+    }
+
+    // Codex Desktop's approval Guardian is a subagent that keeps the thread's
+    // selected model id. It does not send `codex-auto-review` as the model, so
+    // identify the stable Guardian instruction contract instead of relying on
+    // a synthetic model alias that never appears on the wire.
+    let instructions = body
+        .get("instructions")
+        .map(instruction_text)
+        .unwrap_or_default();
+    instructions.contains("You are judging one planned coding-agent action.")
+        && instructions.contains("# User Authorization Scoring")
+        && instructions.contains("# Outcome Policy")
 }
 
-/// Replace only routing-owned fields. Input, tools, text/response format, and
-/// the caller's stream contract remain untouched.
+fn instruction_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Replace routing-owned fields and force the fallback reviewer to produce its
+/// final assessment directly. The official Guardian can use read-only tools,
+/// but third-party coding models can spend the entire 90-second review window
+/// repeatedly calling those tools and finish without an assessment payload.
+/// The transcript and exact planned action already contain the evidence needed
+/// for a conservative fallback decision.
 pub(crate) fn prepare_fallback_body(body: &Value, settings: &AutoReviewSettings) -> Value {
     let mut fallback = body.clone();
     fallback["model"] = Value::String(settings.fallback_model.clone());
@@ -179,6 +213,11 @@ pub(crate) fn prepare_fallback_body(body: &Value, settings: &AutoReviewSettings)
         *reasoning = json!({});
     }
     reasoning["effort"] = Value::String(settings.fallback_effort.clone());
+    if let Some(object) = fallback.as_object_mut() {
+        object.remove("tools");
+        object.remove("tool_choice");
+        object.remove("parallel_tool_calls");
+    }
     fallback
 }
 
@@ -326,6 +365,58 @@ pub(crate) fn strip_json_fence_from_response(response: &mut Value) -> usize {
         }
     }
     stripped
+}
+
+pub(crate) fn validate_assessment_response(response: &Value) -> Result<(), ProxyError> {
+    let text = response
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .find_map(|part| {
+            (part.get("type").and_then(Value::as_str) == Some("output_text"))
+                .then(|| part.get("text").and_then(Value::as_str))
+                .flatten()
+                .filter(|text| !text.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            ProxyError::TransformError(
+                "Auto Review fallback completed without a Guardian assessment payload".to_string(),
+            )
+        })?;
+
+    let parsed = serde_json::from_str::<Value>(text).or_else(|_| {
+        let start = text.find('{').ok_or_else(|| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing JSON object",
+            ))
+        })?;
+        let end = text.rfind('}').filter(|end| *end > start).ok_or_else(|| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unterminated JSON object",
+            ))
+        })?;
+        serde_json::from_str(&text[start..=end])
+    });
+    let parsed = parsed.map_err(|error| {
+        ProxyError::TransformError(format!(
+            "Auto Review fallback returned invalid Guardian assessment JSON: {error}"
+        ))
+    })?;
+    if !matches!(
+        parsed.get("outcome").and_then(Value::as_str),
+        Some("allow" | "deny")
+    ) {
+        return Err(ProxyError::TransformError(
+            "Auto Review fallback assessment JSON is missing outcome=allow|deny".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn strip_json_fence(text: &str) -> Option<String> {
@@ -517,7 +608,33 @@ mod tests {
     }
 
     #[test]
-    fn fallback_body_preserves_contract_fields() {
+    fn detects_guardian_request_even_when_it_keeps_the_selected_model() {
+        let body = json!({
+            "model": "ccs-provider-1-GLM-5.2",
+            "instructions": concat!(
+                "You are judging one planned coding-agent action.\n",
+                "# User Authorization Scoring\n",
+                "Assess authorization.\n",
+                "# Outcome Policy\n",
+                "Return JSON."
+            ),
+            "input": [{"role":"user","content":"Assess the planned action"}]
+        });
+        assert!(is_auto_review_request(&body));
+    }
+
+    #[test]
+    fn ordinary_request_with_review_language_is_not_a_guardian_request() {
+        let body = json!({
+            "model": "GLM-5.2",
+            "instructions": "Review the user's code and report findings.",
+            "input": [{"role":"user","content":"Please review this patch"}]
+        });
+        assert!(!is_auto_review_request(&body));
+    }
+
+    #[test]
+    fn fallback_body_preserves_output_contract_but_disables_tool_loops() {
         let body = json!({
             "model": AUTO_REVIEW_MODEL,
             "input": [{"role":"user","content":"review"}],
@@ -536,9 +653,11 @@ mod tests {
         assert_eq!(fallback["model"], "glm-5");
         assert_eq!(fallback["reasoning"]["effort"], "high");
         assert_eq!(fallback["reasoning"]["summary"], "auto");
-        assert_eq!(fallback["tools"], body["tools"]);
         assert_eq!(fallback["text"], body["text"]);
         assert_eq!(fallback["stream"], true);
+        assert!(fallback.get("tools").is_none());
+        assert!(fallback.get("tool_choice").is_none());
+        assert!(fallback.get("parallel_tool_calls").is_none());
     }
 
     #[test]
@@ -554,6 +673,33 @@ mod tests {
         assert_eq!(response["output"][0]["content"][0]["text"], "{\"ok\":true}");
         assert_eq!(strip_json_fence("prefix ```json\n{}\n```"), None);
         assert_eq!(strip_json_fence("```rust\n{}\n```"), None);
+    }
+
+    #[test]
+    fn validates_guardian_assessment_payload() {
+        let response = json!({
+            "output": [{
+                "type":"message",
+                "content":[{"type":"output_text","text":"{\"outcome\":\"allow\"}"}]
+            }]
+        });
+        assert!(validate_assessment_response(&response).is_ok());
+
+        let empty = json!({
+            "output": [{
+                "type":"message",
+                "content":[{"type":"output_text","text":"\n"}]
+            }]
+        });
+        assert!(validate_assessment_response(&empty).is_err());
+
+        let malformed = json!({
+            "output": [{
+                "type":"message",
+                "content":[{"type":"output_text","text":"{\"risk_level\":\"low\"}"}]
+            }]
+        });
+        assert!(validate_assessment_response(&malformed).is_err());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use super::model::{
     DEFAULT_SUMMARY_INPUT_BUDGET, DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS, MIN_SUMMARY_INPUT_BUDGET,
 };
 use super::planner::{plan_summary, SummaryPlan};
-use super::service::COMPACTION_SUMMARY_INSTRUCTIONS;
+use super::service::COMPACTION_SUMMARY_PROMPT;
 use super::store::estimate_tokens;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -178,7 +178,7 @@ where
                 client,
                 SummaryCall {
                     body: prepared,
-                    prompt: COMPACTION_SUMMARY_INSTRUCTIONS.to_string(),
+                    prompt: COMPACTION_SUMMARY_PROMPT.to_string(),
                     max_output_tokens: final_max_output_tokens,
                 },
                 cache,
@@ -272,7 +272,7 @@ where
                 client,
                 SummaryCall {
                     body: final_body,
-                    prompt: COMPACTION_SUMMARY_INSTRUCTIONS.to_string(),
+                    prompt: COMPACTION_SUMMARY_PROMPT.to_string(),
                     max_output_tokens: final_max_output_tokens,
                 },
                 cache,
@@ -350,7 +350,7 @@ const URL_SAFE_DIGEST: UrlSafeDigest = UrlSafeDigest;
 
 fn chunk_prompt(index: usize, total: usize) -> String {
     format!(
-        "{COMPACTION_SUMMARY_INSTRUCTIONS}\n\nThis is chronological older segment {} of {total}. Produce an intermediate checkpoint containing only facts needed by the final handoff. Preserve causal links between tool calls, edits, errors, and their results.",
+        "{COMPACTION_SUMMARY_PROMPT}\n\nThis is chronological older segment {} of {total}. Produce an intermediate checkpoint containing only facts needed by the final handoff. Preserve causal links between tool calls, edits, errors, and their results.",
         index + 1
     )
 }
@@ -471,5 +471,43 @@ mod tests {
         .unwrap();
         assert_eq!(client.0.len(), 1);
         assert_eq!(client.0[0].max_output_tokens, 4_000);
+        assert_eq!(client.0[0].prompt.trim(), COMPACTION_SUMMARY_PROMPT.trim());
+    }
+
+    #[tokio::test]
+    async fn standard_prompt_preserves_temporal_relations() {
+        struct CapturingClient(Vec<SummaryCall>);
+        impl SummaryClient for CapturingClient {
+            fn summarize<'a>(
+                &'a mut self,
+                call: SummaryCall,
+            ) -> Pin<Box<dyn Future<Output = Result<SummaryReply, SummaryCallError>> + Send + 'a>>
+            {
+                self.0.push(call);
+                Box::pin(std::future::ready(Ok(SummaryReply {
+                    summary: "structured summary".into(),
+                    ..Default::default()
+                })))
+            }
+        }
+
+        let body = json!({"model":"test","input":[{"role":"user","content":"small"}]});
+        let mut client = CapturingClient(Vec::new());
+        execute(
+            &mut client,
+            &body,
+            SummaryExecutionOptions::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(client.0.len(), 1);
+        assert!(client.0[0].prompt.contains("Temporal fidelity"));
+        assert!(client.0[0]
+            .prompt
+            .contains("Never infer real-world event order from the order"));
+        assert!(client.0[0].prompt.contains("relative-time anchors"));
+        assert_eq!(client.0[0].prompt.trim(), COMPACTION_SUMMARY_PROMPT.trim());
     }
 }

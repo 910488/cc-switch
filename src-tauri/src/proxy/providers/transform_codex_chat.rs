@@ -42,6 +42,12 @@ const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
 const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
 const CUSTOM_TOOL_INPUT_DESCRIPTION: &str = "Raw string input for the original custom tool. Preserve formatting exactly and follow the original tool definition embedded in the description.";
 const CUSTOM_TOOL_PRESERVED_METADATA_HEADING: &str = "Original tool definition:";
+const CODEX_TOOL_CONTINUITY_INSTRUCTION: &str = "\
+Tool-use continuity for this Codex task:
+- If you say you will inspect, create, edit, run, test, or otherwise act on the workspace, issue the corresponding tool call in the same response.
+- Do not end the turn with only a promise or announcement of future work.
+- After receiving a tool result, do not return hidden reasoning alone. Either issue the next required tool call or provide a user-visible final answer when the task is actually complete.
+- Continue using tools until the requested task is complete or you are genuinely blocked and need user input.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CodexToolKind {
@@ -269,14 +275,21 @@ pub fn responses_to_chat_completions_with_reasoning(
     }
 
     let mut messages = Vec::new();
-    if let Some(instructions) = body.get("instructions") {
-        let instructions = instruction_text(instructions);
+    let mut instructions = body
+        .get("instructions")
+        .map(instruction_text)
+        .unwrap_or_default();
+    if !tool_context.chat_tools().is_empty() {
         if !instructions.is_empty() {
-            messages.push(json!({
-                "role": "system",
-                "content": instructions
-            }));
+            instructions.push_str("\n\n");
         }
+        instructions.push_str(CODEX_TOOL_CONTINUITY_INSTRUCTION);
+    }
+    if !instructions.is_empty() {
+        messages.push(json!({
+            "role": "system",
+            "content": instructions
+        }));
     }
 
     if let Some(input) = body.get("input") {
@@ -317,9 +330,25 @@ pub fn responses_to_chat_completions_with_reasoning(
         result["tool_choice"] = responses_tool_choice_to_chat(tool_choice, &tool_context);
     }
 
+    // Some OpenAI-compatible coding models acknowledge an explicit workspace
+    // task ("I'll inspect the files first") and then stop without emitting a
+    // native tool call. Codex treats that polite preamble as a completed turn,
+    // so no tool result ever arrives and the task silently drifts. On the first
+    // turn of an unambiguous workspace action, require one native call. We do
+    // not apply this to greetings/questions or to continuation turns whose last
+    // item is a tool result, where the model must remain free to answer.
+    if has_auto_or_missing_tool_choice(&body) && should_require_initial_workspace_tool(&body) {
+        result["tool_choice"] = Value::String("required".to_string());
+    }
+
     for key in EXTRA_CHAT_PASSTHROUGH_FIELDS {
         if let Some(value) = body.get(*key) {
             result[*key] = value.clone();
+        }
+    }
+    if result.get("response_format").is_none() {
+        if let Some(response_format) = responses_text_format_to_chat_response_format(&body) {
+            result["response_format"] = response_format;
         }
     }
 
@@ -344,6 +373,160 @@ pub fn responses_to_chat_completions_with_reasoning(
     super::transform::inject_openai_stream_include_usage(&mut result);
 
     Ok(result)
+}
+
+fn responses_text_format_to_chat_response_format(body: &Value) -> Option<Value> {
+    let format = body.get("text")?.get("format")?;
+    match format.get("type").and_then(Value::as_str) {
+        Some("json_schema") => {
+            if let Some(json_schema) = format.get("json_schema") {
+                return Some(json!({
+                    "type": "json_schema",
+                    "json_schema": json_schema
+                }));
+            }
+
+            let mut json_schema = serde_json::Map::new();
+            for key in ["name", "description", "schema", "strict"] {
+                if let Some(value) = format.get(key) {
+                    json_schema.insert(key.to_string(), value.clone());
+                }
+            }
+            (!json_schema.is_empty()).then(|| {
+                json!({
+                    "type": "json_schema",
+                    "json_schema": Value::Object(json_schema)
+                })
+            })
+        }
+        Some("json_object") => Some(json!({"type": "json_object"})),
+        _ => None,
+    }
+}
+
+fn has_auto_or_missing_tool_choice(body: &Value) -> bool {
+    match body.get("tool_choice") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(choice)) => choice.eq_ignore_ascii_case("auto"),
+        Some(choice) => {
+            choice
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|choice| choice.eq_ignore_ascii_case("auto"))
+                || choice
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .is_some_and(|choice| choice.eq_ignore_ascii_case("auto"))
+        }
+    }
+}
+
+fn should_require_initial_workspace_tool(body: &Value) -> bool {
+    if body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+    {
+        return false;
+    }
+
+    let prompt = match body.get("input") {
+        Some(Value::String(prompt)) => prompt.clone(),
+        Some(Value::Array(items)) => {
+            let mut latest_user_prompt = None;
+            for item in items.iter().rev() {
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                if matches!(
+                    item_type,
+                    "function_call_output" | "custom_tool_call_output" | "tool_search_output"
+                ) {
+                    return false;
+                }
+                match item.get("role").and_then(Value::as_str) {
+                    Some("user") if item_type.is_empty() || item_type == "message" => {
+                        latest_user_prompt = Some(instruction_text(
+                            item.get("content").unwrap_or(&Value::Null),
+                        ));
+                        break;
+                    }
+                    Some("assistant") => return false,
+                    _ => {}
+                }
+            }
+            let Some(prompt) = latest_user_prompt else {
+                return false;
+            };
+            prompt
+        }
+        _ => return false,
+    };
+    let lower = prompt.to_lowercase();
+    let action = [
+        "implement",
+        "create",
+        "edit",
+        "modify",
+        "fix",
+        "run",
+        "test",
+        "inspect",
+        "read",
+        "investigate",
+        "build",
+        "commit",
+        "apply",
+        "delete",
+        "remove",
+        "update",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || [
+            "實作", "实现", "建立", "修改", "修復", "修复", "執行", "执行", "測試", "测试", "檢查",
+            "检查", "調查", "调查", "讀取", "读取", "建置", "編譯", "编译", "提交", "刪除", "删除",
+        ]
+        .iter()
+        .any(|needle| prompt.contains(needle));
+    let workspace = [
+        "file",
+        "repo",
+        "project",
+        "code",
+        "test",
+        "build",
+        "workspace",
+        "directory",
+        "path",
+        ".py",
+        ".rs",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".json",
+        ".toml",
+        ".md",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || [
+            "檔案",
+            "文件",
+            "專案",
+            "项目",
+            "程式碼",
+            "代码",
+            "測試",
+            "测试",
+            "目錄",
+            "目录",
+            "路徑",
+            "工作區",
+            "工作区",
+        ]
+        .iter()
+        .any(|needle| prompt.contains(needle));
+
+    action && workspace
 }
 
 fn apply_reasoning_options(
@@ -674,6 +857,34 @@ fn append_responses_item_as_chat_message(
             if !attached_to_previous {
                 append_pending_reasoning(pending_reasoning, reasoning);
             }
+        }
+        Some("web_search_call") => {
+            flush_pending_tool_calls(
+                messages,
+                pending_tool_calls,
+                pending_reasoning,
+                last_assistant_index,
+            );
+            // Chat Completions cannot replay OpenAI's hosted web-search item as
+            // a native tool call. Preserve the completed action as read-only
+            // assistant history instead of silently dropping context that the
+            // official Responses model would receive on the next turn.
+            let action = item
+                .get("action")
+                .map(canonical_json_string)
+                .unwrap_or_else(|| "{}".to_string());
+            let status = item
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let message = json!({
+                "role": "assistant",
+                "content": format!(
+                    "[Previous Codex hosted web-search action; history only] status={status}; action={action}"
+                )
+            });
+            update_last_assistant_index(messages, &message, last_assistant_index);
+            messages.push(message);
         }
         Some("input_text" | "input_image" | "input_file" | "input_audio") => {
             flush_pending_tool_calls(
@@ -1860,6 +2071,62 @@ mod tests {
     }
 
     #[test]
+    fn responses_request_maps_text_json_schema_to_chat_response_format() {
+        let input = json!({
+            "model": "glm-5.2",
+            "input": [{"role":"user","content":"Assess this action"}],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "guardian_assessment",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "outcome": {"type":"string","enum":["allow","deny"]}
+                        },
+                        "required": ["outcome"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        assert_eq!(result["response_format"]["type"], "json_schema");
+        assert_eq!(
+            result["response_format"]["json_schema"]["name"],
+            "guardian_assessment"
+        );
+        assert_eq!(result["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            result["response_format"]["json_schema"]["schema"]["required"][0],
+            "outcome"
+        );
+    }
+
+    #[test]
+    fn explicit_chat_response_format_takes_precedence_over_responses_text_format() {
+        let input = json!({
+            "model": "glm-5.2",
+            "input": [{"role":"user","content":"Return JSON"}],
+            "response_format": {"type":"json_object"},
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "ignored",
+                    "schema": {"type":"object"}
+                }
+            }
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        assert_eq!(result["response_format"], json!({"type":"json_object"}));
+    }
+
+    #[test]
     fn responses_request_maps_input_file_content_parts() {
         let input = json!({
             "model": "gpt-5.4",
@@ -1969,10 +2236,16 @@ mod tests {
         let result = responses_to_chat_completions(input).unwrap();
         let messages = result["messages"].as_array().unwrap();
 
-        assert_eq!(messages[0]["role"], "user");
-        assert_eq!(messages[0]["content"], "Please run the tool.");
-        assert_eq!(messages[1]["role"], "assistant");
-        assert_eq!(messages[1]["reasoning_content"], "tool call");
+        let user = messages
+            .iter()
+            .find(|message| message["role"] == "user")
+            .expect("user message");
+        let assistant = messages
+            .iter()
+            .find(|message| message.get("tool_calls").is_some())
+            .expect("assistant tool call");
+        assert_eq!(user["content"], "Please run the tool.");
+        assert_eq!(assistant["reasoning_content"], "tool call");
     }
 
     #[test]
@@ -2018,6 +2291,10 @@ mod tests {
 
         assert_eq!(result["model"], "gpt-5.4");
         assert_eq!(result["messages"][0]["role"], "system");
+        assert!(result["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Do not end the turn with only a promise"));
         assert_eq!(result["messages"][1]["role"], "user");
         assert_eq!(result["messages"][1]["content"][0]["type"], "text");
         assert_eq!(result["messages"][1]["content"][1]["type"], "image_url");
@@ -2030,6 +2307,86 @@ mod tests {
         assert_eq!(result["tool_choice"]["function"]["name"], "get_weather");
         assert_eq!(result["max_tokens"], 100);
         assert_eq!(result["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn responses_request_without_tools_does_not_inject_tool_continuity_prompt() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "instructions": "Answer directly.",
+            "input": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let system = result["messages"][0]["content"].as_str().unwrap();
+
+        assert_eq!(system, "Answer directly.");
+        assert!(!system.contains("Tool-use continuity"));
+    }
+
+    #[test]
+    fn explicit_initial_workspace_action_requires_native_tool_call() {
+        let input = json!({
+            "model": "GLM-5.2",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "Implement solution.py, inspect TASK.md, and run the tests."
+                }]
+            }],
+            "tools": [{
+                "type": "function",
+                "name": "shell_command",
+                "description": "Run a command",
+                "parameters": {"type":"object","properties":{"command":{"type":"string"}}}
+            }],
+            "tool_choice": "auto"
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        assert_eq!(result["tool_choice"], "required");
+    }
+
+    #[test]
+    fn greeting_does_not_force_tool_call() {
+        let input = json!({
+            "model": "GLM-5.2",
+            "input": [{"type":"message","role":"user","content":"Hi"}],
+            "tools": [{
+                "type": "function",
+                "name": "shell_command",
+                "description": "Run a command",
+                "parameters": {"type":"object","properties":{"command":{"type":"string"}}}
+            }],
+            "tool_choice": "auto"
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        assert_eq!(result["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn tool_result_continuation_does_not_force_another_tool_call() {
+        let input = json!({
+            "model": "GLM-5.2",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "tests passed"
+            }],
+            "tools": [{
+                "type": "function",
+                "name": "shell_command",
+                "description": "Run a command",
+                "parameters": {"type":"object","properties":{"command":{"type":"string"}}}
+            }],
+            "tool_choice": "auto"
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        assert_eq!(result["tool_choice"], "auto");
     }
 
     #[test]
@@ -2087,16 +2444,64 @@ mod tests {
 
         assert!(tool_names.contains(&"tool_search"));
         assert!(tool_names.contains(&"mcp__codex_apps__gmail___search_emails"));
+        let messages = result["messages"].as_array().unwrap();
+        let assistant = messages
+            .iter()
+            .find(|message| message.get("tool_calls").is_some())
+            .expect("assistant tool-search call");
+        let tool_output = messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("tool-search output");
         assert_eq!(
-            result["messages"][0]["tool_calls"][0]["function"]["name"],
+            assistant["tool_calls"][0]["function"]["name"],
             "tool_search"
         );
-        assert_eq!(result["messages"][1]["role"], "tool");
-        assert_eq!(result["messages"][1]["tool_call_id"], "call_tool_search_1");
-        assert!(result["messages"][1]["content"]
+        assert_eq!(tool_output["tool_call_id"], "call_tool_search_1");
+        assert!(tool_output["content"]
             .as_str()
             .unwrap()
             .contains("mcp__codex_apps__gmail"));
+    }
+
+    #[test]
+    fn responses_request_to_chat_preserves_hosted_web_search_history() {
+        let input = json!({
+            "model": "third-party-model",
+            "input": [
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {"type":"search","query":"Fugle realtime SDK"}
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type":"output_text","text":"I found the SDK documentation."}]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type":"input_text","text":"Continue the implementation."}]
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        assert_eq!(result["messages"][0]["role"], "assistant");
+        assert!(result["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Fugle realtime SDK"));
+        assert_eq!(
+            result["messages"][1]["content"],
+            "I found the SDK documentation."
+        );
+        assert_eq!(
+            result["messages"][2]["content"],
+            "Continue the implementation."
+        );
     }
 
     #[test]
@@ -2126,8 +2531,14 @@ mod tests {
             "input"
         );
         assert_eq!(result["tool_choice"]["function"]["name"], "apply_patch");
+        let assistant = result["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message.get("tool_calls").is_some())
+            .expect("assistant custom tool call");
         assert_eq!(
-            result["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            assistant["tool_calls"][0]["function"]["arguments"],
             r#"{"input":"*** Begin Patch\n*** End Patch"}"#
         );
     }

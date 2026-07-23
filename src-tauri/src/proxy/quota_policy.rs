@@ -55,6 +55,36 @@ impl QuotaPolicy {
         matches!(error, ProxyError::UpstreamError { status: 429, .. })
     }
 
+    /// Temporary upstream capacity exhaustion is not an account/provider quota.
+    /// Gateways commonly encode NVIDIA worker saturation as HTTP 429, but
+    /// persisting a quota latch for it prevents the short retry requested by the
+    /// upstream and makes the whole provider appear unavailable.
+    pub(crate) fn is_transient_capacity_error(error: &ProxyError) -> bool {
+        let ProxyError::UpstreamError {
+            status,
+            body: Some(body),
+        } = error
+        else {
+            return false;
+        };
+        if !matches!(*status, 429 | 500 | 502 | 503 | 504) {
+            return false;
+        }
+
+        let body = body.to_ascii_lowercase();
+        [
+            "no deployments available",
+            "worker local total request limit",
+            "resourceexhausted",
+            "resource exhausted",
+            "worker capacity",
+            "worker is busy",
+            "worker overloaded",
+        ]
+        .iter()
+        .any(|needle| body.contains(needle))
+    }
+
     /// Whether the upstream explicitly says only one model/model-group is out
     /// of quota. Such an error must not disable every model behind the same
     /// provider: GLM-5.2p and GLM-5.2, for example, may have independent
@@ -130,6 +160,9 @@ impl QuotaPolicy {
         let ProxyError::UpstreamError { status: 429, body } = error else {
             return Ok(None);
         };
+        if Self::is_transient_capacity_error(error) {
+            return Ok(None);
+        }
         // Do not turn a model-specific exhaustion into a provider-wide latch.
         // The original 429 is still returned to the caller, but sibling models
         // remain routable immediately.
@@ -408,6 +441,28 @@ mod tests {
         };
         assert!(!QuotaPolicy::is_hard_quota_error(&error));
         assert!(!QuotaPolicy::is_model_scoped_quota_error(&error));
+    }
+
+    #[test]
+    fn nvidia_worker_saturation_does_not_create_quota_latch() {
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = provider("nvidia-busy");
+        db.save_provider("codex", &provider).unwrap();
+        let policy = QuotaPolicy::new(db.clone());
+        let error = ProxyError::UpstreamError {
+            status: 429,
+            body: Some(
+                json!({"error":{"message":"No deployments available for selected model, Try again in 5 seconds. Passed model=nemotron-3-ultra"}})
+                    .to_string(),
+            ),
+        };
+
+        assert!(QuotaPolicy::is_transient_capacity_error(&error));
+        assert!(policy
+            .record_from_error_for_account("codex", &provider, &error, None)
+            .unwrap()
+            .is_none());
+        assert!(!policy.is_provider_latched("codex", "nvidia-busy").unwrap());
     }
 
     #[test]
