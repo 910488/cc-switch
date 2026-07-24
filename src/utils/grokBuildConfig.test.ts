@@ -100,6 +100,7 @@ context_window = 500000
     expect(validateGrokBuildConfig(missingCredentials)).toBe(
       "Missing api_key or env_key",
     );
+    expect(validateGrokBuildConfig(missingCredentials, true)).toBeNull();
 
     const invalidWindow = missingCredentials.replace(
       "context_window = 500000",
@@ -116,6 +117,9 @@ context_window = 500000
         ),
       ),
     ).toBe("context_window must be a positive integer");
+    expect(validateGrokBuildConfig(invalidWindow, true)).toBe(
+      "context_window must be a positive integer",
+    );
   });
 
   it("renames the selected profile without leaving the old table behind", () => {

@@ -57,6 +57,38 @@ const POLLING_SAFETY_MARGIN_SECS: u64 = 3;
 /// User-Agent
 const CODEX_USER_AGENT: &str = "cc-switch-codex-oauth";
 
+fn refresh_token_form(refresh_token: &str) -> [(&str, &str); 3] {
+    [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", CODEX_CLIENT_ID),
+    ]
+}
+
+fn oauth_error_detail(body: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    parsed
+        .as_ref()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("error_description"))
+                .or_else(|| value.get("error"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                "authentication server rejected the refresh token".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        })
+}
+
 /// Codex OAuth 错误
 #[derive(Debug, thiserror::Error)]
 pub enum CodexOAuthError {
@@ -72,8 +104,8 @@ pub enum CodexOAuthError {
     #[error("OAuth Token 获取失败: {0}")]
     TokenFetchFailed(String),
 
-    #[error("Refresh Token 失效或已过期")]
-    RefreshTokenInvalid,
+    #[error("Refresh Token 失效或已过期: {0}")]
+    RefreshTokenInvalid(String),
 
     #[error("网络错误: {0}")]
     NetworkError(String),
@@ -464,22 +496,22 @@ impl CodexOAuthManager {
             .post(OAUTH_TOKEN_URL)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("User-Agent", CODEX_USER_AGENT)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token),
-                ("client_id", CODEX_CLIENT_ID),
-                ("scope", "openid profile email"),
-            ])
+            .form(&refresh_token_form(refresh_token))
             .send()
             .await?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(CodexOAuthError::RefreshTokenInvalid);
-        }
-
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+                || text.contains("invalid_grant")
+                || text.contains("refresh_token_reused")
+            {
+                return Err(CodexOAuthError::RefreshTokenInvalid(oauth_error_detail(
+                    &text,
+                )));
+            }
             return Err(CodexOAuthError::TokenFetchFailed(format!(
                 "Refresh 失败: {status} - {text}"
             )));
@@ -523,6 +555,42 @@ impl CodexOAuthManager {
             }
         }
 
+        self.refresh_account_token_locked(account_id).await
+    }
+
+    /// Refresh an access token that an upstream endpoint rejected before its
+    /// locally decoded expiry. The rejected token is used as a compare value so
+    /// concurrent 401 responses only rotate the refresh token once.
+    pub async fn refresh_token_after_rejection(
+        &self,
+        account_id: &str,
+        rejected_token: &str,
+    ) -> Result<String, CodexOAuthError> {
+        let refresh_lock = self.get_refresh_lock(account_id).await;
+        let _guard = refresh_lock.lock().await;
+
+        // Another request may already have refreshed this account while this
+        // caller was waiting for the per-account lock. Reuse that newer token.
+        {
+            let tokens = self.access_tokens.read().await;
+            if let Some(cached) = tokens.get(account_id) {
+                if cached.token != rejected_token && !cached.is_expiring_soon() {
+                    return Ok(cached.token.clone());
+                }
+            }
+        }
+
+        log::info!(
+            "[CodexOAuth] upstream rejected access_token for account {account_id}; forcing one refresh"
+        );
+        self.refresh_account_token_locked(account_id).await
+    }
+
+    /// Refresh while the caller holds this account's refresh lock.
+    async fn refresh_account_token_locked(
+        &self,
+        account_id: &str,
+    ) -> Result<String, CodexOAuthError> {
         let refresh_token = {
             let accounts = self.accounts.read().await;
             accounts
@@ -533,7 +601,7 @@ impl CodexOAuthManager {
 
         let new_tokens = self.refresh_with_token(&refresh_token).await?;
 
-        // 如果服务端返回了新的 refresh_token，更新存储
+        // Persist refresh-token rotation before exposing the new access token.
         if let Some(new_refresh) = new_tokens.refresh_token.clone() {
             if new_refresh != refresh_token {
                 let mut accounts = self.accounts.write().await;
@@ -969,6 +1037,26 @@ fn extract_identity_from_tokens(tokens: &OAuthTokenResponse) -> (Option<String>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_request_matches_official_codex_without_scope_override() {
+        let form = refresh_token_form("refresh-secret");
+        assert_eq!(form.len(), 3);
+        assert!(form.contains(&("grant_type", "refresh_token")));
+        assert!(form.contains(&("refresh_token", "refresh-secret")));
+        assert!(form.contains(&("client_id", CODEX_CLIENT_ID)));
+        assert!(!form.iter().any(|(key, _)| *key == "scope"));
+    }
+
+    #[test]
+    fn refresh_error_keeps_upstream_detail() {
+        assert_eq!(
+            oauth_error_detail(
+                r#"{"error":{"message":"Refresh token was already used","code":"refresh_token_reused"}}"#,
+            ),
+            "Refresh token was already used"
+        );
+    }
 
     #[test]
     fn test_parse_interval_number() {

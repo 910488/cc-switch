@@ -39,6 +39,7 @@ export interface CodexProviderPreset {
   codexChatReasoning?: CodexChatReasoning;
   // Session-based prompt-cache routing override for Chat Completions upstreams
   promptCacheRouting?: PromptCacheRoutingMode;
+  providerType?: string;
 }
 
 /**
@@ -1518,5 +1519,33 @@ base_url = "https://cc-api.pipellm.ai/v1"`,
     ),
     endpointCandidates: ["https://api.therouter.ai/v1"],
     category: "aggregator",
+  },
+  {
+    name: "Grok Build (CLI Proxy)",
+    websiteUrl: "https://grok.com",
+    auth: {
+      OPENAI_API_KEY: "",
+    },
+    config: `model_provider = "custom"
+model = "grok-4.5"
+model_reasoning_effort = "high"
+disable_response_storage = true
+
+[model_providers.custom]
+name = "Grok Build (CLI Proxy)"
+base_url = "https://cli-chat-proxy.grok.com"
+wire_api = "responses"
+requires_openai_auth = true`,
+    category: "custom",
+    providerType: "grok_cli_proxy",
+    apiFormat: "openai_responses",
+    modelCatalog: modelCatalog([
+      {
+        model: "grok-4.5",
+        displayName: "Grok 4.5",
+        contextWindow: 500000,
+      },
+    ]),
+    icon: "grok",
   },
 ];

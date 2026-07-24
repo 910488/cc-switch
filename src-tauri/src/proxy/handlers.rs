@@ -8,29 +8,43 @@
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
 use super::{
+    auto_review::{self, AutoReviewMode},
+    compaction::{
+        executor::{
+            self as compaction_executor, SummaryCall, SummaryCallError, SummaryClient,
+            SummaryExecutionOptions, SummaryReply,
+        },
+        CompactionContext, CompactionService, MaterializationTarget, OfficialRecompactPlan,
+        ProviderRealm, Snapshot,
+    },
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
-    forwarder::ActiveConnectionGuard,
+    forwarder::{
+        ActiveConnectionGuard, ForwardError, ForwardResult, RequestForwarder,
+        INTERNAL_MODEL_OVERRIDE_FIELD, INTERNAL_MODEL_OVERRIDE_HEADER, INTERNAL_SUMMARY_HEADER,
+    },
     handler_config::{
         claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
         CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
     handler_context::RequestContext,
+    model_routes::{self, ResolvedModelRoute},
     providers::{
         codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::record_responses_sse_stream,
-        get_adapter, get_claude_api_format,
+        codex_responses_sse, get_adapter, get_claude_api_format,
         streaming::create_anthropic_sse_stream,
         streaming_codex_anthropic::{
             create_responses_sse_stream_from_anthropic_with_context,
             responses_sse_events_from_anthropic_message,
         },
-        streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
+        streaming_codex_chat::create_responses_sse_stream_from_chat_with_context_and_reasoning_visibility,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_responses::create_anthropic_sse_stream_from_responses,
         transform, transform_codex_anthropic, transform_codex_chat, transform_gemini,
         transform_responses,
     },
+    reasoning_visibility::{hide_reasoning_summaries, hide_reasoning_summaries_stream},
     response_processor::{
         create_logged_passthrough_stream, process_response, read_decoded_body,
         strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
@@ -43,11 +57,24 @@ use super::{
     ProxyError,
 };
 use crate::app_config::AppType;
+use crate::commands::CodexOAuthState;
 use crate::database::PRICING_SOURCE_REQUEST;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use crate::provider::{CodexOfficialAuthMode, Provider};
+use axum::{
+    extract::{
+        ws::{Message as WebSocketMessage, WebSocket, WebSocketUpgrade},
+        OriginalUri, State,
+    },
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    Json,
+};
 use bytes::Bytes;
+use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::pin::Pin;
+use tauri::Manager;
 
 // ============================================================================
 // 健康检查和状态查询（简单端点）
@@ -762,6 +789,877 @@ pub async fn handle_responses(
     handle_responses_for_app(state, request, AppType::Codex, "Codex", "codex").await
 }
 
+/// Bridge Codex's Responses WebSocket transport onto the same HTTP/SSE proxy
+/// pipeline used by `/v1/responses`.  Codex's built-in `openai` provider tries
+/// WebSocket before HTTP even when a generated model entry prefers HTTP; without
+/// this GET upgrade route Axum answers 405 and Codex visibly retries the first
+/// turn before falling back.
+pub async fn handle_responses_websocket(
+    State(state): State<ProxyState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> axum::response::Response {
+    ws.on_upgrade(move |socket| responses_websocket_session(socket, state, uri, headers))
+        .into_response()
+}
+
+async fn responses_websocket_session(
+    mut socket: WebSocket,
+    state: ProxyState,
+    uri: axum::http::Uri,
+    handshake_headers: HeaderMap,
+) {
+    let mut first_message = true;
+    while let Some(message) = socket.recv().await {
+        let text = match message {
+            Ok(WebSocketMessage::Text(text)) => text,
+            Ok(WebSocketMessage::Close(_)) | Err(_) => break,
+            Ok(WebSocketMessage::Binary(_)) => {
+                let _ = send_websocket_error(
+                    &mut socket,
+                    StatusCode::BAD_REQUEST,
+                    "binary Responses WebSocket requests are not supported",
+                )
+                .await;
+                continue;
+            }
+            Ok(WebSocketMessage::Ping(_)) | Ok(WebSocketMessage::Pong(_)) => continue,
+        };
+
+        let mut body: Value = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = send_websocket_error(
+                    &mut socket,
+                    StatusCode::BAD_REQUEST,
+                    &format!("invalid Responses WebSocket JSON: {error}"),
+                )
+                .await;
+                continue;
+            }
+        };
+
+        // The official Responses WebSocket is more than an alternate transport
+        // for POST /responses: it carries desktop-presence state used by mobile
+        // pairing and the native remote-compaction v2 protocol.  Terminating it
+        // locally and translating it to HTTP makes the paired computer appear
+        // offline and can turn a valid compact response into zero recognized
+        // compaction items.  Once the first request resolves to an official
+        // catalog entry, keep the whole socket native and relay it end-to-end.
+        // A bridge compaction token is encrypted by CC Switch, not OpenAI.
+        // The native relay re-tokenizes such items through /responses/compact,
+        // restores the WebSocket-only compaction trigger, and then keeps the
+        // original socket native end-to-end.
+        if first_message && websocket_model_uses_official_route(&state, &body) {
+            if let Err(error) = relay_official_responses_websocket(
+                &mut socket,
+                text.as_str(),
+                &uri,
+                &handshake_headers,
+                &state,
+            )
+            .await
+            {
+                let _ = send_websocket_error(
+                    &mut socket,
+                    StatusCode::BAD_GATEWAY,
+                    &format!("official Responses WebSocket relay failed: {error}"),
+                )
+                .await;
+            }
+            return;
+        }
+        first_message = false;
+
+        if body.get("type").and_then(Value::as_str) != Some("response.create") {
+            let _ = send_websocket_error(
+                &mut socket,
+                StatusCode::BAD_REQUEST,
+                "expected a response.create WebSocket request",
+            )
+            .await;
+            continue;
+        }
+        if let Some(object) = body.as_object_mut() {
+            object.remove("type");
+            // `generate` is a WebSocket-only control.  For the v2 prewarm form
+            // (`false`) we deliberately execute the full HTTP request so the
+            // returned response id remains a valid continuation anchor for
+            // both native and Chat-transformed upstreams.
+            object.remove("generate");
+        }
+
+        let request = match responses_websocket_http_request(&uri, &handshake_headers, &body) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ =
+                    send_websocket_error(&mut socket, StatusCode::BAD_REQUEST, &error.to_string())
+                        .await;
+                continue;
+            }
+        };
+        let response = match handle_responses(State(state.clone()), request).await {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
+        };
+        if stream_http_response_to_websocket(&mut socket, response)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn websocket_model_uses_official_route(state: &ProxyState, body: &Value) -> bool {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match model_routes::resolve(&state.db, model) {
+        Ok(Some(ResolvedModelRoute::ThirdParty(_))) => false,
+        // With a coexistence route table, older native model slugs and the
+        // model-less desktop-presence prewarm resolve as official. Managed
+        // third-party menu entries always have an explicit `ccs-*` route.
+        Ok(Some(ResolvedModelRoute::Official)) => true,
+        Ok(None) => crate::settings::get_current_provider(&AppType::Codex)
+            .and_then(|provider_id| {
+                state
+                    .db
+                    .get_provider_by_id(&provider_id, "codex")
+                    .ok()
+                    .flatten()
+            })
+            .is_some_and(|provider| super::providers::is_codex_official_provider(&provider)),
+        Err(error) => {
+            log::warn!("[Codex] unable to resolve WebSocket model route: {error}");
+            false
+        }
+    }
+}
+
+fn contains_bridge_compaction(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            let is_bridge_compaction = object.get("type").and_then(Value::as_str)
+                == Some("compaction")
+                && object
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|encrypted| {
+                        encrypted.starts_with(crate::proxy::compaction::model::ENVELOPE_PREFIX)
+                    });
+            is_bridge_compaction || object.values().any(contains_bridge_compaction)
+        }
+        Value::Array(items) => items.iter().any(contains_bridge_compaction),
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingOfficialWebsocketCompaction {
+    context: CompactionContext,
+    snapshot: Snapshot,
+    provider_id: String,
+}
+
+fn canonical_responses_websocket_body(mut body: Value) -> Value {
+    if let Some(object) = body.as_object_mut() {
+        object.remove("type");
+        object.remove("generate");
+    }
+    body
+}
+
+fn prepare_official_websocket_compaction_journal(
+    state: &ProxyState,
+    headers: &HeaderMap,
+    body: &Value,
+    provider_id: &str,
+) -> Result<Option<PendingOfficialWebsocketCompaction>, String> {
+    let canonical = canonical_responses_websocket_body(body.clone());
+    if !CompactionService::is_compaction_request(&canonical)
+        || !state.compaction_service.rollout_mode().captures_official()
+    {
+        return Ok(None);
+    }
+    let context = CompactionService::context_from_request(headers, &canonical, "websocket");
+    let snapshot = state
+        .compaction_service
+        .save_snapshot(&context, &canonical, ProviderRealm::Official)
+        .map_err(|error| error.to_string())?;
+    log::info!(
+        "[Compaction] journaled official WebSocket compact request as snapshot {}",
+        snapshot.id
+    );
+    Ok(Some(PendingOfficialWebsocketCompaction {
+        context,
+        snapshot,
+        provider_id: provider_id.to_string(),
+    }))
+}
+
+fn register_official_websocket_compaction(
+    state: &ProxyState,
+    pending: &PendingOfficialWebsocketCompaction,
+    event: &Value,
+) -> Result<bool, String> {
+    if event.get("type").and_then(Value::as_str) != Some("response.completed") {
+        return Ok(false);
+    }
+    let items = event
+        .pointer("/response/output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return Ok(false);
+    }
+    for item in &items {
+        state
+            .compaction_service
+            .register_native_compaction(
+                &pending.context,
+                &pending.snapshot,
+                &pending.provider_id,
+                item,
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    log::info!(
+        "[Compaction] registered {} official WebSocket compaction item(s) against snapshot {}",
+        items.len(),
+        pending.snapshot.id
+    );
+    Ok(true)
+}
+
+async fn relay_official_responses_websocket(
+    local: &mut WebSocket,
+    first_message: &str,
+    uri: &axum::http::Uri,
+    client_headers: &HeaderMap,
+    state: &ProxyState,
+) -> Result<(), String> {
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+    let upstream_url = official_responses_websocket_url();
+    let mut request = upstream_url
+        .into_client_request()
+        .map_err(|error| error.to_string())?;
+    let managed_auth = resolve_official_websocket_managed_auth(state).await?;
+
+    apply_official_websocket_headers(request.headers_mut(), client_headers, managed_auth.as_ref())?;
+    if let Some(managed_auth) = managed_auth {
+        log::info!(
+            "[Codex] official Responses WebSocket uses managed ChatGPT account {}",
+            managed_auth.account_id
+        );
+    }
+
+    let (upstream, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (mut upstream_write, mut upstream_read) = upstream.split();
+    let first_message = match serde_json::from_str::<Value>(first_message) {
+        Ok(body) if contains_bridge_compaction(&body) => {
+            log::info!(
+                "[Codex] re-tokenizing the initial bridge-compaction WebSocket request before native relay"
+            );
+            let mut rewritten =
+                rewrite_bridge_compaction_for_official_websocket(uri, client_headers, state, body)
+                    .await?;
+            log_official_websocket_sanitization(
+                "initial rewritten",
+                super::forwarder::sanitize_official_responses_input_items(&mut rewritten),
+            );
+            rewritten.to_string()
+        }
+        Ok(mut body) => {
+            log_official_websocket_sanitization(
+                "initial",
+                super::forwarder::sanitize_official_responses_input_items(&mut body),
+            );
+            body.to_string()
+        }
+        Err(_) => first_message.to_string(),
+    };
+    let mut pending_official_compaction = serde_json::from_str::<Value>(&first_message)
+        .map_err(|error| error.to_string())
+        .and_then(|body| {
+            prepare_official_websocket_compaction_journal(
+                state,
+                client_headers,
+                &body,
+                crate::database::CODEX_OFFICIAL_PROVIDER_ID,
+            )
+        })?;
+    upstream_write
+        .send(Message::Text(first_message))
+        .await
+        .map_err(|error| error.to_string())?;
+
+    loop {
+        tokio::select! {
+            local_message = local.recv() => {
+                let Some(local_message) = local_message else { break };
+                let local_message = local_message.map_err(|error| error.to_string())?;
+                let mut sanitized_text = None;
+                if let WebSocketMessage::Text(text) = &local_message {
+                    if let Ok(mut body) = serde_json::from_str::<Value>(text) {
+                        if !websocket_model_uses_official_route(state, &body) {
+                            log::info!(
+                                "[Codex] routing a later third-party WebSocket request through the HTTP transformation pipeline"
+                            );
+                            if let Err(error) = bridge_responses_websocket_message_to_http(
+                                local,
+                                uri,
+                                client_headers,
+                                state,
+                                body,
+                            )
+                            .await
+                            {
+                                log::warn!(
+                                    "[Codex] third-party WebSocket bridge failed: {error}"
+                                );
+                                send_websocket_error(local, StatusCode::BAD_GATEWAY, &error)
+                                    .await
+                                    .map_err(|send_error| send_error.to_string())?;
+                            }
+                            // Keep the local socket and idle official upstream
+                            // alive. A later response.create may switch back to
+                            // an official model on this same Codex connection.
+                            continue;
+                        }
+                        if contains_bridge_compaction(&body) {
+                            log::info!(
+                                "[Codex] re-tokenizing a later bridge-compaction WebSocket request before native relay"
+                            );
+                            match rewrite_bridge_compaction_for_official_websocket(
+                                uri,
+                                client_headers,
+                                state,
+                                body,
+                            )
+                            .await
+                            {
+                                Ok(rewritten) => {
+                                    let mut rewritten = rewritten;
+                                    log_official_websocket_sanitization(
+                                        "later rewritten",
+                                        super::forwarder::sanitize_official_responses_input_items(
+                                            &mut rewritten,
+                                        ),
+                                    );
+                                    if let Some(pending) =
+                                        prepare_official_websocket_compaction_journal(
+                                            state,
+                                            client_headers,
+                                            &rewritten,
+                                            crate::database::CODEX_OFFICIAL_PROVIDER_ID,
+                                        )?
+                                    {
+                                        pending_official_compaction = Some(pending);
+                                    }
+                                    upstream_write
+                                        .send(Message::Text(rewritten.to_string()))
+                                        .await
+                                        .map_err(|error| error.to_string())?;
+                                }
+                                Err(error) => {
+                                    log::warn!(
+                                        "[Codex] unable to re-tokenize bridge compaction for native WebSocket relay: {error}"
+                                    );
+                                    send_websocket_error(local, StatusCode::BAD_GATEWAY, &error)
+                                        .await
+                                        .map_err(|send_error| send_error.to_string())?;
+                                }
+                            }
+                            // Do not close either side. Remote compaction v2 is
+                            // multiplexed onto the long-lived native socket and
+                            // expects OpenAI's native compaction output on that
+                            // same connection.
+                            continue;
+                        }
+                        log_official_websocket_sanitization(
+                            "later",
+                            super::forwarder::sanitize_official_responses_input_items(&mut body),
+                        );
+                        if let Some(pending) = prepare_official_websocket_compaction_journal(
+                            state,
+                            client_headers,
+                            &body,
+                            crate::database::CODEX_OFFICIAL_PROVIDER_ID,
+                        )? {
+                            pending_official_compaction = Some(pending);
+                        }
+                        sanitized_text = Some(body.to_string());
+                    }
+                }
+                let upstream_message = match local_message {
+                    WebSocketMessage::Text(text) => Message::Text(
+                        sanitized_text.unwrap_or_else(|| text.to_string())
+                    ),
+                    WebSocketMessage::Binary(bytes) => Message::Binary(bytes),
+                    WebSocketMessage::Ping(bytes) => Message::Ping(bytes),
+                    WebSocketMessage::Pong(bytes) => Message::Pong(bytes),
+                    WebSocketMessage::Close(frame) => {
+                        let frame = frame.map(|frame| tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                            code: frame.code.into(),
+                            reason: frame.reason.to_string().into(),
+                        });
+                        Message::Close(frame)
+                    }
+                };
+                let closing = upstream_message.is_close();
+                upstream_write.send(upstream_message).await.map_err(|error| error.to_string())?;
+                if closing { break; }
+            }
+            upstream_message = upstream_read.next() => {
+                let Some(upstream_message) = upstream_message else { break };
+                let upstream_message = upstream_message.map_err(|error| error.to_string())?;
+                if let Message::Text(text) = &upstream_message {
+                    if let (Some(pending), Ok(event)) = (
+                        pending_official_compaction.as_ref(),
+                        serde_json::from_str::<Value>(text),
+                    ) {
+                        if register_official_websocket_compaction(state, pending, &event)? {
+                            // Registration is durable before the compaction item
+                            // becomes visible to Codex and can later cross realm.
+                            pending_official_compaction = None;
+                        } else if matches!(
+                            event.get("type").and_then(Value::as_str),
+                            Some("response.failed" | "error")
+                        ) {
+                            pending_official_compaction = None;
+                        }
+                    }
+                }
+                let local_message = match upstream_message {
+                    Message::Text(text) => WebSocketMessage::Text(text.to_string()),
+                    Message::Binary(bytes) => WebSocketMessage::Binary(bytes),
+                    Message::Ping(bytes) => WebSocketMessage::Ping(bytes),
+                    Message::Pong(bytes) => WebSocketMessage::Pong(bytes),
+                    Message::Close(frame) => {
+                        let frame = frame.map(|frame| axum::extract::ws::CloseFrame {
+                            code: frame.code.into(),
+                            reason: frame.reason.to_string().into(),
+                        });
+                        WebSocketMessage::Close(frame)
+                    }
+                    Message::Frame(_) => continue,
+                };
+                let closing = matches!(local_message, WebSocketMessage::Close(_));
+                local.send(local_message).await.map_err(|error| error.to_string())?;
+                if closing { break; }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn log_official_websocket_sanitization(
+    stage: &str,
+    (message_ids, reasoning_items, bridge_reasoning_fields): (usize, usize, usize),
+) {
+    if message_ids > 0 || reasoning_items > 0 || bridge_reasoning_fields > 0 {
+        log::info!(
+            "[Codex] sanitized {stage} official WebSocket input: message_ids={message_ids}, reasoning_items={reasoning_items}, bridge_reasoning_fields={bridge_reasoning_fields}"
+        );
+    }
+}
+
+async fn bridge_responses_websocket_message_to_http(
+    socket: &mut WebSocket,
+    uri: &axum::http::Uri,
+    handshake_headers: &HeaderMap,
+    state: &ProxyState,
+    mut body: Value,
+) -> Result<(), String> {
+    if body.get("type").and_then(Value::as_str) != Some("response.create") {
+        return Err("expected a response.create WebSocket request".to_string());
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.remove("type");
+        object.remove("generate");
+    }
+    let request = responses_websocket_http_request(uri, handshake_headers, &body)
+        .map_err(|error| error.to_string())?;
+    let response = match handle_responses(State(state.clone()), request).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
+    stream_http_response_to_websocket(socket, response)
+        .await
+        .map_err(|_| "failed to stream the HTTP transformation response to WebSocket".to_string())
+}
+
+async fn rewrite_bridge_compaction_for_official_websocket(
+    uri: &axum::http::Uri,
+    handshake_headers: &HeaderMap,
+    state: &ProxyState,
+    mut websocket_body: Value,
+) -> Result<Value, String> {
+    if websocket_body.get("type").and_then(Value::as_str) != Some("response.create") {
+        return Err("expected a response.create WebSocket request".to_string());
+    }
+    let message_type = websocket_body.get("type").cloned();
+    let generate = websocket_body.get("generate").cloned();
+    let compaction_triggers = websocket_body
+        .get("input")
+        .and_then(Value::as_array)
+        .map(|input| {
+            input
+                .iter()
+                .filter(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("compaction_trigger")
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(object) = websocket_body.as_object_mut() {
+        object.remove("type");
+        object.remove("generate");
+    }
+
+    // Build the same sanitized HTTP context used by /responses, but only use it
+    // to exchange the CC Switch bridge envelope for an OpenAI-native compaction
+    // item. The resumed request itself stays on the original WebSocket so Codex
+    // remote compaction v2 keeps its native transport and output contract.
+    let request = responses_websocket_http_request(uri, handshake_headers, &websocket_body)
+        .map_err(|error| error.to_string())?;
+    let (parts, _) = request.into_parts();
+    let mut headers = parts.headers;
+    let mut body = websocket_body;
+    let mut ctx = RequestContext::new(state, &body, &headers, AppType::Codex, "Codex", "codex")
+        .await
+        .map_err(|error| error.to_string())?;
+    apply_codex_model_route(state, &mut body, &mut headers, &mut ctx)
+        .map_err(|error| error.to_string())?;
+    let endpoint = endpoint_with_query(uri, "/responses");
+    if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint)
+        || super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint)
+    {
+        return Err(
+            "bridge compaction WebSocket request did not resolve to an official provider"
+                .to_string(),
+        );
+    }
+    let continuity_context =
+        CompactionService::context_from_request(&headers, &body, &ctx.session_id);
+    let forwarder = ctx.create_forwarder(state);
+    let mut rewritten = try_official_recompact(
+        &forwarder,
+        &AppType::Codex,
+        http::Method::POST,
+        headers,
+        "Codex",
+        ctx.app_config.non_streaming_timeout,
+        state,
+        &continuity_context,
+        &ctx.provider,
+        &body,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if contains_bridge_compaction(&rewritten) {
+        return Err(
+            "official WebSocket rewrite still contains a bridge compaction envelope".to_string(),
+        );
+    }
+    if !compaction_triggers.is_empty() {
+        let input = rewritten
+            .get_mut("input")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| "rewritten official WebSocket request has no input array".to_string())?;
+        if !input
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"))
+        {
+            input.extend(compaction_triggers);
+        }
+    }
+    if let Some(object) = rewritten.as_object_mut() {
+        if let Some(message_type) = message_type {
+            object.insert("type".to_string(), message_type);
+        }
+        if let Some(generate) = generate {
+            object.insert("generate".to_string(), generate);
+        }
+    }
+    Ok(rewritten)
+}
+
+struct OfficialWebsocketManagedAuth {
+    access_token: String,
+    account_id: String,
+}
+
+fn apply_official_websocket_headers(
+    upstream_headers: &mut HeaderMap,
+    client_headers: &HeaderMap,
+    managed_auth: Option<&OfficialWebsocketManagedAuth>,
+) -> Result<(), String> {
+    // Keep Codex feature headers, while allowing tungstenite to generate a
+    // valid upstream handshake instead of forwarding localhost Host, Origin,
+    // connection and Sec-WebSocket key material. A managed official binding
+    // owns both account headers, so the Codex app's native identity is removed.
+    for (name, value) in client_headers {
+        if matches!(
+            name.as_str(),
+            "host"
+                | "origin"
+                | "connection"
+                | "upgrade"
+                | "sec-websocket-key"
+                | "sec-websocket-version"
+                | "sec-websocket-accept"
+                | "sec-websocket-extensions"
+        ) {
+            continue;
+        }
+        if managed_auth.is_some()
+            && (name == http::header::AUTHORIZATION
+                || name.as_str().eq_ignore_ascii_case("chatgpt-account-id"))
+        {
+            continue;
+        }
+        upstream_headers.insert(name.clone(), value.clone());
+    }
+    if let Some(managed_auth) = managed_auth {
+        upstream_headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(&format!("Bearer {}", managed_auth.access_token))
+                .map_err(|error| error.to_string())?,
+        );
+        upstream_headers.insert(
+            http::HeaderName::from_static("chatgpt-account-id"),
+            http::HeaderValue::from_str(&managed_auth.account_id)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(())
+}
+
+async fn resolve_official_websocket_managed_auth(
+    state: &ProxyState,
+) -> Result<Option<OfficialWebsocketManagedAuth>, String> {
+    let provider = state
+        .db
+        .get_provider_by_id(crate::database::CODEX_OFFICIAL_PROVIDER_ID, "codex")
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "OpenAI Official provider is unavailable".to_string())?;
+    let mode = provider
+        .meta
+        .as_ref()
+        .map(|meta| meta.codex_official_auth_mode())
+        .unwrap_or_default();
+    if mode == CodexOfficialAuthMode::Native {
+        return Ok(None);
+    }
+
+    let app_handle = state
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| "Codex OAuth authentication is unavailable".to_string())?;
+    let codex_state = app_handle.state::<CodexOAuthState>();
+    let manager = codex_state.0.read().await;
+    let bound_account_id = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.managed_account_id_for("codex_oauth"));
+    let account_id = match mode {
+        CodexOfficialAuthMode::ManagedAccount => bound_account_id.ok_or_else(|| {
+            "OpenAI Official is configured for a selected account but has no account binding"
+                .to_string()
+        })?,
+        CodexOfficialAuthMode::ManagedDefault => manager
+            .default_account_id()
+            .await
+            .ok_or_else(|| "No default ChatGPT account is configured in CC Switch".to_string())?,
+        CodexOfficialAuthMode::Native => unreachable!(),
+    };
+    let access_token = manager
+        .get_valid_token_for_account(&account_id)
+        .await
+        .map_err(|error| format!("Unable to authenticate the selected ChatGPT account: {error}"))?;
+    Ok(Some(OfficialWebsocketManagedAuth {
+        access_token,
+        account_id,
+    }))
+}
+
+fn official_responses_websocket_url() -> String {
+    #[cfg(test)]
+    if let Ok(url) = std::env::var("CC_SWITCH_TEST_OFFICIAL_WS_URL") {
+        return url;
+    }
+    format!(
+        "{}/responses",
+        super::providers::CHATGPT_CODEX_BASE_URL
+            .trim_end_matches('/')
+            .replacen("https://", "wss://", 1)
+    )
+}
+
+fn responses_websocket_http_request(
+    uri: &axum::http::Uri,
+    handshake_headers: &HeaderMap,
+    body: &Value,
+) -> Result<axum::extract::Request, ProxyError> {
+    let encoded = serde_json::to_vec(body)
+        .map_err(|error| ProxyError::InvalidRequest(format!("invalid request JSON: {error}")))?;
+    let mut headers = handshake_headers.clone();
+    for name in [
+        "connection",
+        "upgrade",
+        "sec-websocket-accept",
+        "sec-websocket-extensions",
+        "sec-websocket-key",
+        "sec-websocket-protocol",
+        "sec-websocket-version",
+        "content-encoding",
+        "content-length",
+    ] {
+        headers.remove(name);
+    }
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    if let Some(metadata) = body.get("client_metadata").and_then(Value::as_object) {
+        for (key, header) in [
+            ("session_id", "session-id"),
+            ("thread_id", "thread-id"),
+            ("turn_id", "x-codex-turn-id"),
+            ("traceparent", "traceparent"),
+        ] {
+            if headers.contains_key(header) {
+                continue;
+            }
+            if let Some(value) = metadata.get(key).and_then(Value::as_str) {
+                if let Ok(value) = axum::http::HeaderValue::from_str(value) {
+                    headers.insert(axum::http::HeaderName::from_static(header), value);
+                }
+            }
+        }
+    }
+
+    let mut request = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri(uri.clone())
+        .body(axum::body::Body::from(encoded))
+        .map_err(|error| ProxyError::InvalidRequest(format!("invalid bridged request: {error}")))?;
+    *request.headers_mut() = headers;
+    Ok(request)
+}
+
+async fn stream_http_response_to_websocket(
+    socket: &mut WebSocket,
+    response: axum::response::Response,
+) -> Result<(), ()> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let is_sse = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    let mut stream = response.into_body().into_data_stream();
+
+    if !status.is_success() || !is_sse {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.map_err(|_| ())?);
+        }
+        if !status.is_success() {
+            let value = serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|_| {
+                json!({"error":{"type":"proxy_error","message":String::from_utf8_lossy(&bytes)}})
+            });
+            let error = value.get("error").cloned().unwrap_or_else(|| value.clone());
+            let payload = json!({
+                "type": "error",
+                "status": status.as_u16(),
+                "error": error,
+            });
+            return socket
+                .send(WebSocketMessage::Text(payload.to_string()))
+                .await
+                .map_err(|_| ());
+        }
+
+        let response_value = serde_json::from_slice::<Value>(&bytes).map_err(|_| ())?;
+        let completed =
+            if response_value.get("type").and_then(Value::as_str) == Some("response.completed") {
+                response_value
+            } else {
+                json!({"type":"response.completed","response":response_value})
+            };
+        return socket
+            .send(WebSocketMessage::Text(completed.to_string()))
+            .await
+            .map_err(|_| ());
+    }
+
+    let mut buffer = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        buffer.extend_from_slice(&chunk.map_err(|_| ())?);
+        while let Some(frame) = take_raw_sse_frame(&mut buffer) {
+            for payload in websocket_payloads_from_sse_frame(&frame) {
+                socket
+                    .send(WebSocketMessage::Text(payload))
+                    .await
+                    .map_err(|_| ())?;
+            }
+        }
+    }
+    if !buffer.is_empty() {
+        for payload in websocket_payloads_from_sse_frame(&buffer) {
+            socket
+                .send(WebSocketMessage::Text(payload))
+                .await
+                .map_err(|_| ())?;
+        }
+    }
+    Ok(())
+}
+
+fn websocket_payloads_from_sse_frame(frame: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(frame);
+    let mut payloads = Vec::new();
+    for line in text.lines() {
+        let Some(data) = strip_sse_field(line, "data") else {
+            continue;
+        };
+        let data = data.trim();
+        if !data.is_empty() && data != "[DONE]" {
+            payloads.push(data.to_string());
+        }
+    }
+    payloads
+}
+
+async fn send_websocket_error(
+    socket: &mut WebSocket,
+    status: StatusCode,
+    message: &str,
+) -> Result<(), axum::Error> {
+    socket
+        .send(WebSocketMessage::Text(
+            json!({
+                "type":"error",
+                "status":status.as_u16(),
+                "error":{"type":"invalid_request_error","message":message}
+            })
+            .to_string(),
+        ))
+        .await
+}
+
 pub async fn handle_grokbuild_responses(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
@@ -794,34 +1692,227 @@ async fn handle_responses_for_app(
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
     let endpoint = endpoint_with_query(&uri, "/responses");
 
+    if app_type == AppType::Codex && auto_review::is_auto_review_request(&body) {
+        let settings = auto_review::load_settings(&state.db)
+            .map_err(|error| ProxyError::ConfigError(error.to_string()))?;
+        if settings.mode != AutoReviewMode::Off {
+            return handle_auto_review_request(
+                &state, method, &endpoint, body, headers, extensions, ctx, settings,
+            )
+            .await;
+        }
+    }
+
+    if app_type == AppType::Codex {
+        apply_codex_model_route(&state, &mut body, &mut headers, &mut ctx)?;
+    }
+
+    let is_compaction = CompactionService::is_compaction_request(&body);
+    let continuity_context =
+        CompactionService::context_from_request(&headers, &body, &ctx.session_id);
+    if app_type == AppType::Codex
+        && (super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint)
+            || super::providers::should_convert_codex_responses_to_anthropic(
+                &ctx.provider,
+                &endpoint,
+            ))
+    {
+        let recovered = state
+            .compaction_service
+            .recover_native_compactions_from_codex_session(
+                &continuity_context,
+                &body,
+                crate::database::CODEX_OFFICIAL_PROVIDER_ID,
+            )
+            .map_err(|error| ProxyError::TransformError(error.to_string()))?;
+        if recovered > 0 {
+            log::warn!(
+                "[Compaction] recovered {recovered} legacy official WebSocket token(s) before third-party materialization"
+            );
+        }
+    }
+    let initial_realm = is_compaction.then(|| {
+        if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint)
+            || super::providers::should_convert_codex_responses_to_anthropic(
+                &ctx.provider,
+                &endpoint,
+            )
+            || super::providers::GrokCliProxyAdapter::is_grok_provider(&ctx.provider)
+        {
+            ProviderRealm::Bridge
+        } else {
+            ProviderRealm::Official
+        }
+    });
+    let rollout_mode = state.compaction_service.rollout_mode();
+    if is_compaction
+        && initial_realm == Some(ProviderRealm::Bridge)
+        && super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint)
+    {
+        let restored = state.codex_chat_history.enrich_request(&mut body).await;
+        if restored > 0 {
+            if let Some(object) = body.as_object_mut() {
+                // A Chat gateway response cursor is provider-local and cannot
+                // serve as canonical history when the snapshot later migrates
+                // to an official Responses realm.
+                object.remove("previous_response_id");
+            }
+            log::info!(
+                "[Compaction] hydrated {restored} previous-response history item(s) before bridge snapshot capture"
+            );
+        }
+    }
+    if initial_realm == Some(ProviderRealm::Bridge) && !rollout_mode.allows_bridge_compaction() {
+        return Err(ProxyError::InvalidRequest(format!(
+            "third-party compaction is disabled in {rollout_mode:?} mode"
+        )));
+    }
+    let should_capture = initial_realm.is_some_and(|realm| match realm {
+        ProviderRealm::Bridge => rollout_mode.allows_bridge_compaction(),
+        ProviderRealm::Official => rollout_mode.captures_official(),
+    });
+    let snapshot = if is_compaction && should_capture {
+        Some(
+            state
+                .compaction_service
+                .save_snapshot(
+                    &continuity_context,
+                    &body,
+                    initial_realm.unwrap_or(ProviderRealm::Official),
+                )
+                .map_err(|error| ProxyError::Internal(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+
     let is_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
-
     let forwarder = ctx.create_forwarder(&state);
-    let mut result = match forwarder
-        .forward_with_retry(
+    let all_providers = ctx.get_providers();
+    if initial_realm == Some(ProviderRealm::Bridge) {
+        if let Some(snapshot) = snapshot.as_ref() {
+            return execute_local_compaction(
+                &forwarder,
+                &app_type,
+                method.clone(),
+                &endpoint,
+                headers.clone(),
+                all_providers,
+                tag,
+                ctx.app_config.non_streaming_timeout,
+                &state,
+                &continuity_context,
+                snapshot,
+                &body,
+                false,
+                is_stream,
+            )
+            .await;
+        }
+    }
+    let initial_provider_is_bridge =
+        super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint)
+            || super::providers::should_convert_codex_responses_to_anthropic(
+                &ctx.provider,
+                &endpoint,
+            );
+    if !is_compaction && !initial_provider_is_bridge {
+        body = try_official_recompact(
+            &forwarder,
             &app_type,
-            method,
+            method.clone(),
+            headers.clone(),
+            tag,
+            ctx.app_config.non_streaming_timeout,
+            &state,
+            &continuity_context,
+            &ctx.provider,
+            &body,
+        )
+        .await?;
+    }
+    let (forward_providers, bridge_providers) = if is_compaction {
+        partition_compaction_providers(all_providers, &endpoint)
+    } else {
+        (all_providers, Vec::new())
+    };
+    let forward_result = if is_compaction {
+        forward_official_compaction_with_retry(
+            &forwarder,
+            &app_type,
+            method.clone(),
             &endpoint,
-            body,
-            headers,
+            body.clone(),
+            headers.clone(),
             extensions,
-            ctx.get_providers(),
+            forward_providers,
         )
         .await
-    {
+    } else {
+        forwarder
+            .forward_with_retry(
+                &app_type,
+                method.clone(),
+                &endpoint,
+                body.clone(),
+                headers.clone(),
+                extensions,
+                forward_providers,
+            )
+            .await
+    };
+    let mut result = match forward_result {
         Ok(result) => result,
         Err(mut err) => {
+            let bridge_providers = if is_compaction
+                && rollout_mode.allows_cross_realm()
+                && official_compaction_quota_exhausted(&err)
+            {
+                state
+                    .compaction_service
+                    .resolve_summary_providers(&app_type, bridge_providers)
+                    .map_err(|error| ProxyError::ConfigError(error.to_string()))?
+            } else {
+                Vec::new()
+            };
+            if !bridge_providers.is_empty() {
+                let snapshot = snapshot.as_ref().ok_or_else(|| {
+                    ProxyError::Internal(
+                        "official compaction fallback has no durable snapshot".to_string(),
+                    )
+                })?;
+                log::warn!(
+                    "Official compaction quota exhausted; using configured third-party summarizer"
+                );
+                return execute_local_compaction(
+                    &forwarder,
+                    &app_type,
+                    method.clone(),
+                    &endpoint,
+                    headers.clone(),
+                    bridge_providers,
+                    tag,
+                    ctx.app_config.non_streaming_timeout,
+                    &state,
+                    &continuity_context,
+                    snapshot,
+                    &body,
+                    false,
+                    is_stream,
+                )
+                .await;
+            }
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
@@ -834,6 +1925,63 @@ async fn handle_responses_for_app(
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
+
+    if let Some(snapshot) = snapshot {
+        if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
+            return handle_local_compaction_response(
+                response,
+                &ctx,
+                &state,
+                connection_guard,
+                &continuity_context,
+                &snapshot,
+                &body,
+                false,
+                is_stream,
+                LocalSummaryProtocol::Anthropic,
+            )
+            .await;
+        }
+        if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint) {
+            return handle_local_compaction_response(
+                response,
+                &ctx,
+                &state,
+                connection_guard,
+                &continuity_context,
+                &snapshot,
+                &body,
+                false,
+                is_stream,
+                LocalSummaryProtocol::Chat,
+            )
+            .await;
+        }
+        if super::providers::GrokCliProxyAdapter::is_grok_provider(&ctx.provider) {
+            return handle_local_compaction_response(
+                response,
+                &ctx,
+                &state,
+                connection_guard,
+                &continuity_context,
+                &snapshot,
+                &body,
+                false,
+                is_stream,
+                LocalSummaryProtocol::Responses,
+            )
+            .await;
+        }
+        return handle_native_compaction_response(
+            response,
+            &ctx,
+            &state,
+            connection_guard,
+            &continuity_context,
+            &snapshot,
+        )
+        .await;
+    }
 
     if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
         return handle_codex_anthropic_to_responses_transform(
@@ -855,6 +2003,7 @@ async fn handle_responses_for_app(
             is_stream,
             connection_guard,
             codex_tool_context,
+            &body,
         )
         .await;
     }
@@ -870,6 +2019,251 @@ async fn handle_responses_for_app(
 }
 
 /// 处理 /v1/responses/compact 请求（OpenAI Responses Compact API - Codex CLI 透传）
+fn apply_codex_model_route(
+    state: &ProxyState,
+    body: &mut Value,
+    headers: &mut axum::http::HeaderMap,
+    ctx: &mut RequestContext,
+) -> Result<(), ProxyError> {
+    let requested_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(route) = model_routes::resolve(&state.db, requested_model)
+        .map_err(|error| ProxyError::ConfigError(error.to_string()))?
+    else {
+        return Ok(());
+    };
+
+    match route {
+        ResolvedModelRoute::Official => {
+            ctx.pin_provider(auto_review::resolve_official_provider(&state.db)?);
+        }
+        ResolvedModelRoute::ThirdParty(route) => {
+            let provider = state
+                .db
+                .get_provider_by_id(&route.provider_id, "codex")
+                .map_err(|error| ProxyError::DatabaseError(error.to_string()))?
+                .ok_or_else(|| {
+                    ProxyError::ConfigError(format!(
+                        "Injected model provider '{}' no longer exists",
+                        route.provider_id
+                    ))
+                })?;
+            if provider.category.as_deref() == Some("official") {
+                return Err(ProxyError::ConfigError(
+                    "Injected third-party model points to an official provider".to_string(),
+                ));
+            }
+            body["model"] = Value::String(route.upstream_model.clone());
+            body[INTERNAL_MODEL_OVERRIDE_FIELD] = Value::String(route.upstream_model);
+            headers.insert(
+                INTERNAL_MODEL_OVERRIDE_HEADER,
+                http::HeaderValue::from_static("1"),
+            );
+            ctx.pin_provider(provider);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_auto_review_request(
+    state: &ProxyState,
+    method: http::Method,
+    endpoint: &str,
+    body: Value,
+    mut headers: axum::http::HeaderMap,
+    extensions: http::Extensions,
+    mut ctx: RequestContext,
+    settings: auto_review::AutoReviewSettings,
+) -> Result<axum::response::Response, ProxyError> {
+    let original_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let forwarder = ctx.create_forwarder(state);
+
+    if settings.mode == AutoReviewMode::Auto {
+        let official = auto_review::resolve_official_provider(&state.db)?;
+        state.auto_review_runtime.record_official_attempt();
+        match forwarder
+            .forward_pinned(
+                &AppType::Codex,
+                method.clone(),
+                endpoint,
+                body.clone(),
+                headers.clone(),
+                extensions.clone(),
+                official,
+            )
+            .await
+        {
+            Ok(result) => {
+                return finish_codex_pinned_response(
+                    result,
+                    &mut ctx,
+                    state,
+                    endpoint,
+                    &body,
+                    original_stream,
+                )
+                .await;
+            }
+            Err(error) if auto_review::is_official_quota_429(&error.error) => {
+                state.auto_review_runtime.record_official_quota_429();
+                log::warn!("[AutoReview] official quota exhausted; using configured fallback");
+            }
+            Err(mut error) => {
+                if let Some(provider) = error.provider.take() {
+                    ctx.provider = provider;
+                }
+                log_forward_error(state, &ctx, original_stream, &error.error);
+                return build_codex_proxy_error_response(&ctx, endpoint, &error.error);
+            }
+        }
+    }
+
+    let fallback = auto_review::resolve_fallback_provider_for_request(&state.db, &settings)?;
+    let mut fallback_body = auto_review::prepare_fallback_body(&body, &settings);
+    // Buffer the substitute result so a JSON markdown fence can be removed
+    // before the response is returned. The client still receives its requested wire mode.
+    fallback_body["stream"] = Value::Bool(false);
+    fallback_body[INTERNAL_MODEL_OVERRIDE_FIELD] = Value::String(settings.fallback_model.clone());
+    headers.insert(
+        INTERNAL_MODEL_OVERRIDE_HEADER,
+        http::HeaderValue::from_static("1"),
+    );
+    state
+        .auto_review_runtime
+        .record_fallback(&fallback.id, &settings.fallback_model)
+        .await;
+
+    let result = match forwarder
+        .forward_pinned(
+            &AppType::Codex,
+            method,
+            endpoint,
+            fallback_body,
+            headers,
+            extensions,
+            fallback,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(mut error) => {
+            state
+                .auto_review_runtime
+                .record_fallback_failure(&error.error)
+                .await;
+            if let Some(provider) = error.provider.take() {
+                ctx.provider = provider;
+            }
+            log_forward_error(state, &ctx, original_stream, &error.error);
+            return build_codex_proxy_error_response(&ctx, endpoint, &error.error);
+        }
+    };
+
+    let response =
+        match finish_codex_pinned_response(result, &mut ctx, state, endpoint, &body, false).await {
+            Ok(response) => response,
+            Err(error) => {
+                state
+                    .auto_review_runtime
+                    .record_fallback_failure(&error)
+                    .await;
+                return Err(error);
+            }
+        };
+    let (parts, response_body) = response.into_parts();
+    let bytes = response_body
+        .collect()
+        .await
+        .map_err(|error| ProxyError::Internal(format!("Failed to buffer Auto Review: {error}")))?
+        .to_bytes();
+    let mut value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        ProxyError::TransformError(format!("Failed to parse Auto Review response: {error}"))
+    })?;
+    auto_review::strip_json_fence_from_response(&mut value);
+    if let Err(error) = auto_review::validate_assessment_response(&value) {
+        state
+            .auto_review_runtime
+            .record_fallback_failure(&error)
+            .await;
+        return Err(error);
+    }
+    let output = if original_stream {
+        auto_review::response_to_sse(&value)?
+    } else {
+        serde_json::to_vec(&value).map_err(|error| {
+            ProxyError::TransformError(format!("Failed to encode Auto Review response: {error}"))
+        })?
+    };
+    let mut response_headers = parts.headers;
+    strip_hop_by_hop_response_headers(&mut response_headers);
+    response_headers.remove(axum::http::header::CONTENT_LENGTH);
+    response_headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static(if original_stream {
+            "text/event-stream"
+        } else {
+            "application/json"
+        }),
+    );
+    let mut builder = axum::response::Response::builder().status(parts.status);
+    for (name, value) in &response_headers {
+        builder = builder.header(name, value);
+    }
+    let response = builder
+        .body(axum::body::Body::from(output))
+        .map_err(|error| ProxyError::Internal(format!("Failed to replay Auto Review: {error}")))?;
+    state.auto_review_runtime.record_fallback_success().await;
+    Ok(response)
+}
+
+async fn finish_codex_pinned_response(
+    mut result: super::forwarder::ForwardResult,
+    ctx: &mut RequestContext,
+    state: &ProxyState,
+    endpoint: &str,
+    request_body: &Value,
+    is_stream: bool,
+) -> Result<axum::response::Response, ProxyError> {
+    let connection_guard = result.connection_guard.take();
+    ctx.outbound_model = result.outbound_model.take();
+    ctx.provider = result.provider;
+    let tool_context = transform_codex_chat::build_codex_tool_context_from_request(request_body);
+    if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, endpoint) {
+        return handle_codex_anthropic_to_responses_transform(
+            result.response,
+            ctx,
+            state,
+            is_stream,
+            connection_guard,
+            tool_context,
+        )
+        .await;
+    }
+    if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, endpoint) {
+        return handle_codex_chat_to_responses_transform(
+            result.response,
+            ctx,
+            state,
+            is_stream,
+            connection_guard,
+            tool_context,
+            request_body,
+        )
+        .await;
+    }
+    process_response(
+        result.response,
+        ctx,
+        state,
+        &CODEX_PARSER_CONFIG,
+        connection_guard,
+    )
+    .await
+}
+
 pub async fn handle_responses_compact(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
@@ -909,34 +2303,131 @@ async fn handle_responses_compact_for_app(
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
 
+    if app_type == AppType::Codex {
+        apply_codex_model_route(&state, &mut body, &mut headers, &mut ctx)?;
+    }
+
+    let continuity_context =
+        CompactionService::context_from_request(&headers, &body, &ctx.session_id);
+    let initial_realm =
+        if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint)
+            || super::providers::should_convert_codex_responses_to_anthropic(
+                &ctx.provider,
+                &endpoint,
+            )
+            || super::providers::GrokCliProxyAdapter::is_grok_provider(&ctx.provider)
+        {
+            ProviderRealm::Bridge
+        } else {
+            ProviderRealm::Official
+        };
+    let rollout_mode = state.compaction_service.rollout_mode();
+    if initial_realm == ProviderRealm::Bridge && !rollout_mode.allows_bridge_compaction() {
+        return Err(ProxyError::InvalidRequest(format!(
+            "third-party compaction is disabled in {rollout_mode:?} mode"
+        )));
+    }
+    // Fail closed: never let the client receive an opaque compaction token unless
+    // the exact canonical request was durably journaled first.
+    let snapshot = if initial_realm == ProviderRealm::Bridge || rollout_mode.captures_official() {
+        Some(
+            state
+                .compaction_service
+                .save_snapshot(&continuity_context, &body, initial_realm)
+                .map_err(|error| ProxyError::Internal(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+
     let is_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
 
     let forwarder = ctx.create_forwarder(&state);
-    let mut result = match forwarder
-        .forward_with_retry(
+    let all_providers = ctx.get_providers();
+    if initial_realm == ProviderRealm::Bridge {
+        let snapshot = snapshot.as_ref().ok_or_else(|| {
+            ProxyError::Internal("bridge compaction journal was not captured".to_string())
+        })?;
+        return execute_local_compaction(
+            &forwarder,
             &app_type,
-            method,
+            method.clone(),
             &endpoint,
-            body,
-            headers,
-            extensions,
-            ctx.get_providers(),
+            headers.clone(),
+            all_providers,
+            tag,
+            ctx.app_config.non_streaming_timeout,
+            &state,
+            &continuity_context,
+            snapshot,
+            &body,
+            true,
+            is_stream,
         )
-        .await
+        .await;
+    }
+    let (official_providers, bridge_providers) =
+        partition_compaction_providers(all_providers, &endpoint);
+    let mut result = match forward_official_compaction_with_retry(
+        &forwarder,
+        &app_type,
+        method.clone(),
+        &endpoint,
+        body.clone(),
+        headers.clone(),
+        extensions,
+        official_providers,
+    )
+    .await
     {
         Ok(result) => result,
         Err(mut err) => {
+            let bridge_providers =
+                if rollout_mode.allows_cross_realm() && official_compaction_quota_exhausted(&err) {
+                    state
+                        .compaction_service
+                        .resolve_summary_providers(&app_type, bridge_providers)
+                        .map_err(|error| ProxyError::ConfigError(error.to_string()))?
+                } else {
+                    Vec::new()
+                };
+            if !bridge_providers.is_empty() {
+                let snapshot = snapshot.as_ref().ok_or_else(|| {
+                    ProxyError::Internal(
+                        "official compaction fallback has no durable snapshot".to_string(),
+                    )
+                })?;
+                log::warn!(
+                    "Official compaction quota exhausted; using configured third-party summarizer"
+                );
+                return execute_local_compaction(
+                    &forwarder,
+                    &app_type,
+                    method.clone(),
+                    &endpoint,
+                    headers.clone(),
+                    bridge_providers,
+                    tag,
+                    ctx.app_config.non_streaming_timeout,
+                    &state,
+                    &continuity_context,
+                    snapshot,
+                    &body,
+                    true,
+                    is_stream,
+                )
+                .await;
+            }
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
@@ -950,38 +2441,1006 @@ async fn handle_responses_compact_for_app(
     ctx.provider = result.provider;
     let response = result.response;
 
-    if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
-        return handle_codex_anthropic_to_responses_transform(
+    let Some(snapshot) = snapshot else {
+        return process_response(
             response,
             &ctx,
             &state,
-            is_stream,
+            &CODEX_PARSER_CONFIG,
             connection_guard,
-            codex_tool_context,
+        )
+        .await;
+    };
+
+    if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
+        return handle_local_compaction_response(
+            response,
+            &ctx,
+            &state,
+            connection_guard,
+            &continuity_context,
+            &snapshot,
+            &body,
+            true,
+            is_stream,
+            LocalSummaryProtocol::Anthropic,
         )
         .await;
     }
 
     if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint) {
-        return handle_codex_chat_to_responses_transform(
+        return handle_local_compaction_response(
             response,
             &ctx,
             &state,
-            is_stream,
             connection_guard,
-            codex_tool_context,
+            &continuity_context,
+            &snapshot,
+            &body,
+            true,
+            is_stream,
+            LocalSummaryProtocol::Chat,
         )
         .await;
     }
 
-    process_response(
+    if super::providers::GrokCliProxyAdapter::is_grok_provider(&ctx.provider) {
+        return handle_local_compaction_response(
+            response,
+            &ctx,
+            &state,
+            connection_guard,
+            &continuity_context,
+            &snapshot,
+            &body,
+            true,
+            is_stream,
+            LocalSummaryProtocol::Responses,
+        )
+        .await;
+    }
+
+    return handle_native_compaction_response(
         response,
         &ctx,
         &state,
-        &CODEX_PARSER_CONFIG,
         connection_guard,
+        &continuity_context,
+        &snapshot,
     )
-    .await
+    .await;
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LocalSummaryProtocol {
+    Responses,
+    Chat,
+    Anthropic,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_official_recompact(
+    forwarder: &RequestForwarder,
+    app_type: &AppType,
+    method: http::Method,
+    headers: axum::http::HeaderMap,
+    tag: &'static str,
+    non_streaming_timeout: u32,
+    state: &ProxyState,
+    continuity_context: &CompactionContext,
+    provider: &Provider,
+    original_body: &Value,
+) -> Result<Value, ProxyError> {
+    let target = MaterializationTarget {
+        provider_id: provider.id.clone(),
+        model: original_body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        realm: ProviderRealm::Official,
+        realm_key: format!("native:{}", provider.id),
+    };
+    let Some(plan) = state
+        .compaction_service
+        .prepare_official_recompact(original_body, &target)
+        .map_err(|error| ProxyError::TransformError(error.to_string()))?
+    else {
+        return Ok(original_body.clone());
+    };
+    if let Some(item) = plan.cached_item.clone() {
+        return Ok(plan.resumed_body(original_body, item));
+    }
+
+    let compact_result = forward_official_compaction_with_retry(
+        forwarder,
+        app_type,
+        method,
+        "/responses/compact",
+        plan.compact_body.clone(),
+        headers,
+        http::Extensions::new(),
+        vec![provider.clone()],
+    )
+    .await;
+    let mut result = match compact_result {
+        Ok(result) => result,
+        Err(error) => {
+            return official_recompact_fallback(
+                state,
+                &plan,
+                format!("official compact request failed: {}", error.error),
+            )
+        }
+    };
+    let status = result.response.status();
+    if !status.is_success() {
+        return official_recompact_fallback(
+            state,
+            &plan,
+            format!("official compact returned HTTP {}", status.as_u16()),
+        );
+    }
+    let timeout = if non_streaming_timeout > 0 {
+        std::time::Duration::from_secs(non_streaming_timeout as u64)
+    } else {
+        std::time::Duration::ZERO
+    };
+    let (response_headers, _status, body_bytes) =
+        match read_decoded_body(result.response, tag, timeout).await {
+            Ok(body) => body,
+            Err(error) => {
+                return official_recompact_fallback(
+                    state,
+                    &plan,
+                    format!("official compact response failed: {error}"),
+                )
+            }
+        };
+    let _connection_guard = result.connection_guard.take();
+    let Some(item) = compaction_items_from_response_bytes(&body_bytes, &response_headers)
+        .into_iter()
+        .next()
+    else {
+        return official_recompact_fallback(
+            state,
+            &plan,
+            "official compact response contained no compaction item".to_string(),
+        );
+    };
+    state
+        .compaction_service
+        .finish_official_recompact(continuity_context, &plan, &target, &item)
+        .map_err(|error| ProxyError::Internal(error.to_string()))?;
+    Ok(plan.resumed_body(original_body, item))
+}
+
+fn official_recompact_fallback(
+    state: &ProxyState,
+    plan: &OfficialRecompactPlan,
+    error: String,
+) -> Result<Value, ProxyError> {
+    let fallback = state
+        .compaction_service
+        .settings()
+        .map(|settings| settings.official_compact_fallback)
+        .unwrap_or(true);
+    if fallback {
+        log::warn!("[Compaction] {error}; using safe canonical materialization fallback");
+        if let Err(store_error) = state
+            .compaction_service
+            .record_official_recompact_failure(plan, true)
+        {
+            log::error!("[Compaction] failed to persist official fallback state: {store_error}");
+        }
+        Ok(plan.fallback_body.clone())
+    } else {
+        if let Err(store_error) = state
+            .compaction_service
+            .record_official_recompact_failure(plan, false)
+        {
+            log::error!("[Compaction] failed to persist official failure state: {store_error}");
+        }
+        Err(ProxyError::UpstreamError {
+            status: 502,
+            body: Some(error),
+        })
+    }
+}
+
+fn partition_compaction_providers(
+    providers: Vec<Provider>,
+    endpoint: &str,
+) -> (Vec<Provider>, Vec<Provider>) {
+    providers.into_iter().partition(|provider| {
+        !super::providers::should_convert_codex_responses_to_chat(provider, endpoint)
+            && !super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint)
+            && !super::providers::GrokCliProxyAdapter::is_grok_provider(provider)
+    })
+}
+
+const MAX_OFFICIAL_COMPACTION_RETRIES: usize = 3;
+const OFFICIAL_COMPACTION_BACKOFF_SECONDS: [u64; MAX_OFFICIAL_COMPACTION_RETRIES] = [1, 2, 4];
+
+fn official_compaction_quota_exhausted(failure: &ForwardError) -> bool {
+    failure
+        .provider
+        .as_ref()
+        .is_some_and(super::providers::is_codex_official_provider)
+        && super::quota_policy::QuotaPolicy::is_hard_quota_error(&failure.error)
+}
+
+fn is_transient_official_compaction_error(error: &ProxyError) -> bool {
+    match error {
+        ProxyError::UpstreamError { status: 429, .. } => {
+            !super::quota_policy::QuotaPolicy::is_hard_quota_error(error)
+        }
+        ProxyError::UpstreamError { status, .. } => (500..=599).contains(status),
+        ProxyError::Timeout(_)
+        | ProxyError::ForwardFailed(_)
+        | ProxyError::ProviderUnhealthy(_)
+        | ProxyError::StreamIdleTimeout(_) => true,
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_official_compaction_with_retry(
+    forwarder: &RequestForwarder,
+    app_type: &AppType,
+    method: http::Method,
+    endpoint: &str,
+    body: Value,
+    headers: axum::http::HeaderMap,
+    extensions: http::Extensions,
+    providers: Vec<Provider>,
+) -> Result<ForwardResult, ForwardError> {
+    let mut retries = 0usize;
+    loop {
+        match forwarder
+            .forward_with_retry(
+                app_type,
+                method.clone(),
+                endpoint,
+                body.clone(),
+                headers.clone(),
+                extensions.clone(),
+                providers.clone(),
+            )
+            .await
+        {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if retries < MAX_OFFICIAL_COMPACTION_RETRIES
+                    && is_transient_official_compaction_error(&error.error) =>
+            {
+                let delay = OFFICIAL_COMPACTION_BACKOFF_SECONDS[retries];
+                retries += 1;
+                log::warn!(
+                    "[Compaction] transient official compact failure; retrying official route {retries}/{MAX_OFFICIAL_COMPACTION_RETRIES} in {delay}s: {}",
+                    error.error
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_local_compaction(
+    forwarder: &RequestForwarder,
+    app_type: &AppType,
+    method: http::Method,
+    endpoint: &str,
+    headers: axum::http::HeaderMap,
+    mut providers: Vec<Provider>,
+    tag: &'static str,
+    non_streaming_timeout: u32,
+    state: &ProxyState,
+    continuity_context: &CompactionContext,
+    snapshot: &Snapshot,
+    original_body: &Value,
+    compact_endpoint: bool,
+    original_stream: bool,
+) -> Result<axum::response::Response, ProxyError> {
+    let settings = state
+        .compaction_service
+        .settings()
+        .map_err(|error| ProxyError::ConfigError(error.to_string()))?;
+    providers = state
+        .compaction_service
+        .resolve_summary_providers(app_type, providers)
+        .map_err(|error| ProxyError::ConfigError(error.to_string()))?;
+    providers.retain(|provider| {
+        super::providers::should_convert_codex_responses_to_chat(provider, endpoint)
+            || super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint)
+            || super::providers::GrokCliProxyAdapter::is_grok_provider(provider)
+    });
+    if providers.is_empty() {
+        return Err(ProxyError::NoAvailableProvider);
+    }
+
+    let mut client = ForwarderSummaryClient {
+        forwarder,
+        app_type,
+        method,
+        endpoint,
+        headers,
+        providers,
+        tag,
+        non_streaming_timeout,
+        summary_model: settings.summary_model.clone(),
+        last_provider: None,
+    };
+    let execution = compaction_executor::execute(
+        &mut client,
+        original_body,
+        SummaryExecutionOptions {
+            input_budget: settings.summary_input_budget,
+            final_max_output_tokens: settings.summary_max_output_tokens,
+        },
+        |progress| {
+            log::info!(
+                "[Compaction] strategy={} phase={} chunks={}/{} retries={} budget={}",
+                progress.strategy,
+                progress.phase,
+                progress.chunks_completed,
+                progress.chunks_total,
+                progress.retries,
+                progress.input_budget
+            );
+            if let Err(error) = state.compaction_service.record_summary_progress(
+                continuity_context,
+                snapshot,
+                &progress,
+            ) {
+                log::error!("[Compaction] failed to persist summary progress: {error}");
+            }
+        },
+    )
+    .await;
+    let execution = match execution {
+        Ok(execution) => execution,
+        Err(error) => {
+            if let Err(store_error) = state.compaction_service.record_summary_failure(
+                continuity_context,
+                snapshot,
+                &error,
+            ) {
+                log::error!("[Compaction] failed to persist summary failure: {store_error}");
+            }
+            return Err(ProxyError::TransformError(error.message));
+        }
+    };
+    let provider = client.last_provider.ok_or_else(|| {
+        ProxyError::Internal("compaction executor completed without a provider".to_string())
+    })?;
+    let item = state
+        .compaction_service
+        .create_bridge_compaction_with_execution(
+            continuity_context,
+            snapshot,
+            &provider.id,
+            &execution.summary,
+            Some(&execution),
+        )
+        .map_err(|error| ProxyError::Internal(error.to_string()))?;
+    build_local_compaction_response(original_body, item, compact_endpoint, original_stream)
+}
+
+struct ForwarderSummaryClient<'a> {
+    forwarder: &'a RequestForwarder,
+    app_type: &'a AppType,
+    method: http::Method,
+    endpoint: &'a str,
+    headers: axum::http::HeaderMap,
+    providers: Vec<Provider>,
+    tag: &'static str,
+    non_streaming_timeout: u32,
+    summary_model: Option<String>,
+    last_provider: Option<Provider>,
+}
+
+impl SummaryClient for ForwarderSummaryClient<'_> {
+    fn summarize<'a>(
+        &'a mut self,
+        call: SummaryCall,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Result<SummaryReply, SummaryCallError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut prepared = CompactionService::prepare_local_summary_request_with(
+                &call.body,
+                &call.prompt,
+                call.max_output_tokens,
+            );
+            if let Some(model) = self.summary_model.as_ref() {
+                prepared["model"] = Value::String(model.clone());
+                prepared[super::forwarder::INTERNAL_SUMMARY_MODEL_FIELD] =
+                    Value::String(model.clone());
+            }
+            let mut headers = self.headers.clone();
+            headers.insert(INTERNAL_SUMMARY_HEADER, http::HeaderValue::from_static("1"));
+            // A saturated NVIDIA worker is temporary capacity pressure, not a
+            // quota failure. Retry the same summary call locally so Codex's
+            // remote-compaction task does not have to tear down and reconnect.
+            const MAX_TRANSIENT_RETRIES: usize = 3;
+            const BACKOFF_SECONDS: [u64; MAX_TRANSIENT_RETRIES] = [1, 2, 4];
+            let mut transient_retries = 0usize;
+            let mut result = loop {
+                match self
+                    .forwarder
+                    .forward_with_retry(
+                        self.app_type,
+                        self.method.clone(),
+                        self.endpoint,
+                        prepared.clone(),
+                        headers.clone(),
+                        http::Extensions::new(),
+                        self.providers.clone(),
+                    )
+                    .await
+                {
+                    Ok(result) => break result,
+                    Err(error)
+                        if transient_retries < MAX_TRANSIENT_RETRIES
+                            && super::quota_policy::QuotaPolicy::is_transient_capacity_error(
+                                &error.error,
+                            ) =>
+                    {
+                        let delay = BACKOFF_SECONDS[transient_retries];
+                        transient_retries += 1;
+                        log::warn!(
+                            "[Compaction] transient worker capacity error; retrying summary call {transient_retries}/{MAX_TRANSIENT_RETRIES} in {delay}s: {}",
+                            error.error
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    }
+                    Err(error) => return Err(summary_call_error(error.error)),
+                }
+            };
+            let protocol = if super::providers::should_convert_codex_responses_to_anthropic(
+                &result.provider,
+                self.endpoint,
+            ) {
+                LocalSummaryProtocol::Anthropic
+            } else if super::providers::should_convert_codex_responses_to_chat(
+                &result.provider,
+                self.endpoint,
+            ) {
+                LocalSummaryProtocol::Chat
+            } else if super::providers::GrokCliProxyAdapter::is_grok_provider(&result.provider) {
+                LocalSummaryProtocol::Responses
+            } else {
+                return Err(SummaryCallError::new(
+                    "summary routing selected a non-bridge provider",
+                    false,
+                ));
+            };
+            let status = result.response.status();
+            if !status.is_success() {
+                return Err(SummaryCallError::new(
+                    format!("summary upstream returned HTTP {}", status.as_u16()),
+                    false,
+                ));
+            }
+            let timeout = if self.non_streaming_timeout > 0 {
+                std::time::Duration::from_secs(self.non_streaming_timeout as u64)
+            } else {
+                std::time::Duration::ZERO
+            };
+            let (_headers, _status, body_bytes) =
+                read_decoded_body(result.response, self.tag, timeout)
+                    .await
+                    .map_err(summary_call_error)?;
+            let _connection_guard = result.connection_guard.take();
+            let upstream = parse_local_summary_value(&body_bytes, protocol)
+                .map_err(|error| SummaryCallError::new(error.to_string(), false))?;
+            let summary = match protocol {
+                LocalSummaryProtocol::Responses => responses_summary_text(&upstream),
+                LocalSummaryProtocol::Chat => chat_summary_text(&upstream),
+                LocalSummaryProtocol::Anthropic => anthropic_summary_text(&upstream),
+            }
+            .filter(|summary| !summary.trim().is_empty())
+            .ok_or_else(|| {
+                SummaryCallError::new("third-party compaction returned an empty summary", false)
+            })?;
+            let usage = summary_usage(&upstream, protocol);
+            self.last_provider = Some(result.provider);
+            Ok(SummaryReply {
+                summary,
+                prompt_tokens: usage.0,
+                completion_tokens: usage.1,
+                total_tokens: usage.2,
+            })
+        })
+    }
+}
+
+fn parse_local_summary_value(
+    body_bytes: &[u8],
+    protocol: LocalSummaryProtocol,
+) -> Result<Value, ProxyError> {
+    let text = String::from_utf8_lossy(body_bytes);
+    match serde_json::from_slice(body_bytes) {
+        Ok(value) => Ok(value),
+        Err(_) if body_looks_like_sse(&text) => match protocol {
+            LocalSummaryProtocol::Responses => responses_sse_to_response_value(&text),
+            LocalSummaryProtocol::Chat => chat_sse_to_response_value(&text),
+            LocalSummaryProtocol::Anthropic => {
+                transform_codex_anthropic::anthropic_sse_to_message_value(&text)
+            }
+        },
+        Err(error) => Err(ProxyError::TransformError(format!(
+            "Failed to parse local compaction response: {error}"
+        ))),
+    }
+}
+
+fn summary_usage(value: &Value, protocol: LocalSummaryProtocol) -> (u64, u64, u64) {
+    let usage = value.get("usage").unwrap_or(&Value::Null);
+    let prompt = match protocol {
+        LocalSummaryProtocol::Responses => usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        LocalSummaryProtocol::Chat => usage
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        LocalSummaryProtocol::Anthropic => usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+    };
+    let completion = match protocol {
+        LocalSummaryProtocol::Responses => usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        LocalSummaryProtocol::Chat => usage
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        LocalSummaryProtocol::Anthropic => usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+    };
+    let total = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(prompt.saturating_add(completion));
+    (prompt, completion, total)
+}
+
+fn summary_call_error(error: ProxyError) -> SummaryCallError {
+    let overflow = match &error {
+        ProxyError::UpstreamError {
+            status: 400 | 413 | 422,
+            body,
+        } => body.as_deref().is_some_and(is_context_overflow_detail),
+        ProxyError::TransformError(message) | ProxyError::InvalidRequest(message) => {
+            is_context_overflow_detail(message)
+        }
+        _ => false,
+    };
+    SummaryCallError::new(error.to_string(), overflow)
+}
+
+fn is_context_overflow_detail(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    [
+        "context length",
+        "context window",
+        "maximum context",
+        "too many tokens",
+        "prompt is too long",
+        "request too large",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_local_compaction_response(
+    response: super::hyper_client::ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    connection_guard: Option<ActiveConnectionGuard>,
+    continuity_context: &CompactionContext,
+    snapshot: &Snapshot,
+    original_body: &Value,
+    compact_endpoint: bool,
+    original_stream: bool,
+    protocol: LocalSummaryProtocol,
+) -> Result<axum::response::Response, ProxyError> {
+    let status = response.status();
+    if !status.is_success() {
+        return handle_codex_chat_error_response(response, ctx, status).await;
+    }
+    let body_timeout =
+        if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
+            std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
+        } else {
+            std::time::Duration::ZERO
+        };
+    let (_headers, _status, body_bytes) =
+        read_decoded_body(response, ctx.tag, body_timeout).await?;
+    let text = String::from_utf8_lossy(&body_bytes);
+    let upstream: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(value) => value,
+        Err(_) if body_looks_like_sse(&text) => match protocol {
+            LocalSummaryProtocol::Responses => responses_sse_to_response_value(&text)?,
+            LocalSummaryProtocol::Chat => chat_sse_to_response_value(&text)?,
+            LocalSummaryProtocol::Anthropic => {
+                transform_codex_anthropic::anthropic_sse_to_message_value(&text)?
+            }
+        },
+        Err(error) => {
+            return Err(ProxyError::TransformError(format!(
+                "Failed to parse local compaction response: {error}"
+            )))
+        }
+    };
+    let summary = match protocol {
+        LocalSummaryProtocol::Responses => responses_summary_text(&upstream),
+        LocalSummaryProtocol::Chat => chat_summary_text(&upstream),
+        LocalSummaryProtocol::Anthropic => anthropic_summary_text(&upstream),
+    }
+    .filter(|summary| !summary.trim().is_empty())
+    .ok_or_else(|| {
+        ProxyError::TransformError("third-party compaction returned an empty summary".to_string())
+    })?;
+
+    let item = state
+        .compaction_service
+        .create_bridge_compaction(
+            continuity_context,
+            snapshot,
+            &ctx.provider.id,
+            summary.trim(),
+        )
+        .map_err(|error| ProxyError::Internal(error.to_string()))?;
+    let _connection_guard = connection_guard;
+    build_local_compaction_response(original_body, item, compact_endpoint, original_stream)
+}
+
+async fn handle_native_compaction_response(
+    response: super::hyper_client::ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    connection_guard: Option<ActiveConnectionGuard>,
+    continuity_context: &CompactionContext,
+    snapshot: &Snapshot,
+) -> Result<axum::response::Response, ProxyError> {
+    let status = response.status();
+    if !status.is_success() {
+        return process_response(response, ctx, state, &CODEX_PARSER_CONFIG, connection_guard)
+            .await;
+    }
+    let is_sse = response.is_sse();
+    let mut headers = response.headers().clone();
+    if is_sse {
+        strip_hop_by_hop_response_headers(&mut headers);
+        headers.remove(axum::http::header::CONTENT_LENGTH);
+        let stream = native_compaction_sse_stream(
+            response,
+            state.compaction_service.clone(),
+            continuity_context.clone(),
+            snapshot.clone(),
+            ctx.provider.id.clone(),
+            connection_guard,
+        );
+        let mut builder = axum::response::Response::builder().status(status);
+        for (key, value) in &headers {
+            builder = builder.header(key, value);
+        }
+        return builder
+            .body(axum::body::Body::from_stream(stream))
+            .map_err(|error| {
+                ProxyError::Internal(format!("Failed to stream compact response: {error}"))
+            });
+    }
+    let body_bytes = response.bytes().await?;
+    let items = compaction_items_from_response_bytes(&body_bytes, &headers);
+    // Current Codex compact endpoints may return a replacement `output`
+    // history made entirely of ordinary ResponseItems.  Opaque `compaction`
+    // items are optional, so journal the ones we see and otherwise replay the
+    // successful upstream response unchanged.
+    for item in &items {
+        state
+            .compaction_service
+            .register_native_compaction(continuity_context, snapshot, &ctx.provider.id, item)
+            .map_err(|error| ProxyError::Internal(error.to_string()))?;
+    }
+    strip_hop_by_hop_response_headers(&mut headers);
+    let mut builder = axum::response::Response::builder().status(status);
+    for (key, value) in &headers {
+        builder = builder.header(key, value);
+    }
+    let _connection_guard = connection_guard;
+    builder
+        .body(axum::body::Body::from(body_bytes))
+        .map_err(|error| {
+            ProxyError::Internal(format!("Failed to replay compact response: {error}"))
+        })
+}
+
+struct NativeCompactionStreamState {
+    upstream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+    buffer: Vec<u8>,
+    service: std::sync::Arc<CompactionService>,
+    context: CompactionContext,
+    snapshot: Snapshot,
+    provider_id: String,
+    registered_ids: std::collections::BTreeSet<String>,
+    finished: bool,
+    _connection_guard: Option<ActiveConnectionGuard>,
+}
+
+fn native_compaction_sse_stream(
+    response: super::hyper_client::ProxyResponse,
+    service: std::sync::Arc<CompactionService>,
+    context: CompactionContext,
+    snapshot: Snapshot,
+    provider_id: String,
+    connection_guard: Option<ActiveConnectionGuard>,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    let upstream = Box::pin(response.bytes_stream());
+    let state = NativeCompactionStreamState {
+        upstream,
+        buffer: Vec::new(),
+        service,
+        context,
+        snapshot,
+        provider_id,
+        registered_ids: std::collections::BTreeSet::new(),
+        finished: false,
+        _connection_guard: connection_guard,
+    };
+
+    futures::stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(frame) = take_raw_sse_frame(&mut state.buffer) {
+                if let Err(error) = register_native_items_in_sse_frame(&mut state, &frame) {
+                    state.finished = true;
+                    return Some((Err(std::io::Error::other(error.to_string())), state));
+                }
+                return Some((Ok(Bytes::from(frame)), state));
+            }
+
+            if state.finished {
+                if !state.buffer.is_empty() {
+                    let trailing = std::mem::take(&mut state.buffer);
+                    return Some((Ok(Bytes::from(trailing)), state));
+                }
+                return None;
+            }
+
+            match state.upstream.next().await {
+                Some(Ok(chunk)) => state.buffer.extend_from_slice(&chunk),
+                Some(Err(error)) => {
+                    state.finished = true;
+                    return Some((Err(error), state));
+                }
+                None => state.finished = true,
+            }
+        }
+    })
+}
+
+fn register_native_items_in_sse_frame(
+    state: &mut NativeCompactionStreamState,
+    frame: &[u8],
+) -> Result<(), crate::error::AppError> {
+    let text = String::from_utf8_lossy(frame);
+    let mut found = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let Some(data) = strip_sse_field(line, "data") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(data) {
+            collect_compaction_items(&value, &mut found);
+        }
+    }
+    for (id, item) in found {
+        if state.registered_ids.insert(id) {
+            state.service.register_native_compaction(
+                &state.context,
+                &state.snapshot,
+                &state.provider_id,
+                &item,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn take_raw_sse_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    let (position, delimiter_len) = match (lf, crlf) {
+        (Some(lf), Some(crlf)) if lf <= crlf => (lf, 2),
+        (Some(_), Some(crlf)) => (crlf, 4),
+        (Some(lf), None) => (lf, 2),
+        (None, Some(crlf)) => (crlf, 4),
+        (None, None) => return None,
+    };
+    Some(buffer.drain(..position + delimiter_len).collect())
+}
+
+fn build_local_compaction_response(
+    original_body: &Value,
+    item: Value,
+    compact_endpoint: bool,
+    stream: bool,
+) -> Result<axum::response::Response, ProxyError> {
+    if compact_endpoint {
+        return Ok(Json(json!({ "output": [item] })).into_response());
+    }
+    let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+    let model = original_body
+        .get("model")
+        .cloned()
+        .unwrap_or_else(|| Value::String("unknown".to_string()));
+    let created_at = chrono::Utc::now().timestamp();
+    let completed = json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": "completed",
+        "model": model,
+        "output": [item.clone()],
+        "parallel_tool_calls": false,
+        "tool_choice": "none",
+        "tools": [],
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    });
+    if !stream {
+        return Ok(Json(completed).into_response());
+    }
+    let created = json!({
+        "id": completed["id"],
+        "object": "response",
+        "created_at": created_at,
+        "status": "in_progress",
+        "model": completed["model"],
+        "output": [],
+    });
+    let chunks = [
+        codex_responses_sse::response_created(&created),
+        codex_responses_sse::response_in_progress(&created),
+        codex_responses_sse::output_item_added(0, &item),
+        codex_responses_sse::output_item_done(0, &item),
+        codex_responses_sse::response_completed(&completed),
+    ];
+    let mut bytes = Vec::new();
+    for chunk in chunks {
+        bytes.extend_from_slice(&chunk);
+    }
+    let mut response = axum::response::Response::new(axum::body::Body::from(bytes));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    Ok(response)
+}
+
+fn responses_summary_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+        if !text.trim().is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    let text = value
+        .get("output")?
+        .as_array()?
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|part| {
+            matches!(
+                part.get("type").and_then(Value::as_str),
+                Some("output_text" | "text")
+            )
+        })
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn chat_summary_text(value: &Value) -> Option<String> {
+    let content = value.pointer("/choices/0/message/content")?;
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => Some(
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
+}
+
+fn anthropic_summary_text(value: &Value) -> Option<String> {
+    Some(
+        value
+            .get("content")?
+            .as_array()?
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn compaction_items_from_response_bytes(
+    bytes: &[u8],
+    headers: &axum::http::HeaderMap,
+) -> Vec<Value> {
+    let text = String::from_utf8_lossy(bytes);
+    let is_sse = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"))
+        || body_looks_like_sse(&text);
+    let mut found = std::collections::BTreeMap::new();
+    if is_sse {
+        for line in text.lines() {
+            let Some(data) = strip_sse_field(line, "data") else {
+                continue;
+            };
+            if data.trim().is_empty() || data.trim() == "[DONE]" {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(data.trim()) {
+                collect_compaction_items(&value, &mut found);
+            }
+        }
+    } else if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        collect_compaction_items(&value, &mut found);
+    }
+    found.into_values().collect()
+}
+
+fn collect_compaction_items(value: &Value, found: &mut std::collections::BTreeMap<String, Value>) {
+    match value {
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("compaction") {
+                let id = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                found.insert(id, value.clone());
+                return;
+            }
+            for child in object.values() {
+                collect_compaction_items(child, found);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_compaction_items(item, found);
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn handle_codex_chat_to_responses_transform(
@@ -991,6 +3450,7 @@ async fn handle_codex_chat_to_responses_transform(
     is_stream: bool,
     connection_guard: Option<ActiveConnectionGuard>,
     tool_context: transform_codex_chat::CodexToolContext,
+    request_body: &Value,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
 
@@ -1003,8 +3463,17 @@ async fn handle_codex_chat_to_responses_transform(
 
     if is_stream || response.is_sse() {
         let stream = response.bytes_stream();
-        let sse_stream = create_responses_sse_stream_from_chat_with_context(stream, tool_context);
-        let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
+        let sse_stream =
+            create_responses_sse_stream_from_chat_with_context_and_reasoning_visibility(
+                stream,
+                tool_context,
+                false,
+            );
+        let sse_stream = record_responses_sse_stream(
+            sse_stream,
+            state.codex_chat_history.clone(),
+            request_body.clone(),
+        );
 
         let usage_collector = if usage_logging_enabled(state) {
             let state = state.clone();
@@ -1124,7 +3593,7 @@ async fn handle_codex_chat_to_responses_transform(
             ));
         }
     };
-    let responses_response = transform_codex_chat::chat_completion_to_response_with_context(
+    let mut responses_response = transform_codex_chat::chat_completion_to_response_with_context(
         chat_response,
         &tool_context,
     )
@@ -1132,9 +3601,10 @@ async fn handle_codex_chat_to_responses_transform(
         log::error!("[Codex] Chat → Responses 响应转换失败: {e}");
         e
     })?;
+    hide_reasoning_summaries(&mut responses_response);
     state
         .codex_chat_history
-        .record_response(&responses_response)
+        .record_exchange(request_body, &responses_response)
         .await;
 
     // 上游非流式 Chat 省略 usage 时，chat_usage_to_responses_usage 会合成全 0 usage
@@ -1295,7 +3765,7 @@ async fn handle_codex_anthropic_to_responses_transform(
     }
 
     let _connection_guard = connection_guard;
-    let responses_response =
+    let mut responses_response =
         transform_codex_anthropic::anthropic_response_to_responses_with_context(
             anthropic_response,
             &codex_tool_context,
@@ -1304,6 +3774,7 @@ async fn handle_codex_anthropic_to_responses_transform(
             log::error!("[Codex] Failed to convert Anthropic response to Responses: {e}");
             e
         })?;
+    hide_reasoning_summaries(&mut responses_response);
 
     if let Some(usage) = TokenUsage::from_codex_response_auto(&responses_response)
         .filter(TokenUsage::has_billable_tokens)
@@ -1436,6 +3907,7 @@ fn build_codex_anthropic_sse_response(
         None
     };
 
+    let sse_stream = hide_reasoning_summaries_stream(sse_stream);
     let logged_stream = create_logged_passthrough_stream(
         sse_stream,
         ctx.tag,
@@ -1540,8 +4012,9 @@ fn build_codex_proxy_error_response(
     endpoint: &str,
     error: &ProxyError,
 ) -> Result<axum::response::Response, ProxyError> {
-    let status = axum::http::StatusCode::from_u16(map_proxy_error_to_status(error))
-        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let status =
+        axum::http::StatusCode::from_u16(codex_proxy_response_status(&ctx.provider, error))
+            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     let body = codex_proxy_error_json(&ctx.provider.name, &ctx.request_model, endpoint, error);
     let body = serde_json::to_vec(&body).map_err(|e| {
         log::error!("[Codex] 序列化代理错误体失败: {e}");
@@ -1559,6 +4032,20 @@ fn build_codex_proxy_error_response(
             log::error!("[Codex] 构建代理错误响应失败: {e}");
             ProxyError::Internal(format!("Failed to build proxy error response: {e}"))
         })
+}
+
+fn codex_proxy_response_status(provider: &Provider, error: &ProxyError) -> u16 {
+    // Codex retries HTTP 429 and eventually replaces the response body with the
+    // generic "exceeded retry limit" message. For an explicit persistent quota
+    // exhaustion from a third-party provider, return a non-retriable client
+    // status while preserving upstream_status=429 in the JSON body. This makes
+    // the provider's actionable reset/quota message visible to the user.
+    if !super::providers::is_codex_official_provider(provider)
+        && super::quota_policy::QuotaPolicy::is_hard_quota_error(error)
+    {
+        return 400;
+    }
+    map_proxy_error_to_status(error)
 }
 
 fn codex_proxy_error_json(
@@ -1597,55 +4084,42 @@ fn codex_proxy_error_json(
         return body;
     };
 
-    let message = if upstream_status == Some(413) {
-        // 413 来自上游渠道商的网关（典型是 nginx 的 client_max_body_size），不是 CC
-        // Switch 本地代理的限制（本地 DefaultBodyLimit 已放到 200MB）。上游响应体往往是
-        // 一整段 nginx HTML，对用户毫无价值，这里替换成明确指向上游 + 可操作的指引，
-        // 避免「以为是 CC Switch 封装了 nginx / 是本地代理的锅」这种反复出现的误解。
-        format!(
-            concat!(
-                "Upstream provider rejected the request with HTTP 413 (Payload Too Large). ",
-                "The request body exceeds the upstream gateway's size limit; this is the ",
-                "provider's server-side limit, not a CC Switch limit. ",
-                "Provider: {provider}; model: {model}; endpoint: {endpoint}. ",
-                "To recover, shrink the request: run /compact, remove large pasted logs or ",
-                "inline images, or ask the provider to raise its request body limit ",
-                "(e.g. nginx client_max_body_size)."
-            ),
-            provider = provider_name,
-            model = request_model,
-            endpoint = endpoint,
-        )
-    } else {
-        let cause = error_obj
-            .get("message")
-            .and_then(|value| value.as_str())
-            .map(ToString::to_string)
-            .filter(|message| !message.trim().is_empty())
-            .unwrap_or_else(|| get_error_message(error));
-        let status_fragment = upstream_status
-            .map(|status| format!("; upstream_status: HTTP {status}"))
-            .unwrap_or_default();
-        format!(
-            "CC Switch local proxy failed while handling Codex endpoint {endpoint}. Provider: {provider_name}; model: {request_model}{status_fragment}; cause: {cause}"
-        )
-    };
+    // Keep the upstream's wording authoritative. HTTP 429 can mean a transient
+    // request-rate throttle or a persistent account limit, and even explicit
+    // quota text can mean only that this particular request is too large. CC
+    // Switch must not replace that message with a guessed diagnosis. Route
+    // metadata is appended separately so the original text remains first and
+    // directly searchable when debugging with the provider.
+    let cause = error_obj
+        .get("message")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| get_error_message(error));
+    let status_fragment = upstream_status
+        .map(|status| format!("; upstream_status=HTTP {status}"))
+        .unwrap_or_default();
+    let message = format!(
+        "{cause}\nCC Switch route context: provider={provider_name}; model={request_model}; endpoint={endpoint}{status_fragment}"
+    );
 
     error_obj.insert(
         "message".to_string(),
         Value::String(compact_error_message(&message, 1800)),
     );
 
-    if error_obj
-        .get("type")
-        .and_then(|value| value.as_str())
-        .map(|value| value.trim().is_empty())
-        .unwrap_or(true)
+    let is_upstream_error = matches!(error, ProxyError::UpstreamError { .. });
+    if !is_upstream_error
+        && error_obj
+            .get("type")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
     {
         error_obj.insert("type".to_string(), Value::String("proxy_error".to_string()));
     }
 
-    if error_obj.get("code").map(Value::is_null).unwrap_or(true) {
+    if !is_upstream_error && error_obj.get("code").map(Value::is_null).unwrap_or(true) {
         error_obj.insert(
             "code".to_string(),
             Value::String(codex_proxy_error_code(error).to_string()),
@@ -1683,6 +4157,7 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         ProxyError::NoAvailableProvider => "cc_switch_no_available_provider",
         ProxyError::AllProvidersCircuitOpen => "cc_switch_all_providers_circuit_open",
         ProxyError::NoProvidersConfigured => "cc_switch_no_providers_configured",
+        ProxyError::AllProvidersQuotaLimited(_) => "cc_switch_all_providers_quota_limited",
         ProxyError::MaxRetriesExceeded => "cc_switch_max_retries_exceeded",
         ProxyError::ProviderUnhealthy(_) => "cc_switch_provider_unhealthy",
         ProxyError::ConfigError(_) => "cc_switch_config_error",
@@ -1701,12 +4176,11 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
 }
 
 fn compact_error_message(message: &str, max_chars: usize) -> String {
-    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= max_chars {
-        return normalized;
+    if message.chars().count() <= max_chars {
+        return message.to_string();
     }
 
-    let truncated = normalized
+    let truncated = message
         .chars()
         .take(max_chars)
         .collect::<String>()
@@ -2437,11 +4911,237 @@ async fn log_usage(
 #[cfg(test)]
 mod tests {
     use super::{
-        body_looks_like_sse, body_snippet, chat_sse_to_response_value, codex_proxy_error_json,
-        responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
-        upstream_body_parse_error,
+        apply_official_websocket_headers, body_looks_like_sse, body_snippet,
+        chat_sse_to_response_value, codex_proxy_error_json, codex_proxy_response_status,
+        contains_bridge_compaction, is_transient_official_compaction_error,
+        official_compaction_quota_exhausted, responses_sse_to_response_value,
+        responses_summary_text, should_use_claude_transform_streaming, summary_usage, transform,
+        upstream_body_parse_error, LocalSummaryProtocol, OfficialWebsocketManagedAuth,
     };
-    use crate::proxy::ProxyError;
+    use crate::{
+        provider::Provider,
+        proxy::{forwarder::ForwardError, ProxyError},
+    };
+    use serde_json::json;
+
+    fn official_provider() -> Provider {
+        let mut provider = Provider::with_id(
+            crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            "OpenAI Official".to_string(),
+            serde_json::json!({}),
+            None,
+        );
+        provider.category = Some("official".to_string());
+        provider
+    }
+
+    #[test]
+    fn only_explicit_official_hard_quota_can_cross_compaction_realm() {
+        let hard_quota = ForwardError {
+            error: ProxyError::UpstreamError {
+                status: 429,
+                body: Some(serde_json::json!({"error":{"code":"insufficient_quota"}}).to_string()),
+            },
+            provider: Some(official_provider()),
+        };
+        assert!(official_compaction_quota_exhausted(&hard_quota));
+
+        for error in [
+            ProxyError::UpstreamError {
+                status: 429,
+                body: Some(
+                    serde_json::json!({"error":{"message":"Too many requests"}}).to_string(),
+                ),
+            },
+            ProxyError::UpstreamError {
+                status: 503,
+                body: Some("temporarily unavailable".to_string()),
+            },
+            ProxyError::UpstreamError {
+                status: 401,
+                body: Some("unauthorized".to_string()),
+            },
+            ProxyError::UpstreamError {
+                status: 422,
+                body: Some("invalid request".to_string()),
+            },
+        ] {
+            assert!(!official_compaction_quota_exhausted(&ForwardError {
+                error,
+                provider: Some(official_provider()),
+            }));
+        }
+    }
+
+    #[test]
+    fn official_compaction_retries_only_transient_failures() {
+        assert!(is_transient_official_compaction_error(
+            &ProxyError::UpstreamError {
+                status: 429,
+                body: Some("Too many requests".to_string()),
+            }
+        ));
+        assert!(is_transient_official_compaction_error(
+            &ProxyError::UpstreamError {
+                status: 503,
+                body: None,
+            }
+        ));
+        assert!(is_transient_official_compaction_error(
+            &ProxyError::ForwardFailed("connection reset".to_string())
+        ));
+        assert!(!is_transient_official_compaction_error(
+            &ProxyError::UpstreamError {
+                status: 429,
+                body: Some(serde_json::json!({"error":{"code":"insufficient_quota"}}).to_string(),),
+            }
+        ));
+        assert!(!is_transient_official_compaction_error(
+            &ProxyError::UpstreamError {
+                status: 401,
+                body: None,
+            }
+        ));
+        assert!(!is_transient_official_compaction_error(
+            &ProxyError::UpstreamError {
+                status: 422,
+                body: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn managed_official_websocket_replaces_native_account_headers() {
+        let mut client = http::HeaderMap::new();
+        client.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer native-token"),
+        );
+        client.insert(
+            http::HeaderName::from_static("chatgpt-account-id"),
+            http::HeaderValue::from_static("native-account"),
+        );
+        client.insert(
+            http::HeaderName::from_static("openai-beta"),
+            http::HeaderValue::from_static("responses_websockets=2026-02-06"),
+        );
+        client.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("127.0.0.1:15721"),
+        );
+        let managed = OfficialWebsocketManagedAuth {
+            access_token: "managed-token".to_string(),
+            account_id: "managed-account".to_string(),
+        };
+        let mut upstream = http::HeaderMap::new();
+
+        apply_official_websocket_headers(&mut upstream, &client, Some(&managed)).unwrap();
+
+        assert_eq!(
+            upstream
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer managed-token")
+        );
+        assert_eq!(
+            upstream
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("managed-account")
+        );
+        assert_eq!(
+            upstream
+                .get("openai-beta")
+                .and_then(|value| value.to_str().ok()),
+            Some("responses_websockets=2026-02-06")
+        );
+        assert!(upstream.get(http::header::HOST).is_none());
+    }
+
+    #[test]
+    fn native_official_websocket_preserves_codex_account_headers() {
+        let mut client = http::HeaderMap::new();
+        client.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer native-token"),
+        );
+        client.insert(
+            http::HeaderName::from_static("chatgpt-account-id"),
+            http::HeaderValue::from_static("native-account"),
+        );
+        let mut upstream = http::HeaderMap::new();
+
+        apply_official_websocket_headers(&mut upstream, &client, None).unwrap();
+
+        assert_eq!(
+            upstream
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer native-token")
+        );
+        assert_eq!(
+            upstream
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("native-account")
+        );
+    }
+
+    #[test]
+    fn official_websocket_detects_bridge_compaction_before_native_relay() {
+        let bridge = json!({
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "id": "cmp_bridge",
+                "type": "compaction",
+                "encrypted_content": "bcmp1.local-envelope"
+            }]
+        });
+        assert!(contains_bridge_compaction(&bridge));
+
+        let native = json!({
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "id": "cmp_native",
+                "type": "compaction",
+                "encrypted_content": "opaque-openai-token"
+            }]
+        });
+        assert!(!contains_bridge_compaction(&native));
+    }
+
+    #[test]
+    fn official_websocket_strips_bridge_reasoning_fields_before_native_relay() {
+        let mut body = json!({
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_184",
+                    "name": "shell_command",
+                    "arguments": "{}",
+                    "reasoning_content": "bridge-only reasoning"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_184",
+                    "output": "ok"
+                }
+            ]
+        });
+
+        let removed = crate::proxy::forwarder::sanitize_official_responses_input_items(&mut body);
+
+        assert_eq!(removed, (0, 0, 1));
+        assert_eq!(body["type"], "response.create");
+        assert_eq!(body["input"][0]["call_id"], "call_184");
+        assert_eq!(body["input"][0]["name"], "shell_command");
+        assert!(body["input"][0].get("reasoning_content").is_none());
+        assert_eq!(body["input"][1]["output"], "ok");
+    }
 
     #[test]
     fn body_looks_like_sse_detects_unlabeled_sse_prefixes() {
@@ -3057,7 +5757,11 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         let body = codex_proxy_error_json("DeepSeek", "deepseek-chat", "/responses", &error);
 
         let message = body["error"]["message"].as_str().unwrap();
-        assert!(message.contains("CC Switch local proxy failed"));
+        assert!(
+            message.find("dns lookup failed").unwrap()
+                < message.find("CC Switch route context:").unwrap()
+        );
+        assert!(message.contains("CC Switch route context:"));
         assert!(message.contains("DeepSeek"));
         assert!(message.contains("deepseek-chat"));
         assert!(message.contains("/responses"));
@@ -3079,10 +5783,70 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         let body = codex_proxy_error_json("MiniMax", "abab6.5s", "/responses", &error);
 
         let message = body["error"]["message"].as_str().unwrap();
-        assert!(message.contains("upstream_status: HTTP 502"));
+        assert!(message.contains("upstream_status=HTTP 502"));
         assert!(message.contains("upstream gateway failed"));
         assert_eq!(body["error"]["code"], 2013);
         assert_eq!(body["error"]["upstream_status"], 502);
+    }
+
+    #[test]
+    fn codex_proxy_model_quota_is_visible_and_non_retriable() {
+        let provider = Provider::with_id(
+            "weikuwu".to_string(),
+            "weikuwu".to_string(),
+            serde_json::json!({}),
+            None,
+        );
+        let error = ProxyError::UpstreamError {
+            status: 429,
+            body: Some(
+                serde_json::json!({
+                    "error": {
+                        "message": "Weekly/Monthly Limit Exhausted. Received Model Group=GLM-5.2p",
+                        "type": "throttling_error",
+                        "code": "429"
+                    }
+                })
+                .to_string(),
+            ),
+        };
+
+        assert_eq!(codex_proxy_response_status(&provider, &error), 400);
+        let body = codex_proxy_error_json("weikuwu", "GLM-5.2p", "/responses", &error);
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("Weekly/Monthly Limit Exhausted"));
+        assert!(message.contains("Weekly/Monthly Limit Exhausted"));
+        assert!(!message.contains("quota exhausted ("));
+        assert_eq!(body["error"]["type"], "throttling_error");
+        assert_eq!(body["error"]["code"], "429");
+        assert_eq!(body["error"]["upstream_status"], 429);
+    }
+
+    #[test]
+    fn codex_proxy_preserves_http_400_chinese_quota_detail() {
+        let provider = Provider::with_id(
+            "weikuwu".to_string(),
+            "weikuwu".to_string(),
+            serde_json::json!({}),
+            None,
+        );
+        let error = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(
+                serde_json::json!({"error":{"message":"当前codeplan或资源包订阅，所剩配额不足～. Received Model Group=GLM-5.2"}})
+                    .to_string(),
+            ),
+        };
+
+        assert_eq!(codex_proxy_response_status(&provider, &error), 400);
+        let body = codex_proxy_error_json("weikuwu", "GLM-5.2", "/responses", &error);
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("当前codeplan或资源包订阅，所剩配额不足～"));
+        assert!(message.contains("配额不足"));
+        assert!(!message.contains("quota insufficient for this request"));
+        assert!(message.contains("upstream_status=HTTP 400"));
+        assert_eq!(body["error"]["code"], serde_json::Value::Null);
+        assert_eq!(body["error"]["upstream_status"], 400);
     }
 
     #[test]
@@ -3101,19 +5865,82 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         let body = codex_proxy_error_json("HCAI", "gpt-5.5", "/responses", &error);
 
         let message = body["error"]["message"].as_str().unwrap();
-        // 不再误导成「本地代理失败」
+        // Upstream text stays authoritative and appears before route metadata.
         assert!(!message.contains("CC Switch local proxy failed"));
-        // 明确指向上游 + 体积超限 + 可操作指引
         assert!(message.contains("413"));
-        assert!(message.to_lowercase().contains("upstream"));
-        assert!(message.contains("/compact"));
-        // 关键：不把整段 nginx HTML 回显给用户
-        assert!(!message.contains("<html>"));
-        assert!(!message.contains("nginx/1.29.6"));
+        assert!(message.contains("<html>"));
+        assert!(message.contains("nginx/1.29.6"));
+        assert!(message.contains("CC Switch route context:"));
+        assert!(
+            message.find("<html>").unwrap() < message.find("CC Switch route context:").unwrap(),
+            "raw upstream body must precede CC Switch metadata"
+        );
         // 结构化字段仍然保留，便于程序化消费 / UI 呈现
         assert_eq!(body["error"]["upstream_status"], 413);
         assert_eq!(body["error"]["provider"], "HCAI");
         assert_eq!(body["error"]["model"], "gpt-5.5");
         assert_eq!(body["error"]["endpoint"], "/responses");
+    }
+
+    #[test]
+    fn codex_proxy_does_not_relabel_too_many_requests_as_quota_exhaustion() {
+        let error = ProxyError::UpstreamError {
+            status: 429,
+            body: Some(
+                serde_json::json!({"error": {
+                    "message": "Too many requests. Please retry after 2 seconds.",
+                    "type": "rate_limit_error",
+                    "code": "rate_limit_exceeded"
+                }})
+                .to_string(),
+            ),
+        };
+        let body = codex_proxy_error_json("example", "model-a", "/responses", &error);
+        let message = body["error"]["message"].as_str().unwrap();
+
+        assert!(message.starts_with("Too many requests. Please retry after 2 seconds."));
+        assert!(!message.to_ascii_lowercase().contains("quota exhausted"));
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+        assert_eq!(body["error"]["upstream_status"], 429);
+    }
+
+    #[test]
+    fn responses_summary_text_reads_output_message_content() {
+        let value = json!({
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "durable summary"}]
+            }],
+            "usage": {"input_tokens": 12, "output_tokens": 3}
+        });
+        assert_eq!(
+            responses_summary_text(&value).as_deref(),
+            Some("durable summary")
+        );
+        assert_eq!(
+            summary_usage(&value, LocalSummaryProtocol::Responses),
+            (12, 3, 15)
+        );
+    }
+
+    #[test]
+    fn responses_summary_text_reads_completed_sse() {
+        let sse = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+            "\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",",
+            "\"text\":\"stream summary\"}]}],",
+            "\"usage\":{\"input_tokens\":7,\"output_tokens\":2,\"total_tokens\":9}}}\n\n"
+        );
+        let value = responses_sse_to_response_value(sse).unwrap();
+        assert_eq!(
+            responses_summary_text(&value).as_deref(),
+            Some("stream summary")
+        );
+        assert_eq!(
+            summary_usage(&value, LocalSummaryProtocol::Responses),
+            (7, 2, 9)
+        );
     }
 }

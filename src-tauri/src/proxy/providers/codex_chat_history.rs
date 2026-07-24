@@ -8,11 +8,15 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 const MAX_CACHED_RESPONSES: usize = 512;
+const MAX_HISTORY_CHAIN_DEPTH: usize = MAX_CACHED_RESPONSES;
 
 #[derive(Debug, Clone, Default)]
 struct CachedResponse {
     calls_by_id: HashMap<String, Value>,
     call_order: Vec<String>,
+    previous_response_id: Option<String>,
+    input_items: Vec<Value>,
+    output_items: Vec<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -26,26 +30,33 @@ struct CodexChatHistoryInner {
 struct CachedLookup {
     previous: Option<CachedResponse>,
     fallback: CachedResponse,
+    history_items: Vec<Value>,
 }
 
 /// Cross-request history needed when Codex Responses is bridged to Chat
 /// Completions.
 ///
-/// Chat providers such as DeepSeek require an assistant message with the
+/// Codex commonly sends follow-up turns as only `previous_response_id` plus
+/// the newest input. Responses upstreams resolve that cursor server-side, but
+/// Chat Completions upstreams are stateless. This store reconstructs the prior
+/// user/assistant/tool turns before converting the request to Chat messages.
+/// Chat providers such as DeepSeek also require an assistant message with the
 /// original tool call and its `reasoning_content` immediately before the tool
-/// result. Codex often sends follow-up requests as
-/// `previous_response_id + function_call_output`, so this store restores the
-/// missing function call before the request is converted to Chat messages.
-/// Some Codex flows such as subagents may omit or rewrite
-/// `previous_response_id`, so the store can also fall back to a uniquely
-/// cached `call_id`.
+/// result, so tool-call metadata remains indexed separately. Some Codex flows
+/// such as subagents may omit or rewrite `previous_response_id`, so the store
+/// can also fall back to a uniquely cached `call_id`.
 #[derive(Debug, Default)]
 pub struct CodexChatHistoryStore {
     inner: RwLock<CodexChatHistoryInner>,
 }
 
 impl CodexChatHistoryStore {
+    #[cfg(test)]
     pub async fn record_response(&self, response: &Value) -> usize {
+        self.record_exchange(&Value::Null, response).await
+    }
+
+    pub async fn record_exchange(&self, request: &Value, response: &Value) -> usize {
         let Some(response_id) = response
             .get("id")
             .and_then(|value| value.as_str())
@@ -54,23 +65,30 @@ impl CodexChatHistoryStore {
             return 0;
         };
 
-        let calls = response
+        let output_items = response
             .get("output")
             .and_then(|value| value.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(cached_call_item)
-                    .collect::<Vec<_>>()
-            })
+            .cloned()
             .unwrap_or_default();
-
-        if calls.is_empty() {
-            return 0;
-        }
+        let calls = output_items
+            .iter()
+            .filter_map(cached_call_item)
+            .collect::<Vec<_>>();
+        let previous_response_id = request
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        let input_items = request_input_items(request);
 
         let mut inner = self.inner.write().await;
-        inner.insert_calls(response_id, calls)
+        inner.insert_exchange(
+            response_id,
+            previous_response_id,
+            input_items,
+            output_items,
+            calls,
+        )
     }
 
     async fn record_call_item(&self, response_id: Option<&str>, item: &Value) -> bool {
@@ -98,14 +116,8 @@ impl CodexChatHistoryStore {
 
         let original_input = std::mem::take(input);
         let original_was_object = matches!(&original_input, Value::Object(_));
-        let items = match original_input {
-            Value::Array(items) => items,
-            Value::Object(object) => vec![Value::Object(object)],
-            other => {
-                *input = other;
-                return 0;
-            }
-        };
+        let original_string = original_input.as_str().map(ToString::to_string);
+        let items = input_value_items(original_input);
 
         let output_call_ids = items
             .iter()
@@ -116,7 +128,7 @@ impl CodexChatHistoryStore {
             })
             .filter_map(response_item_call_id)
             .collect::<HashSet<_>>();
-        let existing_call_ids = items
+        let current_call_ids = items
             .iter()
             .filter(|item| {
                 item.get("type")
@@ -126,13 +138,24 @@ impl CodexChatHistoryStore {
             .filter_map(response_item_call_id)
             .collect::<HashSet<_>>();
         let requested_call_ids = output_call_ids
-            .union(&existing_call_ids)
+            .union(&current_call_ids)
             .cloned()
             .collect::<HashSet<_>>();
         let lookup = self
             .lookup(previous_response_id.as_deref(), &requested_call_ids)
             .await;
 
+        let history_items = history_items_missing_from_input(&lookup.history_items, &items);
+        let existing_call_ids = history_items
+            .iter()
+            .chain(items.iter())
+            .filter(|item| {
+                item.get("type")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(is_call_item_type)
+            })
+            .filter_map(response_item_call_id)
+            .collect::<HashSet<_>>();
         let restore_group = lookup.restore_group(&output_call_ids, &existing_call_ids);
 
         let restore_group_ids = restore_group
@@ -140,10 +163,10 @@ impl CodexChatHistoryStore {
             .map(|(call_id, _)| call_id.clone())
             .collect::<HashSet<_>>();
         let mut restore_group = Some(restore_group);
-        let mut seen_call_ids = HashSet::new();
-        let mut restored = 0usize;
+        let mut seen_call_ids = existing_call_ids;
+        let mut restored = history_items.len();
         let mut enriched = 0usize;
-        let mut new_items = Vec::new();
+        let mut new_items = history_items;
 
         for mut item in items {
             match item.get("type").and_then(|value| value.as_str()) {
@@ -187,6 +210,8 @@ impl CodexChatHistoryStore {
         let changed = restored + enriched;
         if changed == 0 && original_was_object && new_items.len() == 1 {
             *input = new_items.into_iter().next().unwrap_or(Value::Null);
+        } else if changed == 0 && original_string.is_some() && new_items.len() == 1 {
+            *input = Value::String(original_string.unwrap_or_default());
         } else {
             *input = Value::Array(new_items);
         }
@@ -201,11 +226,54 @@ impl CodexChatHistoryStore {
         let inner = self.inner.read().await;
         let previous = previous_response_id.and_then(|id| inner.responses.get(id).cloned());
         let fallback = inner.unique_fallback_calls(requested_call_ids, previous.as_ref());
-        CachedLookup { previous, fallback }
+        let history_items = previous_response_id
+            .map(|id| inner.materialize_history(id))
+            .unwrap_or_default();
+        CachedLookup {
+            previous,
+            fallback,
+            history_items,
+        }
     }
 }
 
 impl CodexChatHistoryInner {
+    fn insert_exchange(
+        &mut self,
+        response_id: &str,
+        previous_response_id: Option<String>,
+        input_items: Vec<Value>,
+        output_items: Vec<Value>,
+        calls: Vec<(String, Value)>,
+    ) -> usize {
+        if !self.responses.contains_key(response_id) {
+            self.response_order.push_back(response_id.to_string());
+        }
+        self.remove_response_from_call_index(response_id);
+
+        let mut indexed_call_ids = Vec::new();
+        let inserted_or_updated = calls.len();
+        {
+            let cached_response = self.responses.entry(response_id.to_string()).or_default();
+            cached_response.previous_response_id = previous_response_id;
+            cached_response.input_items = input_items;
+            cached_response.output_items = output_items;
+            cached_response.calls_by_id.clear();
+            cached_response.call_order.clear();
+            for (call_id, item) in calls {
+                cached_response.call_order.push(call_id.clone());
+                cached_response.calls_by_id.insert(call_id.clone(), item);
+                indexed_call_ids.push(call_id);
+            }
+        }
+        for call_id in indexed_call_ids {
+            self.index_call(&call_id, response_id);
+        }
+
+        self.prune();
+        inserted_or_updated
+    }
+
     fn insert_calls(&mut self, response_id: &str, calls: Vec<(String, Value)>) -> usize {
         if !self.responses.contains_key(response_id) {
             self.response_order.push_back(response_id.to_string());
@@ -218,6 +286,14 @@ impl CodexChatHistoryInner {
             if !cached_response.calls_by_id.contains_key(&call_id) {
                 cached_response.call_order.push(call_id.clone());
             }
+            if !cached_response
+                .output_items
+                .iter()
+                .filter_map(response_item_call_id)
+                .any(|cached_id| cached_id == call_id)
+            {
+                cached_response.output_items.push(item.clone());
+            }
             cached_response.calls_by_id.insert(call_id.clone(), item);
             indexed_call_ids.push(call_id);
             inserted_or_updated += 1;
@@ -228,6 +304,30 @@ impl CodexChatHistoryInner {
 
         self.prune();
         inserted_or_updated
+    }
+
+    fn materialize_history(&self, response_id: &str) -> Vec<Value> {
+        let mut chain = Vec::new();
+        let mut current = Some(response_id);
+        let mut seen = HashSet::new();
+
+        while let Some(id) = current {
+            if chain.len() >= MAX_HISTORY_CHAIN_DEPTH || !seen.insert(id.to_string()) {
+                break;
+            }
+            let Some(response) = self.responses.get(id) else {
+                break;
+            };
+            chain.push(response);
+            current = response.previous_response_id.as_deref();
+        }
+
+        let mut items = Vec::new();
+        for response in chain.into_iter().rev() {
+            append_items_without_duplicate_prefix(&mut items, &response.input_items);
+            append_items_without_duplicate_prefix(&mut items, &response.output_items);
+        }
+        items
     }
 
     fn prune(&mut self) {
@@ -364,9 +464,79 @@ fn append_restore_group(
     }
 }
 
+fn request_input_items(request: &Value) -> Vec<Value> {
+    request
+        .get("input")
+        .cloned()
+        .map(input_value_items)
+        .unwrap_or_default()
+}
+
+fn input_value_items(input: Value) -> Vec<Value> {
+    match input {
+        Value::Array(items) => items,
+        Value::Object(object) => vec![Value::Object(object)],
+        Value::String(text) => vec![serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": text,
+            }],
+        })],
+        _ => Vec::new(),
+    }
+}
+
+fn history_items_missing_from_input(history: &[Value], input: &[Value]) -> Vec<Value> {
+    if history.is_empty() || (input.len() >= history.len() && input[..history.len()] == *history) {
+        return Vec::new();
+    }
+
+    history
+        .iter()
+        .filter(|historical| {
+            !input
+                .iter()
+                .any(|current| same_conversation_item(historical, current))
+        })
+        .cloned()
+        .collect()
+}
+
+fn same_conversation_item(left: &Value, right: &Value) -> bool {
+    let left_type = left.get("type").and_then(Value::as_str);
+    let right_type = right.get("type").and_then(Value::as_str);
+    if left_type.is_some_and(is_call_item_type) && right_type.is_some_and(is_call_item_type) {
+        return response_item_call_id(left).is_some_and(|left_id| {
+            response_item_call_id(right).is_some_and(|right_id| left_id == right_id)
+        });
+    }
+
+    left.get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .is_some_and(|left_id| right.get("id").and_then(Value::as_str) == Some(left_id))
+}
+
+fn append_items_without_duplicate_prefix(target: &mut Vec<Value>, additions: &[Value]) {
+    if additions.is_empty() {
+        return;
+    }
+    if !target.is_empty()
+        && additions.len() >= target.len()
+        && additions[..target.len()] == target[..]
+    {
+        *target = additions.to_vec();
+    } else {
+        target.extend_from_slice(additions);
+    }
+}
+
 pub fn record_responses_sse_stream(
     stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     history: Arc<CodexChatHistoryStore>,
+    request: Value,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
@@ -380,7 +550,13 @@ pub fn record_responses_sse_stream(
                 Ok(bytes) => {
                     append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
                     while let Some(block) = take_sse_block(&mut buffer) {
-                        inspect_sse_block(&block, &mut current_response_id, history.as_ref()).await;
+                        inspect_sse_block(
+                            &block,
+                            &mut current_response_id,
+                            history.as_ref(),
+                            &request,
+                        )
+                        .await;
                     }
                     yield Ok(bytes);
                 }
@@ -394,6 +570,7 @@ async fn inspect_sse_block(
     block: &str,
     current_response_id: &mut Option<String>,
     history: &CodexChatHistoryStore,
+    request: &Value,
 ) {
     if block.trim().is_empty() {
         return;
@@ -433,7 +610,7 @@ async fn inspect_sse_block(
         }
         Some("response.completed") => {
             if let Some(response) = value.get("response") {
-                history.record_response(response).await;
+                history.record_exchange(request, response).await;
             }
         }
         _ => {}
@@ -830,6 +1007,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restores_regular_user_and_assistant_history_from_previous_response() {
+        let history = CodexChatHistoryStore::default();
+        let first_request = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type":"input_text","text":"Discuss Taiwan stock data sources"}]
+            }]
+        });
+        history
+            .record_exchange(
+                &first_request,
+                &json!({
+                    "id": "resp_1",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type":"output_text","text":"Compare Fugle and broker APIs."}]
+                    }]
+                }),
+            )
+            .await;
+
+        let mut second_request = json!({
+            "previous_response_id": "resp_1",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type":"input_text","text":"Search those sources carefully"}]
+            }]
+        });
+
+        assert_eq!(history.enrich_request(&mut second_request).await, 2);
+        let input = second_request["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[2]["role"], "user");
+        assert_eq!(
+            input[1]["content"][0]["text"],
+            "Compare Fugle and broker APIs."
+        );
+
+        let chat =
+            super::super::transform_codex_chat::responses_to_chat_completions(second_request)
+                .unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[2]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn restores_cumulative_history_across_multiple_stateless_chat_turns() {
+        let history = CodexChatHistoryStore::default();
+        let first_request = json!({
+            "input": [{"type":"message","role":"user","content":"first question"}]
+        });
+        history
+            .record_exchange(
+                &first_request,
+                &json!({
+                    "id":"resp_1",
+                    "output":[{"type":"message","role":"assistant","content":"first answer"}]
+                }),
+            )
+            .await;
+
+        let second_original = json!({
+            "previous_response_id":"resp_1",
+            "input":[{"type":"message","role":"user","content":"second question"}]
+        });
+        history
+            .record_exchange(
+                &second_original,
+                &json!({
+                    "id":"resp_2",
+                    "output":[{"type":"message","role":"assistant","content":"second answer"}]
+                }),
+            )
+            .await;
+
+        let mut third_request = json!({
+            "previous_response_id":"resp_2",
+            "input":[{"type":"message","role":"user","content":"what did we discuss?"}]
+        });
+        assert_eq!(history.enrich_request(&mut third_request).await, 4);
+        let input = third_request["input"].as_array().unwrap();
+        assert_eq!(input.len(), 5);
+        assert_eq!(input[0]["content"], "first question");
+        assert_eq!(input[1]["content"], "first answer");
+        assert_eq!(input[2]["content"], "second question");
+        assert_eq!(input[3]["content"], "second answer");
+        assert_eq!(input[4]["content"], "what did we discuss?");
+
+        let mut already_expanded = third_request.clone();
+        assert_eq!(history.enrich_request(&mut already_expanded).await, 0);
+        assert_eq!(already_expanded["input"], third_request["input"]);
+    }
+
+    #[tokio::test]
+    async fn streamed_text_response_restores_context_on_the_next_turn() {
+        let history = Arc::new(CodexChatHistoryStore::default());
+        let first_request = json!({
+            "input":[{"type":"message","role":"user","content":"initial topic"}]
+        });
+        let stream = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            br#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_stream_text","output":[{"type":"message","role":"assistant","content":"initial answer"}]}}
+
+"#,
+        ))]);
+
+        let output = record_responses_sse_stream(stream, history.clone(), first_request)
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(output.len(), 1);
+
+        let mut next_request = json!({
+            "previous_response_id":"resp_stream_text",
+            "input":[{"type":"message","role":"user","content":"follow-up"}]
+        });
+        assert_eq!(history.enrich_request(&mut next_request).await, 2);
+        let input = next_request["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["content"], "initial topic");
+        assert_eq!(input[1]["content"], "initial answer");
+        assert_eq!(input[2]["content"], "follow-up");
+    }
+
+    #[tokio::test]
     async fn records_streamed_function_call_done_items() {
         let history = Arc::new(CodexChatHistoryStore::default());
         let stream = futures::stream::iter(vec![
@@ -841,7 +1150,7 @@ mod tests {
             )),
         ]);
 
-        let output = record_responses_sse_stream(stream, history.clone())
+        let output = record_responses_sse_stream(stream, history.clone(), Value::Null)
             .collect::<Vec<_>>()
             .await;
         assert_eq!(output.len(), 2);

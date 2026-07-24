@@ -40,6 +40,11 @@ const withJson = async <T>(request: Request): Promise<T> => {
 const success = <T>(payload: T) => HttpResponse.json(payload as any);
 
 export const handlers = [
+  // App boot loads the profile switcher in parallel with providers.  Leaving
+  // this request unhandled makes node-fetch try to resolve `tauri.local`, which
+  // costs several seconds and pushes the integration tests past Vitest's
+  // default timeout.
+  http.post(`${TAURI_ENDPOINT}/list_profiles`, () => success([])),
   http.post(`${TAURI_ENDPOINT}/get_migration_result`, () => success(false)),
   http.post(`${TAURI_ENDPOINT}/get_skills_migration_result`, () =>
     success(null),

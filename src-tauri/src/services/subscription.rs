@@ -674,6 +674,7 @@ pub(crate) async fn query_codex_quota(
     account_id: Option<&str>,
     tool_label: &str,
     expired_message: &str,
+    force_refresh: bool,
 ) -> Result<SubscriptionQuota, String> {
     let client = crate::proxy::http_client::get();
 
@@ -682,6 +683,13 @@ pub(crate) async fn query_codex_quota(
         .header("Authorization", format!("Bearer {access_token}"))
         .header("User-Agent", "codex-cli")
         .header("Accept", "application/json");
+
+    if force_refresh {
+        req = req
+            .header(reqwest::header::CACHE_CONTROL, "no-cache, no-store")
+            .header(reqwest::header::PRAGMA, "no-cache")
+            .query(&[("_ccs_refresh", now_millis().to_string())]);
+    }
 
     if let Some(id) = account_id {
         req = req.header("ChatGPT-Account-Id", id);
@@ -693,17 +701,25 @@ pub(crate) async fn query_codex_quota(
     };
 
     let status = resp.status();
+    let raw = match resp.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => return Err(format!("Failed to read API response: {error}")),
+    };
 
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        let detail = codex_api_error_detail(&raw);
         return Ok(SubscriptionQuota::error(
             tool_label,
             CredentialStatus::Expired,
-            format!("{expired_message} (HTTP {status})"),
+            match detail {
+                Some(detail) => format!("{expired_message} (HTTP {status}): {detail}"),
+                None => format!("{expired_message} (HTTP {status})"),
+            },
         ));
     }
 
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = String::from_utf8_lossy(&raw);
         return Ok(SubscriptionQuota::error(
             tool_label,
             CredentialStatus::Valid,
@@ -711,10 +727,6 @@ pub(crate) async fn query_codex_quota(
         ));
     }
 
-    let raw = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => return Err(format!("Failed to read API response: {e}")),
-    };
     let body: CodexUsageResponse = match serde_json::from_slice(&raw) {
         Ok(v) => v,
         Err(e) => {
@@ -758,6 +770,26 @@ pub(crate) async fn query_codex_quota(
         error: None,
         queried_at: Some(now_millis()),
     })
+}
+
+fn codex_api_error_detail(raw: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(raw).ok()?;
+    let message = value
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty());
+    let code = value
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|code| !code.is_empty());
+    match (message, code) {
+        (Some(message), Some(code)) => Some(format!("{message} [{code}]")),
+        (Some(message), None) => Some(message.to_string()),
+        (None, Some(code)) => Some(code.to_string()),
+        (None, None) => None,
+    }
 }
 
 // ── Gemini 凭据读取 ──────────────────────────────────────
@@ -1230,7 +1262,10 @@ async fn query_gemini_quota(access_token: &str) -> Result<SubscriptionQuota, Str
 /// 瞬时传输失败以 `Err` 传播（前端 reject → retry + 保留上次成功值）。Expired
 /// 分支的"过期也试一把"重试同样用 `?` 传播瞬时错误——不能折叠成"已过期"，
 /// 否则一次网络抖动会被误报成确定性的凭据过期。
-pub async fn get_subscription_quota(tool: &str) -> Result<SubscriptionQuota, String> {
+pub async fn get_subscription_quota(
+    tool: &str,
+    force_refresh: bool,
+) -> Result<SubscriptionQuota, String> {
     match tool {
         "claude" => {
             let (token, status, message) = read_claude_credentials();
@@ -1280,6 +1315,7 @@ pub async fn get_subscription_quota(tool: &str) -> Result<SubscriptionQuota, Str
                             account_id.as_deref(),
                             "codex",
                             "Authentication failed. Please re-login with Codex CLI.",
+                            force_refresh,
                         )
                         .await?;
                         if result.success {
@@ -1299,6 +1335,7 @@ pub async fn get_subscription_quota(tool: &str) -> Result<SubscriptionQuota, Str
                         account_id.as_deref(),
                         "codex",
                         "Authentication failed. Please re-login with Codex CLI.",
+                        force_refresh,
                     )
                     .await
                 }
@@ -1356,6 +1393,17 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_auth_error_keeps_upstream_message_and_code() {
+        let detail = codex_api_error_detail(
+            br#"{"error":{"message":"Authentication token invalidated","code":"token_invalidated"}}"#,
+        );
+        assert_eq!(
+            detail.as_deref(),
+            Some("Authentication token invalidated [token_invalidated]")
+        );
+    }
 
     #[test]
     fn window_seconds_map_to_expected_tier_names() {

@@ -3,6 +3,7 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
+import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
 import {
   Form,
@@ -150,7 +151,19 @@ export function GrokBuildProviderForm({
     initialData?.meta?.endpointAutoSelect ?? true,
   );
   const [isEndpointModalOpen, setIsEndpointModalOpen] = useState(false);
+  const [cliProxyMode, setCliProxyMode] = useState(
+    initialData?.meta?.providerType === "grok_cli_proxy",
+  );
+  const [grokAuthStatus, setGrokAuthStatus] = useState<string>("");
+  const [grokVersion, setGrokVersion] = useState<string>("");
+  const [isRefreshingGrok, setIsRefreshingGrok] = useState(false);
   const [presetEndpoints, setPresetEndpoints] = useState<string[]>([]);
+  useEffect(() => {
+    if (!cliProxyMode) {
+      setGrokVersion("");
+      setGrokAuthStatus("");
+    }
+  }, [cliProxyMode]);
   const [draftCustomEndpoints, setDraftCustomEndpoints] = useState<string[]>(
     [],
   );
@@ -263,6 +276,7 @@ export function GrokBuildProviderForm({
     setUpstreamModel(presetModel);
     setApiFormat(presetApiFormat);
     setApiBackend(presetApiBackend);
+    setCliProxyMode(preset.providerType === "grok_cli_proxy");
     setPresetEndpoints(preset.endpointCandidates ?? []);
     setRawConfig(
       buildGrokBuildConfig({
@@ -279,7 +293,7 @@ export function GrokBuildProviderForm({
 
   const handleRawConfigChange = (value: string) => {
     setRawConfig(value);
-    if (validateGrokBuildConfig(value)) return;
+    if (validateGrokBuildConfig(value, cliProxyMode)) return;
     const parsed = parseGrokBuildConfig(value, form.getValues("name"));
     setProfile(parsed.model);
     setUpstreamModel(parsed.upstreamModel ?? parsed.model);
@@ -297,7 +311,7 @@ export function GrokBuildProviderForm({
     if (
       !name ||
       !baseUrl.trim() ||
-      (!apiKey.trim() && !envKey) ||
+      (!cliProxyMode && !apiKey.trim() && !envKey) ||
       !profile.trim()
     ) {
       toast.error(
@@ -325,7 +339,7 @@ export function GrokBuildProviderForm({
       apiBackend,
       contextWindow: parsedContextWindow,
     });
-    const configError = validateGrokBuildConfig(finalConfig);
+    const configError = validateGrokBuildConfig(finalConfig, cliProxyMode);
     if (configError) {
       toast.error(
         t("grokBuild.invalidToml", {
@@ -371,6 +385,9 @@ export function GrokBuildProviderForm({
         Number.isInteger(parsedMaxOutputTokens) && parsedMaxOutputTokens > 0
           ? parsedMaxOutputTokens
           : undefined,
+      providerType: cliProxyMode
+        ? "grok_cli_proxy"
+        : (initialMeta.providerType ?? undefined),
     };
     if (!providerId && Object.keys(customEndpoints).length > 0) {
       meta.custom_endpoints = customEndpoints;
@@ -390,7 +407,7 @@ export function GrokBuildProviderForm({
     await onSubmit(payload);
   };
 
-  const rawConfigError = validateGrokBuildConfig(rawConfig);
+  const rawConfigError = validateGrokBuildConfig(rawConfig, cliProxyMode);
 
   return (
     <Form {...form}>
@@ -410,6 +427,81 @@ export function GrokBuildProviderForm({
         )}
 
         <BasicFormFields form={form} />
+        {cliProxyMode && (
+          <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-4 space-y-3">
+            <div className="flex items-center gap-2 text-sm font-medium text-amber-600 dark:text-amber-400">
+              {t("grokBuild.experimentalWarning", {
+                defaultValue:
+                  "實驗性功能：Grok CLI Proxy 模式使用本地 Grok Build 的工作階段權杖，需要已安裝並登入 Grok CLI。",
+              })}
+            </div>
+            {grokVersion && (
+              <div className="text-xs text-muted-foreground">
+                {t("grokBuild.cliVersion", { defaultValue: "Grok CLI 版本" })}:{" "}
+                {grokVersion}
+              </div>
+            )}
+            {grokAuthStatus && (
+              <div className="text-xs text-muted-foreground">
+                {t("grokBuild.authStatus", { defaultValue: "認證狀態" })}:{" "}
+                {grokAuthStatus}
+              </div>
+            )}
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={isRefreshingGrok}
+                onClick={async () => {
+                  setIsRefreshingGrok(true);
+                  try {
+                    await invoke("refresh_grok_cli_auth");
+                    setGrokAuthStatus("Refreshed");
+                  } catch (e) {
+                    toast.error(String(e));
+                  } finally {
+                    setIsRefreshingGrok(false);
+                  }
+                }}
+              >
+                {t("grokBuild.refreshGrokLogin", {
+                  defaultValue: "重新整理 Grok登入",
+                })}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={async () => {
+                  try {
+                    await invoke("open_grok_login");
+                  } catch (e) {
+                    toast.error(String(e));
+                  }
+                }}
+              >
+                {t("grokBuild.openGrokLogin", {
+                  defaultValue: "開啟 Grok登入",
+                })}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        <FormItem>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={cliProxyMode}
+              onChange={(e) => setCliProxyMode(e.target.checked)}
+              className="rounded border-border"
+            />
+            {t("grokBuild.cliProxyMode", {
+              defaultValue: "啟用 CLI Proxy 模式（實驗性）",
+            })}
+          </label>
+        </FormItem>
 
         <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
           <FormItem>

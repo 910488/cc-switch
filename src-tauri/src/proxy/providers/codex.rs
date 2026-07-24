@@ -462,6 +462,21 @@ fn infer_aggregator_platform_config(
 ) -> Option<CodexChatReasoningConfig> {
     let platform = format!("{name} {base_url}");
 
+    // Weikuwu exposes GLM through LiteLLM's generic OpenAI adapter. The direct
+    // Z.AI API accepts `thinking: { type }`, but this gateway rejects that
+    // vendor extension before forwarding. Use the GLM effort contract already
+    // exercised by the standalone proxy instead.
+    if platform.contains("weikuwu") {
+        return Some(CodexChatReasoningConfig {
+            supports_thinking: Some(false),
+            supports_effort: Some(true),
+            thinking_param: Some("none".to_string()),
+            effort_param: Some("reasoning_effort".to_string()),
+            effort_value_mode: Some("glm_litellm".to_string()),
+            output_format: Some("reasoning_content".to_string()),
+        });
+    }
+
     // OpenRouter：用原生归一化对象 `reasoning: { effort }`（由 OpenRouter 翻译成各底层
     // 模型的正确推理参数，比顶层 OpenAI 别名 reasoning_effort 覆盖面更全）。effort 走
     // "openrouter" 值映射：枚举为 xhigh|high|medium|low|minimal，无 max——max 会触发
@@ -1507,6 +1522,32 @@ wire_api = "chat"
 
         assert_eq!(config.thinking_param.as_deref(), Some("enable_thinking"));
         assert_eq!(config.supports_effort, Some(false));
+        assert_eq!(config.output_format.as_deref(), Some("reasoning_content"));
+    }
+
+    #[test]
+    fn test_resolve_codex_chat_reasoning_weikuwu_uses_litellm_effort() {
+        let provider = create_provider(json!({
+            "config": r#"
+model_provider = "weikuwu"
+model = "GLM-5.2p"
+
+[model_providers.weikuwu]
+name = "weikuwu"
+base_url = "https://llm.weikuwu.me/v1"
+wire_api = "chat"
+"#
+        }));
+
+        let config =
+            resolve_codex_chat_reasoning_config(&provider, &json!({ "model": "GLM-5.2p" }))
+                .unwrap();
+
+        assert_eq!(config.supports_thinking, Some(false));
+        assert_eq!(config.supports_effort, Some(true));
+        assert_eq!(config.thinking_param.as_deref(), Some("none"));
+        assert_eq!(config.effort_param.as_deref(), Some("reasoning_effort"));
+        assert_eq!(config.effort_value_mode.as_deref(), Some("glm_litellm"));
         assert_eq!(config.output_format.as_deref(), Some("reasoning_content"));
     }
 }

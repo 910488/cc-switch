@@ -1,7 +1,16 @@
 import { useState } from "react";
-import { Server, Activity, Zap, Globe, ShieldAlert } from "lucide-react";
+import {
+  Server,
+  Activity,
+  Zap,
+  Globe,
+  ShieldAlert,
+  RotateCcw,
+  Loader2,
+} from "lucide-react";
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import {
   Accordion,
   AccordionContent,
@@ -10,6 +19,7 @@ import {
 } from "@/components/ui/accordion";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { ProxyPanel } from "@/components/proxy";
 import { AutoFailoverConfigPanel } from "@/components/proxy/AutoFailoverConfigPanel";
 import { FailoverQueueManager } from "@/components/proxy/FailoverQueueManager";
@@ -19,6 +29,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ToggleRow } from "@/components/ui/toggle-row";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 import type { SettingsFormState } from "@/hooks/useSettings";
+import { proxyApi } from "@/lib/api/proxy";
 
 interface ProxyTabContentProps {
   settings: SettingsFormState;
@@ -32,6 +43,8 @@ export function ProxyTabContent({
   const { t } = useTranslation();
   const [showProxyConfirm, setShowProxyConfirm] = useState(false);
   const [showFailoverConfirm, setShowFailoverConfirm] = useState(false);
+  const [showCodexRepairConfirm, setShowCodexRepairConfirm] = useState(false);
+  const [isRepairingCodex, setIsRepairingCodex] = useState(false);
 
   const {
     isRunning,
@@ -62,6 +75,32 @@ export function ProxyTabContent({
       await startProxyServer();
     } catch (error) {
       console.error("Proxy confirm failed:", error);
+    }
+  };
+
+  const handleRepairCodex = async () => {
+    setShowCodexRepairConfirm(false);
+    setIsRepairingCodex(true);
+    try {
+      const result = await proxyApi.repairCodexOfficialProfile();
+      toast.success(
+        result.authRemoved
+          ? t("settings.advanced.proxy.repairCodex.successLoginRequired")
+          : t("settings.advanced.proxy.repairCodex.success"),
+        {
+          description: t("settings.advanced.proxy.repairCodex.backupCreated", {
+            path: result.backupDir,
+          }),
+          closeButton: true,
+        },
+      );
+    } catch (error) {
+      console.error("Failed to repair Codex official profile:", error);
+      toast.error(t("settings.advanced.proxy.repairCodex.failed"), {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setIsRepairingCodex(false);
     }
   };
 
@@ -128,6 +167,30 @@ export function ProxyTabContent({
               onToggleProxy={handleToggleProxy}
               isProxyPending={isProxyPending}
             />
+            <div className="mt-6 flex items-center justify-between gap-4 rounded-lg border border-amber-500/25 bg-amber-500/5 p-4">
+              <div className="space-y-1">
+                <p className="text-sm font-medium">
+                  {t("settings.advanced.proxy.repairCodex.title")}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {t("settings.advanced.proxy.repairCodex.description")}
+                </p>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                className="shrink-0 border-amber-500/40 text-amber-700 hover:bg-amber-500/10 dark:text-amber-300"
+                disabled={isRepairingCodex}
+                onClick={() => setShowCodexRepairConfirm(true)}
+              >
+                {isRepairingCodex ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <RotateCcw className="h-4 w-4" />
+                )}
+                {t("settings.advanced.proxy.repairCodex.button")}
+              </Button>
+            </div>
           </AccordionContent>
         </AccordionItem>
 
@@ -269,6 +332,16 @@ export function ProxyTabContent({
         confirmText={t("confirm.proxy.confirm")}
         onConfirm={() => void handleProxyConfirm()}
         onCancel={() => setShowProxyConfirm(false)}
+      />
+
+      <ConfirmDialog
+        isOpen={showCodexRepairConfirm}
+        variant="destructive"
+        title={t("settings.advanced.proxy.repairCodex.confirmTitle")}
+        message={t("settings.advanced.proxy.repairCodex.confirmMessage")}
+        confirmText={t("settings.advanced.proxy.repairCodex.confirm")}
+        onConfirm={() => void handleRepairCodex()}
+        onCancel={() => setShowCodexRepairConfirm(false)}
       />
 
       <ConfirmDialog

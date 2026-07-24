@@ -1,0 +1,83 @@
+name: Windows Test Installer
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/windows-test-installer.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-test-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-msi:
+    name: Build unsigned x64 MSI
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.12.3
+          run_install: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build WiX MSI without updater signing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          pnpm tauri build --ci --bundles msi --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Collect installer
+        id: installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $msi = Get-ChildItem -Path "src-tauri/target/release/bundle/msi" -Filter "*.msi" -File |
+            Select-Object -First 1
+          if ($null -eq $msi) {
+            throw "Tauri build completed without producing an MSI"
+          }
+
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $artifactDir = "installer-artifact"
+          $installerName = "CC-Switch-Continuity-$shortSha-Windows-x64.msi"
+          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+          Copy-Item -LiteralPath $msi.FullName -Destination (Join-Path $artifactDir $installerName)
+          @(
+            "commit=$env:GITHUB_SHA",
+            "source=$env:GITHUB_REPOSITORY",
+            "workflow_run=$env:GITHUB_RUN_ID",
+            "signed=false",
+            "updater_artifacts=false"
+          ) | Set-Content -Path (Join-Path $artifactDir "build-info.txt") -Encoding utf8
+          "installer_name=$installerName" >> $env:GITHUB_OUTPUT
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: CC-Switch-Continuity-Windows-x64-${{ github.run_number }}
+          path: installer-artifact/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

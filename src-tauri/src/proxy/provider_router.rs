@@ -7,6 +7,8 @@ use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
 use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerConfig};
+use crate::proxy::quota_policy::{QuotaLatch, QuotaPolicy};
+use crate::proxy::ProxyError;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -18,12 +20,14 @@ pub struct ProviderRouter {
     db: Arc<Database>,
     /// 熔断器管理器 - key 格式: "app_type:provider_id"
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    quota_policy: Arc<QuotaPolicy>,
 }
 
 impl ProviderRouter {
     /// 创建新的供应商路由器
     pub fn new(db: Arc<Database>) -> Self {
         Self {
+            quota_policy: Arc::new(QuotaPolicy::new(db.clone())),
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -95,7 +99,23 @@ impl ProviderRouter {
             }
         }
 
+        let available_before_quota = result.len();
+        let latched = self.quota_policy.active_provider_ids(app_type)?;
+        if !latched.is_empty() {
+            result.retain(|provider| !latched.contains(&provider.id));
+        }
+
         if result.is_empty() {
+            if available_before_quota > 0 && !latched.is_empty() {
+                let release = self
+                    .quota_policy
+                    .earliest_release(app_type)?
+                    .unwrap_or_else(|| "unknown".to_string());
+                log::warn!(
+                    "[{app_type}] [FO-006] 所有供应商均处于 quota latch，最早恢复 {release}"
+                );
+                return Err(AppError::AllProvidersQuotaLimited(release));
+            }
             if total_providers > 0 && circuit_open_count == total_providers {
                 log::warn!("[{app_type}] [FO-004] 所有供应商均已熔断");
                 return Err(AppError::AllProvidersCircuitOpen);
@@ -106,6 +126,25 @@ impl ProviderRouter {
         }
 
         Ok(result)
+    }
+
+    pub(crate) fn is_provider_quota_latched(
+        &self,
+        app_type: &str,
+        provider_id: &str,
+    ) -> Result<bool, AppError> {
+        self.quota_policy.is_provider_latched(app_type, provider_id)
+    }
+
+    pub(crate) fn record_quota_error_for_account(
+        &self,
+        app_type: &str,
+        provider: &Provider,
+        error: &ProxyError,
+        account_id: Option<&str>,
+    ) -> Result<Option<QuotaLatch>, AppError> {
+        self.quota_policy
+            .record_from_error_for_account(app_type, provider, error, account_id)
     }
 
     /// 请求执行前获取熔断器“放行许可”
@@ -423,6 +462,59 @@ mod tests {
 
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id, "b");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quota_latch_skips_exhausted_provider_without_opening_circuit() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let mut provider_a = Provider::with_id(
+            "quota-a".to_string(),
+            "Quota A".to_string(),
+            json!({}),
+            None,
+        );
+        provider_a.sort_index = Some(1);
+        let mut provider_b = Provider::with_id(
+            "quota-b".to_string(),
+            "Quota B".to_string(),
+            json!({}),
+            None,
+        );
+        provider_b.sort_index = Some(2);
+        db.save_provider("codex", &provider_a).unwrap();
+        db.save_provider("codex", &provider_b).unwrap();
+        db.add_to_failover_queue("codex", "quota-a").unwrap();
+        db.add_to_failover_queue("codex", "quota-b").unwrap();
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        router
+            .record_quota_error_for_account(
+                "codex",
+                &provider_a,
+                &ProxyError::UpstreamError {
+                    status: 429,
+                    body: Some("{\"error\":{\"code\":\"insufficient_quota\"}}".to_string()),
+                },
+                None,
+            )
+            .unwrap();
+
+        let selected = router.select_providers("codex").await.unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "quota-b");
+        assert!(
+            router
+                .allow_provider_request("quota-a", "codex")
+                .await
+                .allowed
+        );
+        let health = db.get_provider_health("quota-a", "codex").await.unwrap();
+        assert!(health.is_healthy);
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { UsageHero } from "./UsageHero";
+import { ProviderUsageBreakdown } from "./ProviderUsageBreakdown";
 import { UsageTrendChart } from "./UsageTrendChart";
 import { RequestLogTable } from "./RequestLogTable";
 import { ProviderStatsTable } from "./ProviderStatsTable";
@@ -43,6 +44,7 @@ import { getLocaleFromLanguage } from "./format";
 import { getUsageRangePresetLabel, resolveUsageRange } from "@/lib/usageRange";
 import { UsageDateRangePicker } from "./UsageDateRangePicker";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { UsageHeatmap } from "./UsageHeatmap";
 
 const APP_FILTER_OPTIONS: AppTypeFilter[] = ["all", ...KNOWN_APP_TYPES];
 
@@ -77,16 +79,26 @@ const decodeOptionValue = (value: string) =>
 interface UsageDashboardProps {
   refreshIntervalMs?: number;
   onRefreshIntervalChange?: (next: number) => Promise<boolean> | boolean | void;
+  initialAppType?: AppTypeFilter;
+  showPricing?: boolean;
+  title?: string;
+  subtitle?: string;
+  showHeatmap?: boolean;
 }
 
 export function UsageDashboard({
   refreshIntervalMs: savedRefreshIntervalMs,
   onRefreshIntervalChange,
+  initialAppType = "all",
+  showPricing = true,
+  title,
+  subtitle,
+  showHeatmap = true,
 }: UsageDashboardProps = {}) {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const [range, setRange] = useState<UsageRangeSelection>({ preset: "today" });
-  const [appType, setAppType] = useState<AppTypeFilter>("all");
+  const [appType, setAppType] = useState<AppTypeFilter>(initialAppType);
   const [providerName, setProviderName] = useState<string | undefined>(
     undefined,
   );
@@ -209,9 +221,11 @@ export function UsageDashboard({
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4 mb-2">
         <div className="flex flex-col gap-1">
           <h2 className="text-2xl font-bold tracking-tight">
-            {t("usage.title")}
+            {title ?? t("usage.title")}
           </h2>
-          <p className="text-sm text-muted-foreground">{t("usage.subtitle")}</p>
+          <p className="text-sm text-muted-foreground">
+            {subtitle ?? t("usage.subtitle")}
+          </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -339,6 +353,14 @@ export function UsageDashboard({
         refreshIntervalMs={refreshIntervalMs}
       />
 
+      <ProviderUsageBreakdown
+        range={range}
+        appType={appType === "all" ? undefined : appType}
+        providerName={providerName}
+        model={model}
+        refreshIntervalMs={refreshIntervalMs}
+      />
+
       <UsageTrendChart
         range={range}
         rangeLabel={rangeLabel}
@@ -347,6 +369,15 @@ export function UsageDashboard({
         model={model}
         refreshIntervalMs={refreshIntervalMs}
       />
+
+      {showHeatmap && (
+        <UsageHeatmap
+          appType={appType === "all" ? undefined : appType}
+          providerName={providerName}
+          model={model}
+          refreshIntervalMs={refreshIntervalMs}
+        />
+      )}
 
       <div className="space-y-4">
         <Tabs defaultValue="logs" className="w-full">
@@ -407,29 +438,35 @@ export function UsageDashboard({
         </Tabs>
       </div>
 
-      <Accordion type="multiple" defaultValue={[]} className="w-full space-y-4">
-        <AccordionItem
-          value="pricing"
-          className="rounded-xl glass-card overflow-hidden"
+      {showPricing && (
+        <Accordion
+          type="multiple"
+          defaultValue={[]}
+          className="w-full space-y-4"
         >
-          <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
-            <div className="flex items-center gap-3">
-              <Coins className="h-5 w-5 text-yellow-500" />
-              <div className="text-left">
-                <h3 className="text-base font-semibold">
-                  {t("settings.advanced.pricing.title")}
-                </h3>
-                <p className="text-sm text-muted-foreground font-normal">
-                  {t("settings.advanced.pricing.description")}
-                </p>
+          <AccordionItem
+            value="pricing"
+            className="rounded-xl glass-card overflow-hidden"
+          >
+            <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+              <div className="flex items-center gap-3">
+                <Coins className="h-5 w-5 text-yellow-500" />
+                <div className="text-left">
+                  <h3 className="text-base font-semibold">
+                    {t("settings.advanced.pricing.title")}
+                  </h3>
+                  <p className="text-sm text-muted-foreground font-normal">
+                    {t("settings.advanced.pricing.description")}
+                  </p>
+                </div>
               </div>
-            </div>
-          </AccordionTrigger>
-          <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
-            <PricingConfigPanel />
-          </AccordionContent>
-        </AccordionItem>
-      </Accordion>
+            </AccordionTrigger>
+            <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+              <PricingConfigPanel />
+            </AccordionContent>
+          </AccordionItem>
+        </Accordion>
+      )}
     </motion.div>
   );
 }

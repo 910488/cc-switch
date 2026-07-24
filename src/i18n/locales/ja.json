@@ -183,7 +183,10 @@
     "needsRouting": "ルーティングが必要",
     "noRoutingSupport": "ルーティング非対応",
     "officialRouting": "公式アカウントルーティング",
-    "nativeLogin": "Codex ログイン"
+    "nativeLogin": "Codex ログイン",
+    "configureModels": "Codexモデルを設定",
+    "modelsConfigured": "{{count}}モデル追加済み",
+    "configureModelsHint": "Codexのモデルメニューに表示するモデルを設定します"
   },
   "claudeDesktop": {
     "officialNotice": "Claude Desktop の公式プロバイダーは内蔵の 1P サインインを使用します。API キーやエンドポイントの設定は不要です。",
@@ -341,7 +344,19 @@
         "enableFailoverToggle": "メインページにフェイルオーバー切り替えを表示",
         "enableFailoverToggleDescription": "有効にすると、メインページ上部にフェイルオーバー切り替えが独立して表示されます",
         "running": "実行中",
-        "stopped": "停止中"
+        "stopped": "停止中",
+        "repairCodex": {
+          "title": "公式Codexプロファイルを復元",
+          "description": "Providerスナップショットに依存せず、安全な公式設定からCodexのライブ設定を再構築します。会話、プロジェクト、MCPサーバー、有効なChatGPT OAuthログインは保持されます。",
+          "button": "公式設定に復元",
+          "confirmTitle": "公式Codexプロファイルを復元しますか？",
+          "confirmMessage": "先にCodex Desktopを閉じてください。CC Switchはルーティングを停止し、現在のプロファイルをバックアップして、注入モデルとProxy経路を削除し、Windowsオンボーディング状態を修復します。会話DB、プロジェクト、MCPサーバー、有効なChatGPTログインは保持されます。auth.jsonが第三者APIキーのみの場合は削除され、再ログインが必要です。",
+          "confirm": "バックアップして復元",
+          "success": "公式Codex設定を復元しました。Codex Desktopを再起動してください。",
+          "successLoginRequired": "公式Codex設定を復元しました。Codex Desktopを再起動して再ログインしてください。",
+          "backupCreated": "安全バックアップ: {{path}}",
+          "failed": "公式Codexプロファイルの復元に失敗しました"
+        }
       },
       "connectivityCheck": {
         "title": "接続チェック設定",
@@ -1447,6 +1462,10 @@
     "cacheHitRate": "キャッシュヒット率",
     "requestLogs": "リクエストログ",
     "providerStats": "プロバイダー統計",
+    "providerBreakdown": {
+      "title": "プロバイダー別使用量",
+      "description": "Codex のネイティブセッションは OpenAI Official に集約し、対応するセッションとプロキシ記録は1回だけ計上します。"
+    },
     "modelStats": "モデル統計",
     "time": "時間",
     "provider": "プロバイダー",
@@ -2491,6 +2510,44 @@
         "totalRequests": "総リクエスト数",
         "successRate": "成功率",
         "uptime": "稼働時間"
+      }
+    },
+    "continuity": {
+      "configurationTitle": "コンテキスト圧縮",
+      "configurationDescription": "Codex continuity の引き継ぎ要約と、それを実行するサードパーティルートを設定します。",
+      "rolloutMode": "ロールアウトモード",
+      "rollout": {
+        "off": "オフ",
+        "observeOnly": "観察のみ",
+        "thirdPartyOnly": "サードパーティのみ",
+        "fullSwitching": "完全な切り替え"
+      },
+      "rolloutHint": "journal の保存、ローカル圧縮、Provider 間の継続を制御します。",
+      "officialFallback": "公式圧縮の安全なフォールバック",
+      "officialFallbackHint": "公式 compact endpoint が失敗した場合、canonical context を安全に展開します。",
+      "summaryProvider": "要約 Provider",
+      "followActiveRoute": "現在のサードパーティルートに従う",
+      "missingProvider": "Provider がありません：{{id}}",
+      "summaryProviderHint": "Codex Chat／Anthropic Provider を固定するか、既存の現在ルート動作を維持します。",
+      "summaryModel": "要約モデル",
+      "summaryModelPlaceholder": "Provider の既定モデル",
+      "summaryModelHint": "設定済みモデルを選ぶか、正確な upstream model ID を入力します。空欄では Provider の既定値を使います。",
+      "effectiveTarget": "実際の要約ターゲット",
+      "providerDefaultModel": "Provider の既定モデル",
+      "activeRouteTarget": "現在のサードパーティルート · リクエストモデル",
+      "appliesWhenStarted": "ローカルルーティングの開始後に有効になります。",
+      "advancedLimits": "要約の詳細制限",
+      "advancedLimitsHint": "executor が実際に使う制限のみを公開します。chunk サイズと overflow retry は自動です。",
+      "inputBudget": "初期入力 budget",
+      "inputBudgetHint": "{{min}}–{{max}} tokens。context が小さいモデルでは下げてください。",
+      "outputTokens": "最終引き継ぎ出力上限",
+      "outputTokensHint": "{{min}}–{{max}} tokens。選択モデルの出力上限を超えないでください。",
+      "saved": "コンテキスト圧縮設定を保存しました",
+      "saveFailed": "コンテキスト圧縮設定を保存できません：{{error}}",
+      "validation": {
+        "inputBudget": "入力 budget は {{min}}〜{{max}} tokens の範囲で指定してください。",
+        "outputTokens": "出力上限は {{min}}〜{{max}} tokens の範囲で指定してください。",
+        "providerMissing": "選択した要約 Provider は存在しません。別の Provider を選んでください。"
       }
     },
     "settings": {

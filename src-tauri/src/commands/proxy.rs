@@ -43,6 +43,37 @@ pub async fn stop_proxy_with_restore(state: tauri::State<'_, AppState>) -> Resul
 
 /// 获取各应用接管状态
 #[tauri::command]
+pub async fn repair_codex_official_profile(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::codex_config::CodexOfficialProfileRepairResult, String> {
+    if let Err(error) = state.proxy_service.stop_with_restore().await {
+        log::warn!("Codex profile repair is continuing after snapshot restore failed: {error}");
+    }
+
+    let result =
+        crate::codex_config::repair_codex_official_profile().map_err(|error| error.to_string())?;
+    crate::proxy::model_routes::clear(&state.db).map_err(|error| error.to_string())?;
+    crate::proxy::model_routes::forget_provider(&state.db).map_err(|error| error.to_string())?;
+
+    if let Ok(mut config) = state.db.get_proxy_config_for_app("codex").await {
+        config.enabled = false;
+        state
+            .db
+            .update_proxy_config_for_app(config)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    state
+        .db
+        .set_live_takeover_active(false)
+        .await
+        .map_err(|error| error.to_string())?;
+    let _ = state.db.delete_all_live_backups().await;
+
+    Ok(result)
+}
+
+#[tauri::command]
 pub async fn get_proxy_takeover_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<ProxyTakeoverStatus, String> {
@@ -66,6 +97,234 @@ pub async fn set_proxy_takeover_for_app(
 #[tauri::command]
 pub async fn get_proxy_status(state: tauri::State<'_, AppState>) -> Result<ProxyStatus, String> {
     state.proxy_service.get_status().await
+}
+
+#[tauri::command]
+pub async fn get_continuity_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::proxy::compaction::CompactionSettings, String> {
+    crate::proxy::compaction::CompactionService::new(state.db.clone())
+        .settings()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn update_continuity_settings(
+    state: tauri::State<'_, AppState>,
+    settings: crate::proxy::compaction::CompactionSettings,
+) -> Result<(), String> {
+    crate::proxy::compaction::CompactionService::new(state.db.clone())
+        .update_settings(&settings)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_auto_review_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::proxy::auto_review::AutoReviewSettings, String> {
+    crate::proxy::auto_review::load_settings(&state.db).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn update_auto_review_settings(
+    state: tauri::State<'_, AppState>,
+    settings: crate::proxy::auto_review::AutoReviewSettings,
+) -> Result<crate::proxy::auto_review::AutoReviewSettings, String> {
+    crate::proxy::auto_review::save_settings(&state.db, settings).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_auto_review_stats(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::proxy::auto_review::AutoReviewStats, String> {
+    Ok(state.proxy_service.get_auto_review_stats().await)
+}
+
+#[tauri::command]
+pub fn get_codex_model_routes(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::proxy::model_routes::ModelRouteSettings, String> {
+    crate::proxy::model_routes::load(&state.db).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn get_codex_cached_official_models(
+) -> Result<Vec<crate::proxy::model_routes::CatalogModelInput>, String> {
+    crate::proxy::model_routes::cached_official_models().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn apply_codex_model_routes(
+    state: tauri::State<'_, AppState>,
+    provider_id: String,
+    official_models: Vec<crate::proxy::model_routes::CatalogModelInput>,
+    third_party_models: Vec<crate::proxy::model_routes::CatalogModelInput>,
+) -> Result<crate::proxy::model_routes::ModelRouteSettings, String> {
+    let provider = state
+        .db
+        .get_provider_by_id(&provider_id, "codex")
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Provider not found: {provider_id}"))?;
+    if provider.category.as_deref() == Some("official") {
+        return Err("Model injection requires a third-party provider".to_string());
+    }
+    let updated_provider =
+        crate::proxy::model_routes::with_provider_model_catalog(&provider, &third_party_models)
+            .map_err(|error| error.to_string())?;
+    // Never trust an account `/models` response for the official section of
+    // the Desktop menu. It may contain rollout/legacy GPT ids that the native
+    // Codex UI intentionally hides. Its own models_cache.json is the SSOT.
+    // Keep accepting the argument for command/API compatibility, but do not
+    // use it as a source of truth.
+    drop(official_models);
+    let official_models =
+        crate::proxy::model_routes::cached_official_models().map_err(|error| error.to_string())?;
+    if official_models.is_empty() {
+        return Err(
+            "Codex Desktop official model cache is empty; load the native model menu first"
+                .to_string(),
+        );
+    }
+    let previous =
+        crate::proxy::model_routes::load(&state.db).map_err(|error| error.to_string())?;
+    // Save only to the database SSOT. Do not use ProviderService::update here:
+    // it can sync a current third-party provider into live auth.json and change
+    // Codex from ChatGPT authentication to API-key authentication.
+    let mut updated_provider = updated_provider;
+    if crate::proxy::providers::GrokCliProxyAdapter::is_grok_provider(&updated_provider) {
+        updated_provider
+            .meta
+            .get_or_insert_with(Default::default)
+            .provider_type =
+            Some(crate::proxy::providers::GROK_CLI_PROXY_PROVIDER_TYPE.to_string());
+    }
+    state
+        .db
+        .save_provider("codex", &updated_provider)
+        .map_err(|error| error.to_string())?;
+    let next = match crate::proxy::model_routes::rebuild_with_official_models(
+        &state.db,
+        official_models,
+    ) {
+        Ok(settings) => settings,
+        Err(error) => {
+            let _ = state.db.save_provider("codex", &provider);
+            let _ = crate::proxy::model_routes::save(&state.db, &previous);
+            return Err(error.to_string());
+        }
+    };
+    crate::proxy::model_routes::remember_provider(&state.db, &provider.id)
+        .map_err(|error| error.to_string())?;
+
+    let result: Result<(), String> = async {
+        let takeover = state.proxy_service.get_takeover_status().await?.codex;
+        if takeover {
+            state
+                .proxy_service
+                .switch_proxy_target("codex", crate::database::CODEX_OFFICIAL_PROVIDER_ID)
+                .await?;
+        } else {
+            state
+                .proxy_service
+                .enable_codex_model_routes_from_current_live()
+                .await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = crate::proxy::model_routes::save(&state.db, &previous);
+        let _ = state.db.save_provider("codex", &provider);
+        return Err(error);
+    }
+    Ok(next)
+}
+
+#[tauri::command]
+pub async fn rollback_codex_model_routes(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let previous =
+        crate::proxy::model_routes::load(&state.db).map_err(|error| error.to_string())?;
+    let previous_provider = if let Some(provider_id) = previous
+        .routes
+        .first()
+        .map(|route| route.provider_id.as_str())
+    {
+        state
+            .db
+            .get_provider_by_id(provider_id, "codex")
+            .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+    if let Some(provider) = previous_provider.as_ref() {
+        let updated = crate::proxy::model_routes::without_provider_model_catalog(provider);
+        state
+            .db
+            .save_provider("codex", &updated)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Err(error) = crate::proxy::model_routes::clear(&state.db) {
+        if let Some(provider) = previous_provider.as_ref() {
+            let _ = state.db.save_provider("codex", provider);
+        }
+        return Err(error.to_string());
+    }
+    let result: Result<(), String> = async {
+        let takeover = state.proxy_service.get_takeover_status().await?.codex;
+        if takeover {
+            state
+                .proxy_service
+                .switch_proxy_target("codex", crate::database::CODEX_OFFICIAL_PROVIDER_ID)
+                .await?;
+        }
+        // Also run the idempotent disable cleanup when the DB already says
+        // takeover is off. Older builds could leave the generated catalog
+        // pointer/file behind in precisely that state.
+        state
+            .proxy_service
+            .set_takeover_for_app("codex", false)
+            .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = crate::proxy::model_routes::save(&state.db, &previous);
+        if let Some(provider) = previous_provider.as_ref() {
+            let _ = state.db.save_provider("codex", provider);
+        }
+        return Err(error);
+    }
+    crate::proxy::model_routes::forget_provider(&state.db).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_continuity_summary_targets(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crate::proxy::compaction::CompactionSummaryTarget>, String> {
+    crate::proxy::compaction::CompactionService::new(state.db.clone())
+        .summary_targets()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_continuity_tasks(
+    state: tauri::State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::proxy::compaction::model::CompactionTaskState>, String> {
+    crate::proxy::compaction::CompactionService::new(state.db.clone())
+        .recent_tasks(limit.unwrap_or(20))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_continuity_thread(
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+) -> Result<usize, String> {
+    crate::proxy::compaction::CompactionService::new(state.db.clone())
+        .delete_thread(&thread_id)
+        .map_err(|error| error.to_string())
 }
 
 /// 获取代理配置

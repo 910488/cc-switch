@@ -89,6 +89,21 @@ pub struct ProxyStatus {
     /// 当前活跃的代理目标列表
     #[serde(default)]
     pub active_targets: Vec<ActiveTarget>,
+    /// Encrypted Codex context-continuity journal health and durable record counts.
+    #[serde(default)]
+    pub continuity: ContinuityStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContinuityStatus {
+    pub available: bool,
+    pub key_protection: Option<String>,
+    pub snapshots: i64,
+    pub compactions: i64,
+    pub migrations: i64,
+    pub task_states: i64,
+    pub rollout_mode: String,
+    pub error: Option<String>,
 }
 
 /// 活跃的代理目标信息

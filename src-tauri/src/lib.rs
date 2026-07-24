@@ -1002,7 +1002,10 @@ pub fn run() {
 
                 let app_config_dir = crate::config::get_app_config_dir();
                 let codex_oauth_manager = CodexOAuthManager::new(app_config_dir);
-                app.manage(CodexOAuthState(Arc::new(RwLock::new(codex_oauth_manager))));
+                app.manage(CodexOAuthState(
+                    Arc::new(RwLock::new(codex_oauth_manager)),
+                    Arc::new(tokio::sync::Mutex::new(())),
+                ));
                 log::info!("✓ CodexOAuthManager initialized");
             }
 
@@ -1268,6 +1271,8 @@ pub fn run() {
             commands::get_subscription_quota,
             commands::get_codex_oauth_quota,
             commands::get_codex_oauth_models,
+            commands::get_codex_oauth_reset_credits,
+            commands::consume_codex_oauth_reset,
             commands::get_coding_plan_quota,
             commands::get_balance,
             // New MCP via config.json (SSOT)
@@ -1373,9 +1378,22 @@ pub fn run() {
             commands::start_proxy_server,
             commands::stop_proxy_server,
             commands::stop_proxy_with_restore,
+            commands::repair_codex_official_profile,
             commands::get_proxy_takeover_status,
             commands::set_proxy_takeover_for_app,
             commands::get_proxy_status,
+            commands::get_continuity_settings,
+            commands::update_continuity_settings,
+            commands::get_auto_review_settings,
+            commands::update_auto_review_settings,
+            commands::get_auto_review_stats,
+            commands::get_codex_model_routes,
+            commands::get_codex_cached_official_models,
+            commands::apply_codex_model_routes,
+            commands::rollback_codex_model_routes,
+            commands::get_continuity_summary_targets,
+            commands::get_continuity_tasks,
+            commands::delete_continuity_thread,
             commands::get_proxy_config,
             commands::update_proxy_config,
             // Global & Per-App Config
@@ -1522,6 +1540,9 @@ pub fn run() {
             commands::enter_lightweight_mode,
             commands::exit_lightweight_mode,
             commands::is_lightweight_mode,
+            // Grok CLI proxy commands
+            commands::refresh_grok_cli_auth,
+            commands::open_grok_login,
         ]);
 
     let app = builder

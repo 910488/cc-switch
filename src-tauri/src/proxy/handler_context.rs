@@ -73,6 +73,11 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
+    pub(crate) fn pin_provider(&mut self, provider: Provider) {
+        self.provider = provider.clone();
+        self.providers = vec![provider];
+    }
+
     /// 创建请求上下文
     ///
     /// # Arguments
@@ -140,6 +145,9 @@ impl RequestContext {
                     ProxyError::AllProvidersCircuitOpen
                 }
                 crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
+                crate::error::AppError::AllProvidersQuotaLimited(release) => {
+                    ProxyError::AllProvidersQuotaLimited(release)
+                }
                 _ => ProxyError::DatabaseError(e.to_string()),
             })?;
 
@@ -230,6 +238,7 @@ impl RequestContext {
             state.current_providers.clone(),
             state.gemini_shadow.clone(),
             state.codex_chat_history.clone(),
+            state.compaction_service.clone(),
             state.failover_manager.clone(),
             state.app_handle.clone(),
             self.current_provider_id.clone(),

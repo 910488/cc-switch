@@ -60,6 +60,8 @@ pub enum AppError {
     AllProvidersCircuitOpen,
     #[error("未配置供应商")]
     NoProvidersConfigured,
+    #[error("所有供应商均处于配额恢复期，最早恢复时间: {0}")]
+    AllProvidersQuotaLimited(String),
 }
 
 impl AppError {

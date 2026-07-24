@@ -333,6 +333,18 @@ pub struct AuthBinding {
     pub account_id: Option<String>,
 }
 
+/// Authentication source used by the built-in `codex-official` provider while
+/// local proxy takeover is active. Missing values intentionally default to the
+/// native Codex login so existing installations keep their current behavior.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexOfficialAuthMode {
+    #[default]
+    Native,
+    ManagedDefault,
+    ManagedAccount,
+}
+
 /// Claude Desktop 3P 写入模式。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -450,6 +462,18 @@ pub struct ProviderMeta {
     /// 新代码应只写入该字段；githubAccountId 仅保留兼容读取。
     #[serde(rename = "authBinding", skip_serializing_if = "Option::is_none")]
     pub auth_binding: Option<AuthBinding>,
+    /// Authentication source for the fixed `codex-official` route.
+    #[serde(
+        rename = "codexOfficialAuthMode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub codex_official_auth_mode: Option<CodexOfficialAuthMode>,
+    /// OpenAI Official quota polling interval in seconds. Zero disables polling.
+    #[serde(
+        rename = "codexOfficialQuotaRefreshSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub codex_official_quota_refresh_seconds: Option<u64>,
     /// Claude 认证字段名（"ANTHROPIC_AUTH_TOKEN" 或 "ANTHROPIC_API_KEY"）
     #[serde(rename = "apiKeyField", skip_serializing_if = "Option::is_none")]
     pub api_key_field: Option<String>,
@@ -540,6 +564,10 @@ pub fn parse_custom_user_agent(
 }
 
 impl ProviderMeta {
+    pub fn codex_official_auth_mode(&self) -> CodexOfficialAuthMode {
+        self.codex_official_auth_mode.unwrap_or_default()
+    }
+
     /// Codex OAuth FAST mode 是否启用。默认关闭，因为 `service_tier="priority"`
     /// 会按更高速率消耗 ChatGPT 订阅配额，用户需显式开启以换取更低延迟。
     pub fn codex_fast_mode_enabled(&self) -> bool {
@@ -967,8 +995,9 @@ pub struct OpenCodeModelLimit {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, LocalProxyRequestOverrides,
-        OpenCodeProviderConfig, Provider, ProviderManager, ProviderMeta, UniversalProvider,
+        ClaudeModelConfig, CodexModelConfig, CodexOfficialAuthMode, GeminiModelConfig,
+        LocalProxyRequestOverrides, OpenCodeProviderConfig, Provider, ProviderManager,
+        ProviderMeta, UniversalProvider,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1021,6 +1050,41 @@ mod tests {
     fn provider_meta_omits_max_output_tokens_when_none() {
         let value = serde_json::to_value(ProviderMeta::default()).expect("serialize ProviderMeta");
         assert!(value.get("maxOutputTokens").is_none());
+    }
+
+    #[test]
+    fn codex_official_auth_mode_defaults_to_native() {
+        let meta: ProviderMeta =
+            serde_json::from_value(json!({})).expect("deserialize legacy ProviderMeta");
+        assert_eq!(
+            meta.codex_official_auth_mode(),
+            CodexOfficialAuthMode::Native
+        );
+        assert!(serde_json::to_value(meta)
+            .expect("serialize ProviderMeta")
+            .get("codexOfficialAuthMode")
+            .is_none());
+    }
+
+    #[test]
+    fn codex_official_managed_account_mode_roundtrips() {
+        let meta: ProviderMeta = serde_json::from_value(json!({
+            "codexOfficialAuthMode": "managed_account",
+            "authBinding": {
+                "source": "managed_account",
+                "authProvider": "codex_oauth",
+                "accountId": "account-b"
+            }
+        }))
+        .expect("deserialize managed official auth");
+        assert_eq!(
+            meta.codex_official_auth_mode(),
+            CodexOfficialAuthMode::ManagedAccount
+        );
+        assert_eq!(
+            meta.managed_account_id_for("codex_oauth").as_deref(),
+            Some("account-b")
+        );
     }
 
     #[test]

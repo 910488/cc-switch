@@ -6,7 +6,18 @@ import type {
   ProxyTakeoverStatus,
   GlobalProxyConfig,
   AppProxyConfig,
+  CompactionSettings,
+  CompactionSummaryTarget,
+  ContinuityTaskState,
 } from "@/types/proxy";
+
+export interface CodexOfficialProfileRepairResult {
+  backupDir: string;
+  authPreserved: boolean;
+  authRemoved: boolean;
+  catalogRemoved: boolean;
+  onboardingRepaired: boolean;
+}
 
 export const proxyApi = {
   // ========== 代理服务器控制 API ==========
@@ -21,9 +32,33 @@ export const proxyApi = {
     return invoke("stop_proxy_with_restore");
   },
 
+  async repairCodexOfficialProfile(): Promise<CodexOfficialProfileRepairResult> {
+    return invoke("repair_codex_official_profile");
+  },
+
   // 获取代理服务器状态
   async getProxyStatus(): Promise<ProxyStatus> {
     return invoke("get_proxy_status");
+  },
+
+  async getContinuitySettings(): Promise<CompactionSettings> {
+    return invoke("get_continuity_settings");
+  },
+
+  async updateContinuitySettings(settings: CompactionSettings): Promise<void> {
+    return invoke("update_continuity_settings", { settings });
+  },
+
+  async getContinuitySummaryTargets(): Promise<CompactionSummaryTarget[]> {
+    return invoke("get_continuity_summary_targets");
+  },
+
+  async getContinuityTasks(limit = 20): Promise<ContinuityTaskState[]> {
+    return invoke("get_continuity_tasks", { limit });
+  },
+
+  async deleteContinuityThread(threadId: string): Promise<number> {
+    return invoke("delete_continuity_thread", { threadId });
   },
 
   // 检查代理服务器是否正在运行

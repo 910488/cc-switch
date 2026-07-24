@@ -472,17 +472,19 @@ requires_openai_auth = true
     let parsed_live: toml::Value = toml::from_str(&live_config).expect("parse live config");
     assert_eq!(
         parsed_live
-            .get("model_providers")
-            .and_then(|v| v.get("aihubmix"))
-            .and_then(|v| v.get("experimental_bearer_token"))
+            .get("experimental_bearer_token")
             .and_then(|v| v.as_str()),
         Some("bridge-key"),
-        "third-party key should be injected into the selected live provider table"
+        "third-party key should be injected into the canonical live provider route"
+    );
+    assert_eq!(
+        parsed_live.get("model_provider").and_then(|v| v.as_str()),
+        Some("openai")
     );
     assert_eq!(
         parsed_live
             .get("model_providers")
-            .and_then(|v| v.get("aihubmix"))
+            .and_then(|v| v.get("openai"))
             .and_then(|v| v.get("requires_openai_auth"))
             .and_then(|v| v.as_bool()),
         Some(true)
@@ -1660,9 +1662,9 @@ wire_api = "responses"
         "live config should keep the proxy bearer placeholder"
     );
     assert!(
-        live_config.contains(r#"model_provider = "deepseek-new""#)
+        live_config.contains(r#"model_provider = "openai""#)
             && live_config.contains(r#"name = "DeepSeek New""#),
-        "live config should update the Codex-visible provider label during takeover"
+        "live config should update the route while retaining the sidebar history bucket"
     );
     assert!(
         !live_config.contains("https://new.deepseek.example/v1"),
@@ -1684,8 +1686,10 @@ wire_api = "responses"
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     assert!(
-        backup_config.contains("new-key") && backup_config.contains("deepseek-new"),
-        "restore backup should be rebuilt from the newly selected provider"
+        backup_config.contains("new-key")
+            && backup_config.contains(r#"model_provider = "openai""#)
+            && backup_config.contains(r#"name = "DeepSeek New""#),
+        "restore backup should be rebuilt from the newly selected provider, got: {backup_config}"
     );
 
     let current = state

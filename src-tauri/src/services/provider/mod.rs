@@ -903,6 +903,10 @@ experimental_bearer_token = "sk-live-secret"
 model_catalog_json = "cc-switch-model-catalog.json"
 web_search = "disabled"
 
+[windows]
+sandbox = "elevated"
+terminal = "powershell"
+
 [model_providers.azure]
 name = "Azure OpenAI"
 base_url = "https://azure.example/v1"
@@ -959,6 +963,14 @@ command = "legacy-cmd"
         assert!(
             !extracted.contains("model_catalog_json"),
             "should strip catalog projection pointer, got: {extracted}"
+        );
+        assert!(
+            !extracted.contains("sandbox = \"elevated\""),
+            "device-local Windows sandbox mode must not be shared, got: {extracted}"
+        );
+        assert!(
+            extracted.contains("terminal = \"powershell\""),
+            "unrelated Windows preferences should survive, got: {extracted}"
         );
         assert!(
             !extracted.contains("web_search"),
@@ -1113,6 +1125,14 @@ command = "legacy-cmd"
     async fn update_current_codex_provider_refreshes_and_clears_catalog_during_takeover() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
+        let live_config_path = crate::codex_config::get_codex_config_path();
+        fs::create_dir_all(live_config_path.parent().expect("Codex config parent"))
+            .expect("create Codex config dir");
+        fs::write(
+            &live_config_path,
+            "model_provider = \"openai\"\n\n[desktop]\nappearanceTheme = \"dark\"\n",
+        )
+        .expect("seed native Codex live config");
 
         let db = Arc::new(Database::memory().expect("init db"));
         let state = AppState::new(db.clone());
@@ -2549,6 +2569,7 @@ impl ProviderService {
         let live_taken_over = state
             .proxy_service
             .detect_takeover_in_live_config_for_app(&app_type);
+        let proxy_running = futures::executor::block_on(state.proxy_service.is_running());
 
         let should_hot_switch = is_app_taken_over || live_taken_over;
 
@@ -2581,6 +2602,20 @@ impl ProviderService {
                     .hot_switch_provider_inner(app_type.as_str(), id),
             )
             .map_err(|e| AppError::Message(format!("热切换失败: {e}")))?;
+
+            // A leftover local route with takeover disabled is crash-recovery
+            // state, not an active immutable snapshot. Rebuild its restore
+            // backup for the selected provider; otherwise disabling the stale
+            // route restores the previous provider and hides the same chats
+            // again behind a different Desktop provider filter.
+            if !proxy_running && live_taken_over && matches!(app_type, AppType::Codex) {
+                futures::executor::block_on(
+                    state
+                        .proxy_service
+                        .update_live_backup_from_provider_inner(app_type.as_str(), _provider),
+                )
+                .map_err(|e| AppError::Message(format!("更新 Codex 恢复备份失败: {e}")))?;
+            }
 
             // The proxy server will route requests to the new provider via is_current.
             // MCP sync is intentionally skipped while Live config is owned by takeover.
@@ -3202,6 +3237,20 @@ impl ProviderService {
         root.remove("experimental_bearer_token");
         // - model_catalog_json 指向按供应商生成的 catalog 投影文件（DB 为 SSOT）。
         root.remove("model_catalog_json");
+        // Windows sandbox provisioning is device-local. Sharing an elevated
+        // selection can force a new PC into runtime onboarding before its
+        // runtime is installed and disable the limited-access fallback.
+        let mut remove_windows_table = false;
+        if let Some(windows) = root
+            .get_mut("windows")
+            .and_then(|item| item.as_table_like_mut())
+        {
+            windows.remove("sandbox");
+            remove_windows_table = windows.is_empty();
+        }
+        if remove_windows_table {
+            root.remove("windows");
+        }
         // - web_search 只剥 cc-switch 注入的 "disabled" 哨兵；用户手设的其它值
         //   属于可共享偏好，保留。
         if root
@@ -3501,7 +3550,13 @@ impl ProviderService {
                             "Grok Build configuration is missing the config field",
                         )
                     })?;
-                crate::grok_config::validate_config_toml(config)?;
+                let is_cli_proxy =
+                    crate::proxy::providers::GrokCliProxyAdapter::is_grok_provider(provider);
+                if is_cli_proxy {
+                    crate::grok_config::validate_cli_proxy_config_toml(config)?;
+                } else {
+                    crate::grok_config::validate_config_toml(config)?;
+                }
             }
             AppType::OpenCode => {
                 // OpenCode uses a different config structure: { npm, options, models }

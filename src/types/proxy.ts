@@ -27,6 +27,68 @@ export interface ProxyStatus {
   last_error: string | null;
   failover_count: number;
   active_targets?: ActiveTarget[];
+  continuity?: ContinuityStatus;
+}
+
+export interface ContinuityStatus {
+  available: boolean;
+  key_protection: string | null;
+  snapshots: number;
+  compactions: number;
+  migrations: number;
+  task_states: number;
+  rollout_mode: CompactionRolloutMode;
+  error: string | null;
+}
+
+export type CompactionRolloutMode =
+  | "off"
+  | "observe-only"
+  | "third-party-only"
+  | "full-switching";
+
+export interface CompactionSettings {
+  rolloutMode: CompactionRolloutMode;
+  officialCompactFallback: boolean;
+  summaryProviderId?: string;
+  summaryModel?: string;
+  summaryInputBudget: number;
+  summaryMaxOutputTokens: number;
+}
+
+export interface CompactionSummaryTarget {
+  providerId: string;
+  providerName: string;
+  protocol: "openai_chat" | "anthropic";
+  models: string[];
+  defaultModel?: string;
+}
+
+export interface ContinuityTaskState {
+  threadId: string;
+  sessionId: string;
+  compactionId?: string;
+  model: string;
+  realm: string;
+  state: string;
+  phase: string;
+  journalSaved: boolean;
+  summaryCreated: boolean;
+  resumeVerified: boolean;
+  originalContextRetained: boolean;
+  errorCode?: string;
+  strategy?: string;
+  inputTokensBefore: number;
+  summaryTokens: number;
+  chunksCompleted: number;
+  chunksTotal: number;
+  retryCount: number;
+  overflowRetryCount: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  providerId?: string;
+  updatedAt: string;
 }
 
 export interface ActiveTarget {

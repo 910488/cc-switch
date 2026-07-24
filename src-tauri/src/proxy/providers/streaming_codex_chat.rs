@@ -80,6 +80,7 @@ struct ChatToResponsesState {
     latest_usage: Option<Value>,
     finish_reason: Option<String>,
     tool_context: CodexToolContext,
+    expose_reasoning_summary: bool,
 }
 
 impl Default for ChatToResponsesState {
@@ -100,14 +101,19 @@ impl Default for ChatToResponsesState {
             latest_usage: None,
             finish_reason: None,
             tool_context: CodexToolContext::default(),
+            expose_reasoning_summary: true,
         }
     }
 }
 
 impl ChatToResponsesState {
-    fn with_tool_context(tool_context: CodexToolContext) -> Self {
+    fn with_tool_context_and_reasoning_visibility(
+        tool_context: CodexToolContext,
+        expose_reasoning_summary: bool,
+    ) -> Self {
         Self {
             tool_context,
+            expose_reasoning_summary,
             ..Self::default()
         }
     }
@@ -289,16 +295,20 @@ impl ChatToResponsesState {
             self.reasoning.added = true;
 
             events.push(sse::reasoning_item_added(output_index, &item_id));
-            events.push(sse::reasoning_summary_part_added(output_index, &item_id));
+            if self.expose_reasoning_summary {
+                events.push(sse::reasoning_summary_part_added(output_index, &item_id));
+            }
         }
 
         self.reasoning.text.push_str(delta);
-        let output_index = self.reasoning.output_index.unwrap_or(0);
-        events.push(sse::reasoning_summary_text_delta(
-            output_index,
-            &self.reasoning.item_id,
-            delta,
-        ));
+        if self.expose_reasoning_summary {
+            let output_index = self.reasoning.output_index.unwrap_or(0);
+            events.push(sse::reasoning_summary_text_delta(
+                output_index,
+                &self.reasoning.item_id,
+                delta,
+            ));
+        }
 
         events
     }
@@ -308,7 +318,7 @@ impl ChatToResponsesState {
 
         if !self.text.added {
             let output_index = self.next_output_index();
-            let item_id = format!("{}_msg", self.response_id);
+            let item_id = format!("msg_{}", self.response_id);
             self.text.output_index = Some(output_index);
             self.text.item_id = item_id.clone();
             self.text.added = true;
@@ -483,6 +493,16 @@ impl ChatToResponsesState {
             })
     }
 
+    fn has_actionable_output(&self) -> bool {
+        !self.text.text.trim().is_empty()
+            || self.tools.values().any(|state| {
+                !state.name.trim().is_empty()
+                    && (state.added
+                        || !state.call_id.trim().is_empty()
+                        || !state.arguments.trim().is_empty())
+            })
+    }
+
     fn finalize(&mut self) -> Vec<Bytes> {
         if self.completed {
             return Vec::new();
@@ -495,6 +515,18 @@ impl ChatToResponsesState {
         events.extend(self.finalize_tools());
 
         let status = response_status_from_finish_reason(self.finish_reason.as_deref());
+        if status == "completed" && !self.has_actionable_output() {
+            log::warn!(
+                "[Codex] Chat upstream ended with reasoning only; refusing to mark the task complete"
+            );
+            events.push(self.failed_event(
+                "Upstream model ended after hidden reasoning without a tool call or user-visible answer"
+                    .to_string(),
+                Some("empty_completion".to_string()),
+            ));
+            return events;
+        }
+
         let mut response = self.base_response(status, self.completed_output_items());
         if status == "incomplete" {
             response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
@@ -513,7 +545,16 @@ impl ChatToResponsesState {
         let output_index = self.reasoning.output_index.unwrap_or(0);
         let item_id = self.reasoning.item_id.clone();
         let text = self.reasoning.text.clone();
-        let (events, item) = sse::reasoning_close(output_index, &item_id, &text);
+        let (events, item) = if self.expose_reasoning_summary {
+            sse::reasoning_close(output_index, &item_id, &text)
+        } else {
+            let item = json!({
+                "id": item_id,
+                "type": "reasoning",
+                "summary": []
+            });
+            (vec![sse::output_item_done(output_index, &item)], item)
+        };
         self.output_items.push((output_index, item));
         self.reasoning.done = true;
         events
@@ -728,10 +769,29 @@ pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error +
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     tool_context: CodexToolContext,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_responses_sse_stream_from_chat_with_context_and_reasoning_visibility(
+        stream,
+        tool_context,
+        true,
+    )
+}
+
+/// Convert Chat Completions SSE while optionally keeping raw provider reasoning
+/// private. CC Switch still accumulates hidden reasoning for tool-call replay.
+pub fn create_responses_sse_stream_from_chat_with_context_and_reasoning_visibility<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    tool_context: CodexToolContext,
+    expose_reasoning_summary: bool,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
-        let mut state = ChatToResponsesState::with_tool_context(tool_context);
+        let mut state = ChatToResponsesState::with_tool_context_and_reasoning_visibility(
+            tool_context,
+            expose_reasoning_summary,
+        );
         let mut stream_failed = false;
 
         tokio::pin!(stream);
@@ -863,6 +923,21 @@ mod tests {
         String::from_utf8(bytes.concat()).unwrap()
     }
 
+    async fn collect_with_hidden_reasoning(chunks: Vec<&str>) -> String {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = chunks
+            .into_iter()
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk.as_bytes())))
+            .collect();
+        let upstream = stream::iter(chunks);
+        let converted = create_responses_sse_stream_from_chat_with_context_and_reasoning_visibility(
+            upstream,
+            CodexToolContext::default(),
+            false,
+        );
+        let bytes: Vec<Bytes> = converted.map(|item| item.unwrap()).collect().await;
+        String::from_utf8(bytes.concat()).unwrap()
+    }
+
     fn parse_sse_events(output: &str) -> Vec<Value> {
         output
             .split("\n\n")
@@ -884,6 +959,7 @@ mod tests {
 
         assert!(output.contains("event: response.created"));
         assert!(output.contains("event: response.output_text.delta"));
+        assert!(output.contains("\"id\":\"msg_resp_chatcmpl_1\""));
         assert!(output.contains("\"text\":\"Hello\""));
         assert!(output.contains("event: response.completed"));
         assert!(output.contains("\"input_tokens\":4"));
@@ -1252,5 +1328,49 @@ mod tests {
         assert!(output.contains("quota exceeded"));
         assert!(output.contains("rate_limit_exceeded"));
         assert!(!output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn hidden_reasoning_keeps_thinking_lifecycle_without_streaming_raw_chain() {
+        let output = collect_with_hidden_reasoning(vec![
+            r#"data: {"id":"chatcmpl_hidden","created":123,"model":"GLM-5.2","choices":[{"delta":{"reasoning_content":"private chain of thought"}}]}
+
+"#,
+            r#"data: {"id":"chatcmpl_hidden","created":123,"model":"GLM-5.2","choices":[{"delta":{"content":"Done"},"finish_reason":"stop"}]}
+
+"#,
+            "data: [DONE]
+
+",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.output_item.added"));
+        assert!(output.contains("\"type\":\"reasoning\""));
+        assert!(output.contains("\"summary\":[]"));
+        assert!(!output.contains("response.reasoning_summary_text.delta"));
+        assert!(!output.contains("private chain of thought"));
+        assert!(output.contains("\"text\":\"Done\""));
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_stop_is_failed_instead_of_silent_completion() {
+        let output = collect_with_hidden_reasoning(vec![
+            r#"data: {"id":"chatcmpl_reasoning_only","created":123,"model":"nemotron-3-ultra","choices":[{"delta":{"reasoning_content":"I should continue with another tool."}}]}
+
+"#,
+            r#"data: {"id":"chatcmpl_reasoning_only","created":123,"model":"nemotron-3-ultra","choices":[{"delta":{},"finish_reason":"stop"}]}
+
+"#,
+            "data: [DONE]
+
+",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.failed"));
+        assert!(output.contains("\"type\":\"empty_completion\""));
+        assert!(!output.contains("event: response.completed"));
+        assert!(!output.contains("I should continue with another tool."));
     }
 }

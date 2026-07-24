@@ -5,6 +5,7 @@
 use super::hyper_client::ProxyResponse;
 use super::{
     body_filter::filter_private_params_with_whitelist,
+    compaction::{CompactionService, MaterializationTarget, ProviderRealm},
     content_encoding::{decompress_body, get_content_encoding},
     error::*,
     failover_switch::FailoverSwitchManager,
@@ -13,7 +14,7 @@ use super::{
     provider_router::ProviderRouter,
     providers::{
         codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore, get_adapter,
-        AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
+        AuthInfo, AuthStrategy, GrokCliProxyAdapter, ProviderAdapter, ProviderType,
     },
     thinking_budget_rectifier::{rectify_thinking_budget, should_rectify_thinking_budget},
     thinking_rectifier::{
@@ -38,6 +39,10 @@ use tauri::Manager;
 use tokio::sync::RwLock;
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
+pub(crate) const INTERNAL_SUMMARY_HEADER: &str = "x-cc-switch-summary-prepared";
+pub(crate) const INTERNAL_SUMMARY_MODEL_FIELD: &str = "_cc_switch_summary_model";
+pub(crate) const INTERNAL_MODEL_OVERRIDE_HEADER: &str = "x-cc-switch-model-override";
+pub(crate) const INTERNAL_MODEL_OVERRIDE_FIELD: &str = "_cc_switch_model_override";
 
 fn validate_codex_official_authorization(headers: &http::HeaderMap) -> Result<(), ProxyError> {
     let authorization = headers
@@ -119,6 +124,7 @@ pub struct RequestForwarder {
     current_providers: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
     gemini_shadow: Arc<GeminiShadowStore>,
     codex_chat_history: Arc<CodexChatHistoryStore>,
+    compaction_service: Arc<CompactionService>,
     /// 故障转移切换管理器
     failover_manager: Arc<FailoverSwitchManager>,
     /// AppHandle，用于发射事件和更新托盘
@@ -148,6 +154,73 @@ pub struct RequestForwarder {
 }
 
 impl RequestForwarder {
+    fn codex_tool_result_retry_should_trigger(
+        app_type: &AppType,
+        provider: &Provider,
+        endpoint: &str,
+        provider_body: &Value,
+        error: &ProxyError,
+    ) -> bool {
+        if !matches!(app_type, AppType::Codex | AppType::GrokBuild)
+            || !super::providers::should_convert_codex_responses_to_chat(provider, endpoint)
+        {
+            return false;
+        }
+
+        let ProxyError::UpstreamError {
+            status: 400,
+            body: Some(error_body),
+        } = error
+        else {
+            return false;
+        };
+        if !error_body
+            .to_ascii_lowercase()
+            .contains("messages parameter is illegal")
+        {
+            return false;
+        }
+
+        let last_item = match provider_body.get("input") {
+            Some(Value::Array(items)) => items.last(),
+            Some(Value::Object(_)) => provider_body.get("input"),
+            _ => None,
+        };
+        last_item
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|item_type| {
+                matches!(
+                    item_type,
+                    "function_call_output" | "custom_tool_call_output" | "tool_search_output"
+                )
+            })
+    }
+
+    fn append_codex_tool_result_continuation(body: &mut Value) -> bool {
+        let Some(input) = body.get_mut("input") else {
+            return false;
+        };
+        let continuation = serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": "Continue using the tool result above."
+            }]
+        });
+
+        match input {
+            Value::Array(items) => items.push(continuation),
+            Value::Object(_) => {
+                let original = std::mem::take(input);
+                *input = Value::Array(vec![original, continuation]);
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// 预防式 media 降级：发送前对 text-only 模型把图片块替换为标记。
     ///
     /// 受 `enabled && request_media_fallback` 管辖；其中"启发式模型名单预测"
@@ -201,6 +274,7 @@ impl RequestForwarder {
         current_providers: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
         gemini_shadow: Arc<GeminiShadowStore>,
         codex_chat_history: Arc<CodexChatHistoryStore>,
+        compaction_service: Arc<CompactionService>,
         failover_manager: Arc<FailoverSwitchManager>,
         app_handle: Option<tauri::AppHandle>,
         current_provider_id_at_start: String,
@@ -222,6 +296,7 @@ impl RequestForwarder {
             current_providers,
             gemini_shadow,
             codex_chat_history,
+            compaction_service,
             failover_manager,
             app_handle,
             current_provider_id_at_start,
@@ -373,6 +448,48 @@ impl RequestForwarder {
         })
     }
 
+    /// Send one request through one explicitly selected provider without
+    /// consulting the normal failover queue, quota latches, or circuit breaker.
+    /// This route also never changes the globally selected provider.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn forward_pinned(
+        &self,
+        app_type: &AppType,
+        method: http::Method,
+        endpoint: &str,
+        body: Value,
+        headers: axum::http::HeaderMap,
+        extensions: Extensions,
+        provider: Provider,
+    ) -> Result<ForwardResult, ForwardError> {
+        let guard = ActiveConnectionGuard::acquire(self.status.clone()).await;
+        let adapter = get_adapter(app_type);
+        self.forward(
+            app_type,
+            &method,
+            &provider,
+            endpoint,
+            &body,
+            &headers,
+            &extensions,
+            adapter.as_ref(),
+        )
+        .await
+        .map(
+            |(response, claude_api_format, outbound_model)| ForwardResult {
+                response,
+                provider: provider.clone(),
+                claude_api_format,
+                outbound_model,
+                connection_guard: Some(guard),
+            },
+        )
+        .map_err(|error| ForwardError {
+            error,
+            provider: Some(provider),
+        })
+    }
+
     /// 实际转发逻辑（不包含客户端维度的入口/出口计数）
     ///
     /// # Arguments
@@ -404,9 +521,12 @@ impl RequestForwarder {
             });
         }
 
+        let max_attempts = self.max_attempts;
+
         let mut last_error = None;
         let mut last_provider = None;
         let mut attempted_providers = 0usize;
+        let mut quota_fallback_engaged = false;
 
         // 单 Provider 场景下跳过熔断器检查（故障转移关闭时）
         let bypass_circuit_breaker = providers.len() == 1;
@@ -421,13 +541,28 @@ impl RequestForwarder {
 
             // 上限检查：尊重用户在 AppProxyConfig.max_retries 上配置的「重试次数」。
             // 放在熔断器 allow 检查之前，避免在已经超限时还占用 HalfOpen 探测名额。
-            if attempted_providers >= self.max_attempts {
+            if attempted_providers >= max_attempts {
                 log::warn!(
                     "[{app_type_str}] 已达最大尝试次数上限 ({}/{}), 停止故障转移",
                     attempted_providers,
-                    self.max_attempts
+                    max_attempts
                 );
                 break;
+            }
+
+            // Latches are rechecked for every attempt, not just when the handler
+            // constructed the provider list. A concurrent request may have learned
+            // that this account is exhausted after routing began.
+            if self
+                .router
+                .is_provider_quota_latched(app_type_str, &provider.id)
+                .unwrap_or(false)
+            {
+                log::info!(
+                    "[{app_type_str}] quota-aware routing skipped provider {}",
+                    provider.name
+                );
+                continue;
             }
 
             // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
@@ -476,7 +611,7 @@ impl RequestForwarder {
             }
 
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
-            match self
+            let mut forward_result = self
                 .forward(
                     app_type,
                     &method,
@@ -487,8 +622,66 @@ impl RequestForwarder {
                     &extensions,
                     adapter.as_ref(),
                 )
-                .await
-            {
+                .await;
+
+            if matches!(
+                forward_result,
+                Err(ProxyError::UpstreamError { status: 401, .. })
+            ) {
+                match self
+                    .refresh_codex_managed_auth_after_rejection(app_type, provider)
+                    .await
+                {
+                    Ok(true) => {
+                        forward_result = self
+                            .forward(
+                                app_type,
+                                &method,
+                                provider,
+                                endpoint,
+                                &provider_body,
+                                &headers,
+                                &extensions,
+                                adapter.as_ref(),
+                            )
+                            .await;
+                    }
+                    Ok(false) => {}
+                    Err(error) => forward_result = Err(error),
+                }
+            }
+
+            if forward_result.as_ref().is_err_and(|error| {
+                Self::codex_tool_result_retry_should_trigger(
+                    app_type,
+                    provider,
+                    endpoint,
+                    &provider_body,
+                    error,
+                )
+            }) {
+                let mut continuation_body = provider_body.clone();
+                if Self::append_codex_tool_result_continuation(&mut continuation_body) {
+                    log::warn!(
+                        "[{app_type_str}] upstream rejected a Chat tool-result tail; retrying provider={} with a minimal continuation message",
+                        provider.id
+                    );
+                    forward_result = self
+                        .forward(
+                            app_type,
+                            &method,
+                            provider,
+                            endpoint,
+                            &continuation_body,
+                            &headers,
+                            &extensions,
+                            adapter.as_ref(),
+                        )
+                        .await;
+                }
+            }
+
+            match forward_result {
                 Ok((response, claude_api_format, outbound_model)) => {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
@@ -496,7 +689,7 @@ impl RequestForwarder {
                         .await;
 
                     // 更新当前应用类型使用的 provider
-                    {
+                    if !quota_fallback_engaged {
                         let mut current_providers = self.current_providers.write().await;
                         current_providers.insert(
                             app_type_str.to_string(),
@@ -509,21 +702,28 @@ impl RequestForwarder {
                         let mut status = self.status.write().await;
                         status.success_requests += 1;
                         status.last_error = None;
-                        let should_switch =
+                        let provider_changed =
                             self.current_provider_id_at_start.as_str() != provider.id.as_str();
-                        if should_switch {
+                        if provider_changed {
                             status.failover_count += 1;
 
-                            // 异步触发供应商切换，更新 UI/托盘，并把“当前供应商”同步为实际使用的 provider
-                            let fm = self.failover_manager.clone();
-                            let ah = self.app_handle.clone();
-                            let pid = provider.id.clone();
-                            let pname = provider.name.clone();
-                            let at = app_type_str.to_string();
+                            if quota_fallback_engaged {
+                                log::info!(
+                                    "[{app_type_str}] quota fallback used provider {} for this request without changing the global provider",
+                                    provider.name
+                                );
+                            } else {
+                                // 异步触发供应商切换，更新 UI/托盘，并把“当前供应商”同步为实际使用的 provider
+                                let fm = self.failover_manager.clone();
+                                let ah = self.app_handle.clone();
+                                let pid = provider.id.clone();
+                                let pname = provider.name.clone();
+                                let at = app_type_str.to_string();
 
-                            tokio::spawn(async move {
-                                let _ = fm.try_switch(ah.as_ref(), &at, &pid, &pname).await;
-                            });
+                                tokio::spawn(async move {
+                                    let _ = fm.try_switch(ah.as_ref(), &at, &pid, &pname).await;
+                                });
+                            }
                         }
                         // 重新计算成功率
                         if status.total_requests > 0 {
@@ -999,6 +1199,39 @@ impl RequestForwarder {
                         });
                     }
 
+                    if crate::proxy::quota_policy::QuotaPolicy::is_quota_error(&e) {
+                        match self.router.record_quota_error_for_account(
+                            app_type_str,
+                            provider,
+                            &e,
+                            None,
+                        ) {
+                            Ok(Some(latch)) => log::warn!(
+                                "[{app_type_str}] provider {} quota-latched until {} ({})",
+                                provider.name,
+                                latch.blocked_until,
+                                latch.quota_kind
+                            ),
+                            Ok(None) => {}
+                            Err(error) => log::error!(
+                                "[{app_type_str}] failed to persist quota latch for {}: {}",
+                                provider.name,
+                                error
+                            ),
+                        }
+                        self.router
+                            .release_permit_neutral(
+                                &provider.id,
+                                app_type_str,
+                                used_half_open_permit,
+                            )
+                            .await;
+                        quota_fallback_engaged = true;
+                        last_error = Some(e);
+                        last_provider = Some(provider.clone());
+                        continue;
+                    }
+
                     // 先分类错误，决定是否计入 provider 健康度
                     // —— NonRetryable / ClientAbort 是客户端层错误，无论换哪家 provider 都会被拒绝，
                     //    不应污染熔断器和数据库健康度（与 release_permit_neutral 同语义）。
@@ -1110,6 +1343,70 @@ impl RequestForwarder {
     ///
     /// 成功时返回 `(response, claude_api_format, outbound_model)`，其中
     /// `outbound_model` 是最终发往上游的模型名（所有映射/改写之后）。
+    /// Force one OAuth refresh when a CC Switch-managed ChatGPT request is
+    /// rejected with HTTP 401. Native Codex authentication is deliberately not
+    /// touched because its credential belongs to the Codex app itself.
+    async fn refresh_codex_managed_auth_after_rejection(
+        &self,
+        app_type: &AppType,
+        provider: &Provider,
+    ) -> Result<bool, ProxyError> {
+        if matches!(app_type, AppType::Codex) && GrokCliProxyAdapter::is_grok_provider(provider) {
+            GrokCliProxyAdapter::new().refresh_session(provider).await?;
+            return Ok(true);
+        }
+
+        let is_managed_official = matches!(app_type, AppType::Codex)
+            && super::providers::is_codex_official_provider(provider)
+            && provider
+                .meta
+                .as_ref()
+                .map(|meta| meta.codex_official_auth_mode())
+                .unwrap_or_default()
+                != crate::provider::CodexOfficialAuthMode::Native;
+
+        if !provider.is_codex_oauth() && !is_managed_official {
+            return Ok(false);
+        }
+
+        let app_handle = self.app_handle.as_ref().ok_or_else(|| {
+            ProxyError::AuthError("Codex OAuth authentication is unavailable".to_string())
+        })?;
+        let codex_state = app_handle.state::<CodexOAuthState>();
+        let manager = codex_state.0.read().await;
+        let account_id = match provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+        {
+            Some(account_id) => account_id,
+            None => manager.default_account_id().await.ok_or_else(|| {
+                ProxyError::AuthError(
+                    "No default ChatGPT account is configured in CC Switch".to_string(),
+                )
+            })?,
+        };
+        let rejected_token = manager
+            .get_valid_token_for_account(&account_id)
+            .await
+            .map_err(|error| {
+                ProxyError::AuthError(format!(
+                    "Unable to load the rejected ChatGPT credential: {error}"
+                ))
+            })?;
+
+        manager
+            .refresh_token_after_rejection(&account_id, &rejected_token)
+            .await
+            .map_err(|error| {
+                ProxyError::AuthError(format!(
+                    "ChatGPT rejected the access token and automatic OAuth refresh failed: {error}. Please re-login via CC Switch."
+                ))
+            })?;
+
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn forward(
         &self,
@@ -1146,8 +1443,38 @@ impl RequestForwarder {
             && super::providers::should_convert_codex_responses_to_chat(provider, endpoint);
         let codex_responses_to_anthropic = matches!(app_type, AppType::Codex | AppType::GrokBuild)
             && super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint);
-        let codex_official_auth_passthrough = matches!(app_type, AppType::Codex)
+        let is_codex_official = matches!(app_type, AppType::Codex)
             && super::providers::is_codex_official_provider(provider);
+        let codex_official_auth_mode = provider
+            .meta
+            .as_ref()
+            .map(|meta| meta.codex_official_auth_mode())
+            .unwrap_or_default();
+        let codex_official_auth_passthrough = is_codex_official
+            && codex_official_auth_mode == crate::provider::CodexOfficialAuthMode::Native;
+        let codex_official_managed_auth = is_codex_official
+            && codex_official_auth_mode != crate::provider::CodexOfficialAuthMode::Native;
+        let internal_summary_model = if headers.contains_key(INTERNAL_SUMMARY_HEADER) {
+            body.get(INTERNAL_SUMMARY_MODEL_FIELD)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(ToString::to_string)
+        } else {
+            None
+        };
+        let internal_model_override = if headers.contains_key(INTERNAL_MODEL_OVERRIDE_HEADER) {
+            body.get(INTERNAL_MODEL_OVERRIDE_FIELD)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(ToString::to_string)
+        } else {
+            None
+        };
+        let pinned_model = internal_model_override
+            .as_ref()
+            .or(internal_summary_model.as_ref());
 
         if codex_official_auth_passthrough {
             validate_codex_official_authorization(headers)?;
@@ -1168,6 +1495,15 @@ impl RequestForwarder {
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
         let mut mapped_body = normalize_thinking_type(mapped_body);
 
+        if let Some(object) = mapped_body.as_object_mut() {
+            object.remove(INTERNAL_SUMMARY_MODEL_FIELD);
+            object.remove(INTERNAL_MODEL_OVERRIDE_FIELD);
+        }
+
+        if let Some(model) = pinned_model {
+            mapped_body["model"] = Value::String(model.clone());
+        }
+
         // Grok Build exposes a stable client-side model profile in config.toml.
         // Route requests to the provider's real upstream model before applying
         // the optional Responses -> Chat/Anthropic bridge.
@@ -1187,6 +1523,71 @@ impl RequestForwarder {
             // final anthropic_body.
             mapped_body =
                 super::model_mapper::strip_one_m_suffix_for_upstream_from_body(mapped_body);
+        }
+
+        let is_grok_cli_proxy =
+            GrokCliProxyAdapter::is_grok_provider(provider) && app_type == &AppType::Codex;
+        let mut materialized_compaction_ids = Vec::new();
+
+        // Materialization is intentionally per provider attempt. A failover chain can
+        // cross protocol/realm boundaries, so doing this once in the handler would let
+        // an opaque token leak into a later Chat/Anthropic transform (which historically
+        // dropped it silently). The canonical suffix remains in the outer request and is
+        // therefore appended exactly once.
+        if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
+            let realm =
+                if codex_responses_to_chat || codex_responses_to_anthropic || is_grok_cli_proxy {
+                    ProviderRealm::Bridge
+                } else {
+                    ProviderRealm::Official
+                };
+            let realm_key = match realm {
+                ProviderRealm::Bridge => format!("bridge:{}", provider.id),
+                ProviderRealm::Official => format!("native:{}", provider.id),
+            };
+            let target = MaterializationTarget {
+                provider_id: provider.id.clone(),
+                model: mapped_body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                realm,
+                realm_key,
+            };
+            // Chat history hydration happens later because it needs the
+            // provider-local previous_response_id cache. That hydration may
+            // reintroduce a compaction item saved with an earlier request, so
+            // defer Chat materialization until after enrich_request().
+            if !codex_responses_to_chat {
+                let materialized = self
+                    .compaction_service
+                    .materialize_for_target(&mapped_body, &target)
+                    .map_err(|error| ProxyError::TransformError(error.to_string()))?;
+                if materialized.changed_items > 0 {
+                    log::info!(
+                        "[Codex] materialized {} compaction item(s) for provider={} realm={}",
+                        materialized.changed_items,
+                        provider.id,
+                        target.realm.as_str()
+                    );
+                }
+                materialized_compaction_ids.extend(materialized.compaction_ids);
+                mapped_body = materialized.body;
+            }
+            if target.realm == ProviderRealm::Bridge
+                && !headers.contains_key(INTERNAL_SUMMARY_HEADER)
+                && (endpoint
+                    .split('?')
+                    .next()
+                    .is_some_and(|path| path.ends_with("/responses/compact"))
+                    || CompactionService::is_compaction_request(body))
+            {
+                return Err(ProxyError::TransformError(
+                    "third-party compaction reached the forwarder without hierarchical execution"
+                        .to_string(),
+                ));
+            }
         }
 
         // --- Copilot 优化器：分类 + 请求体优化（在格式转换之前执行） ---
@@ -1412,6 +1813,12 @@ impl RequestForwarder {
         let mut codex_anthropic_one_m = false;
 
         // 转换请求体（如果需要）
+        let grok_tool_context = is_grok_cli_proxy.then(|| {
+            super::providers::transform_codex_chat::build_codex_tool_context_from_request(
+                &mapped_body,
+            )
+        });
+
         let mut request_body = if codex_responses_to_chat {
             let mut mapped_body = mapped_body;
             let explicit_prompt_cache_key = mapped_body
@@ -1424,10 +1831,43 @@ impl RequestForwarder {
                 .await;
             if restored > 0 {
                 log::debug!(
-                    "[Codex] Restored or enriched {restored} cached function call item(s) for Chat upstream"
+                    "[Codex] Restored or enriched {restored} conversation history item(s) for Chat upstream"
                 );
             }
             super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
+            if let Some(model) = pinned_model {
+                mapped_body["model"] = Value::String(model.clone());
+            }
+            // This must be the final Responses-level operation before the Chat
+            // transform. enrich_request() can restore cached input/output items
+            // from previous_response_id, including a native compaction token
+            // that was already materialized on the preceding turn. Running the
+            // continuity bridge here prevents that hydrated token from leaking
+            // into responses_to_chat_completions().
+            let target = MaterializationTarget {
+                provider_id: provider.id.clone(),
+                model: mapped_body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                realm: ProviderRealm::Bridge,
+                realm_key: format!("bridge:{}", provider.id),
+            };
+            let materialized = self
+                .compaction_service
+                .materialize_for_target(&mapped_body, &target)
+                .map_err(|error| ProxyError::TransformError(error.to_string()))?;
+            if materialized.changed_items > 0 {
+                log::info!(
+                    "[Codex] materialized {} history-hydrated compaction item(s) for provider={} realm={}",
+                    materialized.changed_items,
+                    provider.id,
+                    target.realm.as_str()
+                );
+            }
+            materialized_compaction_ids.extend(materialized.compaction_ids);
+            mapped_body = materialized.body;
             let reasoning_config =
                 super::providers::resolve_codex_chat_reasoning_config(provider, &mapped_body);
             let mut chat_body = super::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning(
@@ -1445,6 +1885,9 @@ impl RequestForwarder {
         } else if codex_responses_to_anthropic {
             let mut mapped_body = mapped_body;
             super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
+            if let Some(model) = pinned_model {
+                mapped_body["model"] = Value::String(model.clone());
+            }
             // Per-provider output ceiling override. Codex does not forward its
             // `model_max_output_tokens` in the request body, so honor the value
             // configured on the provider here — it takes precedence over any
@@ -1453,13 +1896,15 @@ impl RequestForwarder {
             // lets the thinking-budget clamp size its headroom against the real
             // ceiling too. Kept per-provider to avoid a global large default that
             // would 400 on low-output-ceiling gateways.
-            if let Some(max_out) = provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.max_output_tokens)
-                .filter(|v| *v > 0)
-            {
-                mapped_body["max_output_tokens"] = Value::from(max_out);
+            if !headers.contains_key(INTERNAL_SUMMARY_HEADER) {
+                if let Some(max_out) = provider
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.max_output_tokens)
+                    .filter(|v| *v > 0)
+                {
+                    mapped_body["max_output_tokens"] = Value::from(max_out);
+                }
             }
             // Anthropic requires max_tokens; fall back to this default only when the
             // Codex request omits max_output_tokens (rare — Codex normally sends it).
@@ -1534,6 +1979,29 @@ impl RequestForwarder {
                 if apply_local_proxy_body_overrides(&mut filtered_body, overrides) {
                     filtered_body = prepare_upstream_request_body(filtered_body);
                 }
+            }
+        }
+        // Apply bridge-history cleanup to the final body, after every provider
+        // override, so no later merge can reintroduce an invalid reference.
+        if is_codex_official {
+            let (message_ids, reasoning_items, bridge_reasoning_fields) =
+                sanitize_official_responses_input_items(&mut filtered_body);
+            if message_ids > 0 || reasoning_items > 0 || bridge_reasoning_fields > 0 {
+                log::info!(
+                    "[Codex] sanitized official resume input: message_ids={message_ids}, reasoning_items={reasoning_items}, bridge_reasoning_fields={bridge_reasoning_fields}"
+                );
+            }
+            if effective_endpoint
+                .split('?')
+                .next()
+                .is_some_and(|path| path.ends_with("/responses/compact"))
+                && filtered_body
+                    .as_object_mut()
+                    .is_some_and(|object| object.remove("include").is_some())
+            {
+                log::info!(
+                    "[Codex] removed unsupported include field from official compact request"
+                );
             }
         }
         // 出站 body 定稿后刷新真值（覆盖 Codex chat 上游模型覆写、转换层模型改写）
@@ -1673,6 +2141,90 @@ impl RequestForwarder {
         } else {
             Vec::new()
         };
+
+        // The fixed OpenAI Official provider normally forwards Codex's native
+        // Grok CLI proxy session-managed auth: when the adapter returned the
+        // GROK_SESSION_MANAGED placeholder, resolve the real access token and
+        // identity headers via the credential broker.
+        if is_grok_cli_proxy {
+            if auth_headers.is_empty() {
+                // Session-managed mode: resolve real headers from the broker.
+                let grok_adapter = GrokCliProxyAdapter::new();
+                auth_headers = grok_adapter
+                    .resolve_session_headers(provider, &self.session_id)
+                    .await?;
+            } else {
+                // API key mode already has Authorization but still needs Grok
+                // identity headers. Session mode receives both sets above.
+                let grok_adapter = GrokCliProxyAdapter::new();
+                let broker = grok_adapter.get_broker_for_headers(provider).await?;
+                let model = broker.broker.model().to_string();
+                let identity = super::providers::build_grok_identity_headers(
+                    &broker.client_version,
+                    broker.agent_id.as_deref(),
+                    None,
+                    &self.session_id,
+                    &self.session_id,
+                    super::providers::next_grok_turn_idx(&self.session_id),
+                    &model,
+                );
+                auth_headers.extend(identity);
+            }
+        }
+
+        // Authorization header. In an explicitly selected managed mode, replace
+        // it with the chosen CC Switch account instead. The token remains in the
+        // OAuth manager and is never persisted in provider configuration.
+        if codex_official_managed_auth {
+            let app_handle = self.app_handle.as_ref().ok_or_else(|| {
+                ProxyError::AuthError("Codex OAuth authentication is unavailable".to_string())
+            })?;
+            let codex_state = app_handle.state::<CodexOAuthState>();
+            let codex_auth: tokio::sync::RwLockReadGuard<'_, CodexOAuthManager> =
+                codex_state.0.read().await;
+            let bound_account_id = provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.managed_account_id_for("codex_oauth"));
+
+            if codex_official_auth_mode == crate::provider::CodexOfficialAuthMode::ManagedAccount
+                && bound_account_id.is_none()
+            {
+                return Err(ProxyError::AuthError(
+                    "OpenAI Official is set to a fixed managed account, but no account is bound"
+                        .to_string(),
+                ));
+            }
+
+            let token = match bound_account_id.as_deref() {
+                Some(account_id) => codex_auth
+                    .get_valid_token_for_account(account_id)
+                    .await
+                    .map_err(|error| {
+                        ProxyError::AuthError(format!(
+                            "Unable to authenticate the selected ChatGPT account: {error}"
+                        ))
+                    })?,
+                None => codex_auth.get_valid_token().await.map_err(|error| {
+                    ProxyError::AuthError(format!(
+                        "Unable to authenticate the default ChatGPT account: {error}"
+                    ))
+                })?,
+            };
+
+            codex_oauth_account_id = match bound_account_id {
+                Some(account_id) => Some(account_id),
+                None => codex_auth.default_account_id().await,
+            };
+            if codex_oauth_account_id.is_none() {
+                return Err(ProxyError::AuthError(
+                    "No default ChatGPT account is configured in CC Switch".to_string(),
+                ));
+            }
+            auth_headers =
+                adapter.get_auth_headers(&AuthInfo::new(token, AuthStrategy::CodexOAuth))?;
+            should_send_codex_oauth_session_headers = true;
+        }
 
         // 注入 Codex OAuth 的 ChatGPT-Account-Id header（如果有 account_id）
         if let Some(ref account_id) = codex_oauth_account_id {
@@ -1820,6 +2372,10 @@ impl RequestForwarder {
         for (key, value) in headers {
             let key_str = key.as_str();
 
+            if key_str.eq_ignore_ascii_case(INTERNAL_SUMMARY_HEADER) {
+                continue;
+            }
+
             // --- host — 原位替换为上游 host（保持客户端原始位置） ---
             if key_str.eq_ignore_ascii_case("host") {
                 if let Some(ref host_val) = upstream_host {
@@ -1861,6 +2417,12 @@ impl RequestForwarder {
                     | "traceparent"
                     | "tracestate"
             ) {
+                continue;
+            }
+
+            // A managed official route owns the account identity. Never allow
+            // the calling Codex client's native account id to leak or conflict.
+            if codex_official_managed_auth && key_str.eq_ignore_ascii_case("chatgpt-account-id") {
                 continue;
             }
 
@@ -2072,6 +2634,25 @@ impl RequestForwarder {
             is_copilot,
         );
 
+        // Grok account-login credentials are owned by the local CLI session.
+        // Re-apply them after every inbound-header merge and provider override:
+        // Codex sends its own Authorization header, and a stale override must
+        // never replace either the Grok bearer token or x-xai-token-auth marker.
+        if is_grok_cli_proxy {
+            enforce_managed_auth_headers(&mut ordered_headers, &auth_headers);
+            let has_authorization = ordered_headers.contains_key(http::header::AUTHORIZATION);
+            let has_xai_token_auth = ordered_headers.contains_key("x-xai-token-auth");
+            log::debug!(
+                "[GrokCliProxy] managed auth prepared: authorization={has_authorization}, x_xai_token_auth={has_xai_token_auth}"
+            );
+            if !has_authorization || !has_xai_token_auth {
+                return Err(ProxyError::AuthError(
+                    "Grok account session did not produce the required authentication headers; refresh the Grok login and retry"
+                        .to_string(),
+                ));
+            }
+        }
+
         reject_proxy_placeholder_for_managed_account_upstream(&url, &ordered_headers)?;
 
         // 输出请求信息日志
@@ -2200,6 +2781,39 @@ impl RequestForwarder {
                     // either productive output or a valid non-failure terminal event.
                     // A response.failed/error before output remains failover-safe.
                     response = self.validate_responses_stream_start(response).await?;
+                }
+            }
+            // Wrap Grok CLI proxy SSE streams with a normalizer that filters
+            // xAI-specific events and supplements missing lifecycle events.
+            if is_grok_cli_proxy && request_is_streaming {
+                if let crate::proxy::hyper_client::ProxyResponse::Streamed {
+                    status,
+                    headers,
+                    stream,
+                } = response
+                {
+                    let normalized =
+                        super::providers::grok_cli_proxy::normalize_grok_sse_stream_with_context(
+                            stream,
+                            grok_tool_context.clone().unwrap_or_default(),
+                        );
+                    response = crate::proxy::hyper_client::ProxyResponse::streamed(
+                        status, headers, normalized,
+                    );
+                }
+            }
+            if !materialized_compaction_ids.is_empty() {
+                match self
+                    .compaction_service
+                    .mark_resume_verified(&materialized_compaction_ids)
+                {
+                    Ok(updated) if updated > 0 => log::info!(
+                        "[Compaction] verified resume for {updated} materialized compaction item(s)"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => log::warn!(
+                        "[Compaction] response succeeded but resume verification state could not be persisted: {error}"
+                    ),
                 }
             }
             Ok((response, resolved_claude_api_format, outbound_model))
@@ -3138,6 +3752,15 @@ fn headers_contain_proxy_placeholder(headers: &http::HeaderMap) -> bool {
     })
 }
 
+fn enforce_managed_auth_headers(
+    headers: &mut http::HeaderMap,
+    managed_headers: &[(http::HeaderName, http::HeaderValue)],
+) {
+    for (name, value) in managed_headers {
+        headers.insert(name.clone(), value.clone());
+    }
+}
+
 fn should_preserve_exact_header_case(
     adapter_name: &str,
     provider: &Provider,
@@ -3359,6 +3982,73 @@ fn prepare_upstream_request_body(request_body: Value) -> Value {
     canonicalize_value(filter_private_params_with_whitelist(request_body, &[]))
 }
 
+pub(crate) fn sanitize_official_responses_input_items(body: &mut Value) -> (usize, usize, usize) {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return (0, 0, 0);
+    };
+
+    let mut removed_message_ids = 0;
+    let mut removed_reasoning_items = 0;
+    let mut removed_bridge_reasoning_fields = 0;
+    input.retain_mut(|item| {
+        // A bridge can expose visible reasoning summaries, but it cannot mint
+        // OpenAI's encrypted reasoning payload. Sending an `rs_*` id without
+        // encrypted_content makes the official store try to resolve an item
+        // that never existed there (and store:false then returns 404). The
+        // adjacent assistant message/tool calls retain the actual conversation.
+        let has_encrypted_content = item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| !content.trim().is_empty());
+        let is_bridge_reasoning_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("rs_resp_"));
+        if item.get("type").and_then(Value::as_str) == Some("reasoning")
+            && (is_bridge_reasoning_id || !has_encrypted_content)
+        {
+            removed_reasoning_items += 1;
+            return false;
+        }
+
+        // Chat-compatible bridge providers expose chain-of-thought through
+        // non-standard fields on messages and tool-call items. Codex can replay
+        // those bridge-shaped items when a task switches back to an official
+        // Responses model, but the official API rejects fields such as
+        // `input[n].reasoning_content`. Keep the canonical message/tool payload
+        // and remove only provider-private reasoning metadata at this boundary.
+        if let Some(object) = item.as_object_mut() {
+            for field in ["reasoning_content", "reasoning_details", "thinking_content"] {
+                if object.remove(field).is_some() {
+                    removed_bridge_reasoning_fields += 1;
+                }
+            }
+        }
+
+        let is_message = item.get("type").and_then(Value::as_str) == Some("message");
+        if !is_message {
+            return true;
+        }
+
+        let invalid_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.starts_with("msg"));
+        if invalid_id {
+            if let Some(object) = item.as_object_mut() {
+                object.remove("id");
+                removed_message_ids += 1;
+            }
+        }
+        true
+    });
+    (
+        removed_message_ids,
+        removed_reasoning_items,
+        removed_bridge_reasoning_fields,
+    )
+}
+
 fn log_prompt_cache_trace(
     app_type: &AppType,
     provider: &Provider,
@@ -3501,6 +4191,10 @@ mod tests {
             current_providers: Arc::new(RwLock::new(HashMap::new())),
             gemini_shadow: Arc::new(GeminiShadowStore::new()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            compaction_service: Arc::new(CompactionService::with_store(
+                crate::proxy::compaction::CompactionStore::with_key(db.clone(), vec![13; 32])
+                    .expect("test compaction store"),
+            )),
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
             app_handle: None,
             current_provider_id_at_start: String::new(),
@@ -3661,6 +4355,84 @@ mod tests {
     }
 
     #[test]
+    fn official_responses_sanitizes_legacy_bridge_items() {
+        let mut body = json!({
+            "input": [
+                {"type":"message","id":"resp_20260719225020_msg","role":"assistant","content":[]},
+                {"type":"message","id":"msg_official","role":"assistant","content":[]},
+                {"type":"reasoning","id":"rs_resp_bridge","summary":[{"type":"summary_text","text":"bridge"}],"encrypted_content":null},
+                {"type":"reasoning","id":"rs_resp_empty","summary":[],"encrypted_content":""},
+                {"type":"reasoning","id":"rs_resp_fake_cipher","summary":[],"encrypted_content":"not-from-openai"},
+                {"type":"reasoning","id":"rs_official","summary":[],"encrypted_content":"ciphertext"},
+                {"type":"function_call","id":"fc_1","call_id":"call_1","name":"run","arguments":"{}"}
+            ]
+        });
+
+        let removed = sanitize_official_responses_input_items(&mut body);
+
+        assert_eq!(removed, (1, 3, 0));
+        assert!(body["input"][0].get("id").is_none());
+        assert_eq!(body["input"][1]["id"], "msg_official");
+        assert_eq!(body["input"][2]["id"], "rs_official");
+        assert_eq!(body["input"][2]["encrypted_content"], "ciphertext");
+        assert_eq!(body["input"][3]["id"], "fc_1");
+        assert_eq!(body["input"].as_array().unwrap().len(), 4);
+        assert_eq!(body["input"][0]["role"], "assistant");
+    }
+
+    #[test]
+    fn official_resume_strips_bridge_reasoning_fields_without_dropping_tool_history() {
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "reasoning": {"effort": "high"},
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "I inspected the repository.",
+                    "reasoning_content": "Private bridge reasoning"
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}",
+                    "reasoning_content": "Need to inspect the file.",
+                    "reasoning_details": [{"type": "reasoning.text", "text": "private"}],
+                    "thinking_content": "vendor private thinking"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "README contents"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "Continue the existing plan"
+                }
+            ]
+        });
+
+        let removed = sanitize_official_responses_input_items(&mut body);
+
+        assert_eq!(removed, (0, 0, 4));
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["input"].as_array().unwrap().len(), 4);
+        assert_eq!(body["input"][1]["type"], "function_call");
+        assert_eq!(body["input"][1]["call_id"], "call_1");
+        assert_eq!(body["input"][1]["name"], "read_file");
+        assert_eq!(body["input"][2]["type"], "function_call_output");
+        assert_eq!(body["input"][2]["output"], "README contents");
+        for item in body["input"].as_array().unwrap() {
+            assert!(item.get("reasoning_content").is_none());
+            assert!(item.get("reasoning_details").is_none());
+            assert!(item.get("thinking_content").is_none());
+        }
+    }
+
+    #[test]
     fn local_proxy_body_overrides_deep_merge_final_body_without_stream() {
         let mut body = json!({
             "model": "before",
@@ -3767,6 +4539,38 @@ mod tests {
                 .get(http::header::USER_AGENT)
                 .and_then(|value| value.to_str().ok()),
             Some("copilot")
+        );
+    }
+
+    #[test]
+    fn grok_managed_auth_overrides_stale_client_and_provider_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer stale-codex-token"),
+        );
+        headers.insert(
+            "x-xai-token-auth",
+            http::HeaderValue::from_static("stale-marker"),
+        );
+        let managed = crate::proxy::providers::grok_cli_proxy::build_grok_session_auth_headers(
+            "current-grok-session-token",
+        )
+        .unwrap();
+
+        enforce_managed_auth_headers(&mut headers, &managed);
+
+        assert_eq!(
+            headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer current-grok-session-token")
+        );
+        assert_eq!(
+            headers
+                .get("x-xai-token-auth")
+                .and_then(|value| value.to_str().ok()),
+            Some("xai-grok-cli")
         );
     }
 
@@ -4765,5 +5569,68 @@ mod tests {
         });
         let body = body_with_image("any-model");
         assert!(fwd.media_retry_should_trigger("Claude", false, &body, &image_unsupported_error()));
+    }
+
+    #[test]
+    fn codex_chat_tool_result_illegal_messages_error_triggers_continuation_retry() {
+        let mut provider = test_provider_with_type(None);
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..Default::default()
+        });
+        let mut body = json!({
+            "model": "GLM-5.2",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok"
+            }]
+        });
+        let error = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(
+                r#"{"error":{"message":"The messages parameter is illegal. Please check the documentation."}}"#
+                    .to_string(),
+            ),
+        };
+
+        assert!(RequestForwarder::codex_tool_result_retry_should_trigger(
+            &AppType::Codex,
+            &provider,
+            "/responses",
+            &body,
+            &error,
+        ));
+        assert!(RequestForwarder::append_codex_tool_result_continuation(
+            &mut body
+        ));
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[1]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn codex_chat_tool_result_retry_ignores_unrelated_bad_requests() {
+        let mut provider = test_provider_with_type(None);
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..Default::default()
+        });
+        let body = json!({
+            "input": [{"type": "function_call_output", "call_id": "call_1", "output": "ok"}]
+        });
+        let error = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(r#"{"error":{"message":"invalid model"}}"#.to_string()),
+        };
+
+        assert!(!RequestForwarder::codex_tool_result_retry_should_trigger(
+            &AppType::Codex,
+            &provider,
+            "/responses",
+            &body,
+            &error,
+        ));
     }
 }

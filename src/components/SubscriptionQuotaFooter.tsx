@@ -10,6 +10,7 @@ interface SubscriptionQuotaFooterProps {
   inline?: boolean;
   isCurrent?: boolean;
   autoQueryInterval?: number;
+  autoQueryIntervalSeconds?: number;
 }
 
 interface SubscriptionQuotaViewProps {
@@ -45,6 +46,17 @@ export const TIER_I18N_KEYS: Record<string, string> = {
 export function utilizationColor(utilization: number): string {
   if (utilization >= 90) return "text-red-500 dark:text-red-400";
   if (utilization >= 70) return "text-orange-500 dark:text-orange-400";
+  return "text-green-600 dark:text-green-400";
+}
+
+export function remainingPercent(utilization: number): number {
+  if (!Number.isFinite(utilization)) return 0;
+  return Math.max(0, Math.min(100, 100 - utilization));
+}
+
+export function remainingColor(remaining: number): string {
+  if (remaining <= 10) return "text-red-500 dark:text-red-400";
+  if (remaining <= 30) return "text-orange-500 dark:text-orange-400";
   return "text-green-600 dark:text-green-400";
 }
 
@@ -126,12 +138,18 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
 
   // 凭据过期
   if (quota.credentialStatus === "expired" && !quota.success) {
+    const expiredDetail = quota.credentialMessage || quota.error;
     if (inline) {
       return (
         <div className="inline-flex items-center gap-2 text-xs rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 px-3 py-2 shadow-sm">
           <div className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
             <AlertCircle size={12} />
-            <span>{t("subscription.expired")}</span>
+            <span
+              className="max-w-[440px] truncate"
+              title={expiredDetail || undefined}
+            >
+              {expiredDetail || t("subscription.expired")}
+            </span>
           </div>
           <button
             onClick={() => refetch()}
@@ -313,6 +331,7 @@ export const TierBadge: React.FC<{
     ? t(TIER_I18N_KEYS[tier.name])
     : tier.name;
   const countdown = countdownStr(tier.resetsAt);
+  const remaining = remainingPercent(tier.utilization);
 
   const hasUsd = tier.usedValueUsd != null && tier.maxValueUsd != null;
 
@@ -320,9 +339,10 @@ export const TierBadge: React.FC<{
     <div className="flex items-center gap-0.5">
       <span className="text-gray-500 dark:text-gray-400">{label}:</span>
       <span
-        className={`font-semibold tabular-nums ${utilizationColor(tier.utilization)}`}
+        className={`font-semibold tabular-nums ${remainingColor(remaining)}`}
+        title={t("usage.remaining")}
       >
-        {t("subscription.utilization", { value: Math.round(tier.utilization) })}
+        {Math.round(remaining)}%
       </span>
       {hasUsd && (
         <span className="text-muted-foreground/60">
@@ -348,6 +368,7 @@ const TierBar: React.FC<{
     ? t(TIER_I18N_KEYS[tier.name])
     : tier.name;
   const resetText = formatResetTime(tier.resetsAt, t);
+  const remaining = remainingPercent(tier.utilization);
 
   return (
     <div className="flex items-center gap-3 text-xs">
@@ -362,13 +383,13 @@ const TierBar: React.FC<{
       <div className="flex-1 h-2 bg-gray-100 dark:bg-gray-800 rounded-full overflow-hidden">
         <div
           className={`h-full rounded-full transition-all ${
-            tier.utilization >= 90
+            remaining <= 10
               ? "bg-red-500"
-              : tier.utilization >= 70
+              : remaining <= 30
                 ? "bg-orange-500"
                 : "bg-green-500"
           }`}
-          style={{ width: `${Math.min(tier.utilization, 100)}%` }}
+          style={{ width: `${remaining}%` }}
         />
       </div>
 
@@ -377,9 +398,10 @@ const TierBar: React.FC<{
         style={{ width: "30%" }}
       >
         <span
-          className={`font-semibold tabular-nums ${utilizationColor(tier.utilization)}`}
+          className={`font-semibold tabular-nums ${remainingColor(remaining)}`}
+          title={t("usage.remaining")}
         >
-          {Math.round(tier.utilization)}%
+          {Math.round(remaining)}%
         </span>
         {resetText && (
           <span
@@ -403,7 +425,17 @@ const SubscriptionQuotaFooter: React.FC<SubscriptionQuotaFooterProps> = ({
   inline = false,
   isCurrent = false,
   autoQueryInterval = 5,
+  autoQueryIntervalSeconds,
 }) => {
+  const explicitIntervalMs =
+    autoQueryIntervalSeconds === undefined
+      ? undefined
+      : autoQueryIntervalSeconds * 1000;
+  const shouldAutoQuery =
+    isCurrent &&
+    (autoQueryIntervalSeconds !== undefined
+      ? autoQueryIntervalSeconds > 0
+      : autoQueryInterval > 0);
   const {
     data: quota,
     isFetching: loading,
@@ -411,8 +443,9 @@ const SubscriptionQuotaFooter: React.FC<SubscriptionQuotaFooterProps> = ({
   } = useSubscriptionQuota(
     appId,
     isCurrent,
-    isCurrent && autoQueryInterval > 0,
+    shouldAutoQuery,
     autoQueryInterval,
+    explicitIntervalMs,
   );
 
   if (!isCurrent) return null;

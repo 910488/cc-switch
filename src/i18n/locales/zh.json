@@ -183,7 +183,10 @@
     "needsRouting": "需要路由",
     "noRoutingSupport": "不支持路由",
     "officialRouting": "官方账号路由",
-    "nativeLogin": "Codex 登录"
+    "nativeLogin": "Codex 登录",
+    "configureModels": "设置 Codex 模型",
+    "modelsConfigured": "已加入 {{count}} 个模型",
+    "configureModelsHint": "设置此 Provider 要加入 Codex 模型菜单的模型"
   },
   "claudeDesktop": {
     "officialNotice": "Claude Desktop 官方供应商使用应用内置的 1P 登录，无需配置 API Key 和接口地址。",
@@ -341,7 +344,19 @@
         "enableFailoverToggle": "在主页面显示故障转移开关",
         "enableFailoverToggleDescription": "开启后，主页面顶部将独立显示故障转移开关",
         "running": "运行中",
-        "stopped": "已停止"
+        "stopped": "已停止",
+        "repairCodex": {
+          "title": "恢复官方 Codex 设置",
+          "description": "不依赖 Provider snapshot，直接使用安全的官方默认值重建 Codex 实时设置；保留聊天记录、项目、MCP Server 与有效的 ChatGPT OAuth 登录。",
+          "button": "一键恢复官方设置",
+          "confirmTitle": "要恢复官方 Codex 设置吗？",
+          "confirmMessage": "请先关闭 Codex Desktop。CC Switch 会停止路由、备份当前 profile、移除注入模型与 Proxy 路由，并修复 Windows onboarding 状态。聊天数据库、项目、MCP Server 与有效的 ChatGPT 登录会保留；如果 auth.json 只有第三方 API Key，将被移除并要求重新登录。",
+          "confirm": "备份并恢复",
+          "success": "官方 Codex 设置已恢复，请重新启动 Codex Desktop。",
+          "successLoginRequired": "官方 Codex 设置已恢复，请重新启动 Codex Desktop 并重新登录。",
+          "backupCreated": "安全备份位置：{{path}}",
+          "failed": "恢复官方 Codex 设置失败"
+        }
       },
       "connectivityCheck": {
         "title": "连通检测配置",
@@ -1447,6 +1462,10 @@
     "cacheHitRate": "缓存命中率",
     "requestLogs": "请求日志",
     "providerStats": "Provider 统计",
+    "providerBreakdown": {
+      "title": "各 Provider 使用量",
+      "description": "Codex 原生会话统一计入 OpenAI Official；匹配的会话与 Proxy 记录只计算一次。"
+    },
     "modelStats": "模型统计",
     "time": "时间",
     "provider": "供应商",
@@ -2491,6 +2510,44 @@
         "totalRequests": "总请求数",
         "successRate": "成功率",
         "uptime": "运行时间"
+      }
+    },
+    "continuity": {
+      "configurationTitle": "上下文压缩",
+      "configurationDescription": "设置 Codex continuity 如何建立本地交接摘要，以及由哪个第三方路由执行摘要。",
+      "rolloutMode": "启用模式",
+      "rollout": {
+        "off": "关闭",
+        "observeOnly": "仅观察",
+        "thirdPartyOnly": "仅第三方",
+        "fullSwitching": "完整跨 Provider 续接"
+      },
+      "rolloutHint": "控制 journal 保存、本地压缩与跨 Provider 上下文续接。",
+      "officialFallback": "官方压缩安全回退",
+      "officialFallbackHint": "官方 compact endpoint 失败时，改用 canonical context 安全展开。",
+      "summaryProvider": "摘要 Provider",
+      "followActiveRoute": "跟随当前第三方路由",
+      "missingProvider": "找不到 Provider：{{id}}",
+      "summaryProviderHint": "可固定使用第三方 Codex Chat／Anthropic Provider，或维持现有的当前路由行为。",
+      "summaryModel": "摘要模型",
+      "summaryModelPlaceholder": "Provider 默认模型",
+      "summaryModelHint": "可选择已配置模型或输入精确的 upstream model ID；留空时使用 Provider 默认值。",
+      "effectiveTarget": "实际摘要目标",
+      "providerDefaultModel": "Provider 默认模型",
+      "activeRouteTarget": "当前第三方路由 · 原请求模型",
+      "appliesWhenStarted": "此设置会在本地路由启动后生效。",
+      "advancedLimits": "高级摘要限制",
+      "advancedLimitsHint": "只开放 executor 真正使用的限制；chunk 大小与 overflow retry 仍由系统自动处理。",
+      "inputBudget": "初始输入 budget",
+      "inputBudgetHint": "{{min}}–{{max}} tokens。小 context 模型可调低；overflow retry 仍会自动缩小。",
+      "outputTokens": "最终交接摘要输出上限",
+      "outputTokensHint": "{{min}}–{{max}} tokens，请勿超过所选模型的输出上限。",
+      "saved": "上下文压缩设置已保存",
+      "saveFailed": "无法保存上下文压缩设置：{{error}}",
+      "validation": {
+        "inputBudget": "输入 budget 必须介于 {{min}} 与 {{max}} tokens。",
+        "outputTokens": "输出上限必须介于 {{min}} 与 {{max}} tokens。",
+        "providerMissing": "选取的摘要 Provider 已不存在，请重新选择。"
       }
     },
     "settings": {

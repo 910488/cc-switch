@@ -2,9 +2,11 @@
 //!
 //! 提供本地HTTP代理服务，支持多Provider故障转移和请求透传
 
+pub(crate) mod auto_review;
 pub mod body_filter;
 pub mod cache_injector;
 pub mod circuit_breaker;
+pub(crate) mod compaction;
 pub(crate) mod content_encoding;
 pub mod copilot_optimizer;
 pub mod error;
@@ -22,10 +24,14 @@ pub(crate) mod json_canonical;
 pub mod log_codes;
 pub mod media_sanitizer;
 pub mod model_mapper;
+pub(crate) mod model_routes;
 pub mod provider_router;
 pub mod providers;
+pub(crate) mod quota_policy;
+pub(crate) mod reasoning_visibility;
 pub mod response_handler;
 pub mod response_processor;
+pub(crate) mod secret_vault;
 pub(crate) mod server;
 pub mod session;
 pub(crate) mod sse;

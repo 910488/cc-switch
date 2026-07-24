@@ -183,7 +183,10 @@
     "needsRouting": "Needs Routing",
     "noRoutingSupport": "No Routing Support",
     "officialRouting": "Official Account Routing",
-    "nativeLogin": "Codex Sign-in"
+    "nativeLogin": "Codex Sign-in",
+    "configureModels": "Configure Models",
+    "modelsConfigured": "{{count}} models added",
+    "configureModelsHint": "Choose which models from this provider appear in the Codex model menu"
   },
   "claudeDesktop": {
     "officialNotice": "Claude Desktop official providers use the built-in 1P sign-in. No API key or endpoint URL is required.",
@@ -341,7 +344,19 @@
         "enableFailoverToggle": "Show Failover Toggle on Main Page",
         "enableFailoverToggleDescription": "When enabled, the failover toggle will appear independently at the top of the main page",
         "running": "Running",
-        "stopped": "Stopped"
+        "stopped": "Stopped",
+        "repairCodex": {
+          "title": "Restore Official Codex Profile",
+          "description": "Rebuild the live Codex configuration from safe official defaults without relying on a provider snapshot. Chats, projects, MCP servers, and valid ChatGPT OAuth login are preserved.",
+          "button": "Restore Official Settings",
+          "confirmTitle": "Restore the official Codex profile?",
+          "confirmMessage": "Close Codex Desktop first. CC Switch will stop routing, back up the current profile, remove injected models and proxy routes, repair the Windows onboarding flag, and preserve chat databases, projects, MCP servers, and valid ChatGPT login. If auth.json contains only a third-party API key, it will be removed and you will need to sign in again.",
+          "confirm": "Back up and restore",
+          "success": "Official Codex settings restored. Restart Codex Desktop.",
+          "successLoginRequired": "Official Codex settings restored. Restart Codex Desktop and sign in again.",
+          "backupCreated": "Safety backup: {{path}}",
+          "failed": "Failed to restore the official Codex profile"
+        }
       },
       "connectivityCheck": {
         "title": "Connectivity Check Settings",
@@ -1447,6 +1462,10 @@
     "cacheHitRate": "Cache Hit Rate",
     "requestLogs": "Request Logs",
     "providerStats": "Provider Stats",
+    "providerBreakdown": {
+      "title": "Usage by provider",
+      "description": "Native Codex sessions are counted with OpenAI Official; matching session and proxy records are counted once."
+    },
     "modelStats": "Model Stats",
     "time": "Time",
     "provider": "Provider",
@@ -2491,6 +2510,44 @@
         "totalRequests": "Total Requests",
         "successRate": "Success Rate",
         "uptime": "Uptime"
+      }
+    },
+    "continuity": {
+      "configurationTitle": "Context compaction",
+      "configurationDescription": "Choose how Codex continuity creates local handoff summaries and which third-party route performs the work.",
+      "rolloutMode": "Rollout mode",
+      "rollout": {
+        "off": "Off",
+        "observeOnly": "Observe only",
+        "thirdPartyOnly": "Third-party only",
+        "fullSwitching": "Full switching"
+      },
+      "rolloutHint": "Controls journal capture, local compaction, and cross-provider continuation.",
+      "officialFallback": "Safe official compact fallback",
+      "officialFallbackHint": "Materialize canonical context if the official compact endpoint fails.",
+      "summaryProvider": "Summary provider",
+      "followActiveRoute": "Follow the active third-party route",
+      "missingProvider": "Missing provider: {{id}}",
+      "summaryProviderHint": "Pin a third-party Codex Chat or Anthropic provider, or keep the existing active-route behavior.",
+      "summaryModel": "Summary model",
+      "summaryModelPlaceholder": "Provider default model",
+      "summaryModelHint": "Select a configured model or enter its exact upstream model ID. Leave blank to use the provider default.",
+      "effectiveTarget": "Effective summary target",
+      "providerDefaultModel": "provider default model",
+      "activeRouteTarget": "Active third-party route · request model",
+      "appliesWhenStarted": "This selection takes effect when local routing starts.",
+      "advancedLimits": "Advanced summary limits",
+      "advancedLimitsHint": "Only limits that map to the executor are exposed. Chunk sizing and overflow retries remain automatic.",
+      "inputBudget": "Initial input budget",
+      "inputBudgetHint": "{{min}}–{{max}} tokens. Lower this for models with smaller context windows; overflow retries reduce it further.",
+      "outputTokens": "Final handoff output limit",
+      "outputTokensHint": "{{min}}–{{max}} tokens. Do not exceed the selected model's output ceiling.",
+      "saved": "Context compaction settings saved",
+      "saveFailed": "Failed to save context compaction settings: {{error}}",
+      "validation": {
+        "inputBudget": "Input budget must be between {{min}} and {{max}} tokens.",
+        "outputTokens": "Output limit must be between {{min}} and {{max}} tokens.",
+        "providerMissing": "The selected summary provider no longer exists. Choose another provider."
       }
     },
     "settings": {

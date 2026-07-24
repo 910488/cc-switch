@@ -303,3 +303,41 @@ pub async fn auth_logout(
         _ => unreachable!(),
     }
 }
+// ---------------------------------------------------------------------------
+// Grok CLI auth commands
+// ---------------------------------------------------------------------------
+
+/// Refresh the Grok CLI session by running `grok models` (which triggers
+/// a token refresh if the session is expired). Returns the new status.
+#[tauri::command]
+pub async fn refresh_grok_cli_auth() -> Result<String, String> {
+    use tokio::process::Command;
+    let executable = crate::proxy::providers::grok_credential_broker::find_grok_executable(Some(
+        &crate::grok_config::get_grok_config_dir(),
+    ));
+    let mut command = Command::new(executable);
+    command.arg("models").kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+        .await
+        .map_err(|_| "`grok models` timed out after 30 seconds".to_string())?
+        .map_err(|e| format!("Failed to run `grok models`: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("`grok models` failed: {stderr}"));
+    }
+    Ok("Refreshed".to_string())
+}
+
+/// Open the Grok login page by running `grok login`.
+#[tauri::command]
+pub async fn open_grok_login() -> Result<(), String> {
+    use tokio::process::Command;
+    let executable = crate::proxy::providers::grok_credential_broker::find_grok_executable(Some(
+        &crate::grok_config::get_grok_config_dir(),
+    ));
+    Command::new(executable)
+        .arg("login")
+        .spawn()
+        .map_err(|e| format!("Failed to run `grok login`: {e}"))?;
+    Ok(())
+}

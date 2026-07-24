@@ -9,6 +9,8 @@
 //! a direct (non-proxied) CLI request.
 
 use super::{
+    auto_review::{AutoReviewRuntime, AutoReviewStats},
+    compaction::CompactionService,
     failover_switch::FailoverSwitchManager,
     handlers,
     log_codes::srv as log_srv,
@@ -44,6 +46,10 @@ pub struct ProxyState {
     pub gemini_shadow: Arc<GeminiShadowStore>,
     /// Codex Chat bridge history，用于恢复 previous_response_id 指向的 tool call
     pub codex_chat_history: Arc<CodexChatHistoryStore>,
+    /// Durable encrypted journal used to keep Codex context valid while providers change.
+    pub compaction_service: Arc<CompactionService>,
+    /// Runtime counters for the pinned `codex-auto-review` route.
+    pub auto_review_runtime: Arc<AutoReviewRuntime>,
     /// AppHandle，用于发射事件和更新托盘菜单
     pub app_handle: Option<tauri::AppHandle>,
     /// 故障转移切换管理器
@@ -70,8 +76,9 @@ impl ProxyServer {
         // 创建故障转移切换管理器
         let failover_manager = Arc::new(FailoverSwitchManager::new(db.clone()));
 
+        let compaction_service = Arc::new(CompactionService::new(db.clone()));
         let state = ProxyState {
-            db,
+            db: db.clone(),
             config: Arc::new(RwLock::new(config.clone())),
             status: Arc::new(RwLock::new(ProxyStatus::default())),
             start_time: Arc::new(RwLock::new(None)),
@@ -79,6 +86,8 @@ impl ProxyServer {
             provider_router,
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            compaction_service,
+            auto_review_runtime: Arc::new(AutoReviewRuntime::new(db.clone())),
             app_handle,
             failover_manager,
         };
@@ -194,6 +203,7 @@ impl ProxyServer {
                             if let Err(e) = hyper::server::conn::http1::Builder::new()
                                 .preserve_header_case(true)
                                 .serve_connection(TokioIo::new(stream), service)
+                                .with_upgrades()
                                 .await
                             {
                                 // Connection reset / broken pipe 等在代理场景下很常见，debug 级别
@@ -272,8 +282,13 @@ impl ProxyServer {
                 provider_name: provider_name.clone(),
             })
             .collect();
+        status.continuity = self.state.compaction_service.status();
 
         status
+    }
+
+    pub async fn get_auto_review_stats(&self) -> AutoReviewStats {
+        self.state.auto_review_runtime.snapshot().await
     }
 
     /// 更新某个应用类型当前“目标供应商”（用于 UI 展示 active_targets）
@@ -323,10 +338,22 @@ impl ProxyServer {
             .route("/models", get(handlers::handle_models))
             .route("/v1/models", get(handlers::handle_models))
             // OpenAI Responses API (Codex CLI，支持带前缀和不带前缀)
-            .route("/responses", post(handlers::handle_responses))
-            .route("/v1/responses", post(handlers::handle_responses))
-            .route("/v1/v1/responses", post(handlers::handle_responses))
-            .route("/codex/v1/responses", post(handlers::handle_responses))
+            .route(
+                "/responses",
+                get(handlers::handle_responses_websocket).post(handlers::handle_responses),
+            )
+            .route(
+                "/v1/responses",
+                get(handlers::handle_responses_websocket).post(handlers::handle_responses),
+            )
+            .route(
+                "/v1/v1/responses",
+                get(handlers::handle_responses_websocket).post(handlers::handle_responses),
+            )
+            .route(
+                "/codex/v1/responses",
+                get(handlers::handle_responses_websocket).post(handlers::handle_responses),
+            )
             // Grok Build uses the Responses protocol but has an independent
             // provider namespace and failover queue.
             .route(
@@ -401,5 +428,1690 @@ impl ProxyServer {
             .provider_router
             .reset_provider_breaker(provider_id, app_type)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod continuity_e2e_tests {
+    use super::*;
+    use axum::{extract::State, response::IntoResponse, routing::post, Json};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use bytes::Bytes;
+    use futures::{SinkExt, StreamExt};
+    use serde_json::{json, Value};
+    use serial_test::serial;
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
+
+    struct TestEnvironment {
+        _home: TempDir,
+        old_test_home: Option<String>,
+        old_key: Option<String>,
+    }
+
+    impl TestEnvironment {
+        fn new() -> Self {
+            let home = TempDir::new().expect("temp test home");
+            let old_test_home = std::env::var("CC_SWITCH_TEST_HOME").ok();
+            let old_key = std::env::var("CC_SWITCH_COMPACTION_MASTER_KEY").ok();
+            std::env::set_var("CC_SWITCH_TEST_HOME", home.path());
+            std::env::set_var(
+                "CC_SWITCH_COMPACTION_MASTER_KEY",
+                STANDARD.encode(vec![42u8; 32]),
+            );
+            crate::settings::reload_settings().expect("reload isolated settings");
+            Self {
+                _home: home,
+                old_test_home,
+                old_key,
+            }
+        }
+
+        fn db_path(&self) -> std::path::PathBuf {
+            self._home.path().join(".cc-switch").join("cc-switch.db")
+        }
+    }
+
+    impl Drop for TestEnvironment {
+        fn drop(&mut self) {
+            match &self.old_test_home {
+                Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+                None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+            }
+            match &self.old_key {
+                Some(value) => std::env::set_var("CC_SWITCH_COMPACTION_MASTER_KEY", value),
+                None => std::env::remove_var("CC_SWITCH_COMPACTION_MASTER_KEY"),
+            }
+            let _ = crate::settings::reload_settings();
+        }
+    }
+
+    async fn mock_chat(
+        State(captured): State<Arc<Mutex<Vec<Value>>>>,
+        Json(body): Json<Value>,
+    ) -> axum::response::Response {
+        let streaming = body.get("stream").and_then(Value::as_bool) == Some(true);
+        captured.lock().expect("capture lock").push(body);
+        if streaming {
+            let wire = concat!(
+                "data: {\"id\":\"chatcmpl-e2e\",\"object\":\"chat.completion.chunk\",\"model\":\"mock-chat\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl-e2e\",\"object\":\"chat.completion.chunk\",\"model\":\"mock-chat\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"HANDOFF_E2E_SUMMARY: durable context retained\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl-e2e\",\"object\":\"chat.completion.chunk\",\"model\":\"mock-chat\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":8,\"total_tokens\":28}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            return (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                wire,
+            )
+                .into_response();
+        }
+        Json(json!({
+            "id": "chatcmpl-e2e",
+            "object": "chat.completion",
+            "model": "mock-chat",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "HANDOFF_E2E_SUMMARY: durable context retained"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28}
+        }))
+        .into_response()
+    }
+
+    async fn start_mock_chat_upstream() -> (
+        String,
+        Arc<Mutex<Vec<Value>>>,
+        oneshot::Sender<()>,
+        JoinHandle<()>,
+    ) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_chat))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock upstream");
+        let address = listener.local_addr().expect("mock address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("mock upstream server");
+        });
+        (format!("http://{address}/v1"), captured, shutdown_tx, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn responses_websocket_bridges_to_http_pipeline_without_405() {
+        let _environment = TestEnvironment::new();
+        let (upstream, _captured, shutdown_tx, upstream_task) = start_mock_chat_upstream().await;
+        let db = Arc::new(Database::init().expect("websocket bridge database"));
+        let provider = crate::provider::Provider::with_id(
+            "ws-chat".to_string(),
+            "WS Chat".to_string(),
+            json!({
+                "base_url": upstream,
+                "api_format": "openai_chat",
+                "auth": {"OPENAI_API_KEY": "ws-key"}
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        select_codex_provider(&db, "ws-chat");
+        let server = ProxyServer::new(test_proxy_config(), db, None);
+        let info = server.start().await.unwrap();
+
+        let (mut socket, upgrade) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/v1/responses", info.port))
+                .await
+                .expect("upgrade local Responses websocket");
+        assert_eq!(upgrade.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"mock-chat",
+                    "stream":true,
+                    "input":[{"type":"message","role":"user","content":"hello over ws"}],
+                    "client_metadata":{
+                        "session_id":"ws-session",
+                        "thread_id":"ws-thread"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(message) = socket.next().await {
+                let message = message.unwrap();
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    let event: Value = serde_json::from_str(text.as_ref()).unwrap();
+                    if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                        return event;
+                    }
+                }
+            }
+            panic!("websocket closed before response.completed");
+        })
+        .await
+        .expect("websocket response timeout");
+        assert_eq!(completed["type"], "response.completed");
+
+        let _ = socket.close(None).await;
+        server.stop().await.unwrap();
+        let _ = shutdown_tx.send(());
+        upstream_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn official_responses_websocket_retokenizes_bridge_for_remote_compaction_v2() {
+        use crate::proxy::compaction::{CompactionContext, MaterializationTarget, ProviderRealm};
+        use crate::proxy::model_routes::{self, CatalogModelInput, ModelRoute, ModelRouteSettings};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let _environment = TestEnvironment::new();
+        let (chat_url, captured_chat, chat_shutdown, chat_task) = start_mock_chat_upstream().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        std::env::set_var(
+            "CC_SWITCH_TEST_OFFICIAL_WS_URL",
+            format!("ws://{upstream_addr}/responses"),
+        );
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get(http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer test-official-token")
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+
+            let first = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let first: Value = serde_json::from_str(first.as_ref()).unwrap();
+            assert_eq!(first["type"], "response.create");
+            assert_eq!(first["generate"], false);
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":"resp-official-ws","status":"completed","output":[]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let compact = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let compact: Value = serde_json::from_str(compact.as_ref()).unwrap();
+            assert_eq!(compact["type"], "response.create");
+            assert_eq!(compact["generate"], true);
+            assert_eq!(compact["input"][0]["id"], "cmp-native-ws");
+            assert_eq!(compact["input"][0]["encrypted_content"], "opaque-native-ws");
+            assert_eq!(compact["input"][1]["type"], "compaction_trigger");
+            assert!(
+                !compact.to_string().contains("bcmp1."),
+                "CC Switch bridge ciphertext must never reach OpenAI"
+            );
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{
+                            "id":"resp-remote-compact",
+                            "status":"completed",
+                            "output":[{
+                                "id":"cmp-remote-result",
+                                "type":"compaction",
+                                "encrypted_content":"opaque-remote-result"
+                            }]
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            // The native socket must remain usable after compact completion.
+            let follow_up = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let follow_up: Value = serde_json::from_str(follow_up.as_ref()).unwrap();
+            assert_eq!(follow_up["input"][0]["content"], "still connected");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":"resp-follow-up","status":"completed","output":[]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = socket.close(None).await;
+        });
+
+        let db = Arc::new(Database::init().expect("official websocket database"));
+        let mut provider = crate::provider::Provider::with_id(
+            crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            "OpenAI Official".to_string(),
+            json!({"auth":{},"config":""}),
+            None,
+        );
+        provider.category = Some("official".to_string());
+        db.save_provider("codex", &provider).unwrap();
+        let third_party = crate::provider::Provider::with_id(
+            "compact-ws-chat".to_string(),
+            "Compact WS Chat".to_string(),
+            json!({
+                "base_url":chat_url,
+                "api_format":"openai_chat",
+                "auth":{"OPENAI_API_KEY":"compact-ws-key"}
+            }),
+            None,
+        );
+        db.save_provider("codex", &third_party).unwrap();
+        model_routes::save(
+            &db,
+            &ModelRouteSettings {
+                official_models: vec![CatalogModelInput {
+                    model: "gpt-native".to_string(),
+                    display_name: Some("GPT Native".to_string()),
+                    ..Default::default()
+                }],
+                routes: vec![ModelRoute {
+                    alias: "ccs-compact-0-third-model".to_string(),
+                    provider_id: third_party.id.clone(),
+                    upstream_model: "third-model".to_string(),
+                    display_name: "[Compact] Third Model".to_string(),
+                    context_window: Some(64_000),
+                }],
+            },
+        )
+        .unwrap();
+        select_codex_provider(&db, crate::database::CODEX_OFFICIAL_PROVIDER_ID);
+        let server = ProxyServer::new(test_proxy_config(), db, None);
+
+        let continuity_context = CompactionContext {
+            thread_id: "ws-compact-thread".to_string(),
+            session_id: "ws-compact-session".to_string(),
+            request_id: "ws-compact-seed".to_string(),
+        };
+        let source = json!({
+            "model":"gpt-native",
+            "input":[{"type":"message","role":"user","content":"canonical history"}]
+        });
+        let snapshot = server
+            .state
+            .compaction_service
+            .save_snapshot(&continuity_context, &source, ProviderRealm::Bridge)
+            .unwrap();
+        let bridge_item = server
+            .state
+            .compaction_service
+            .create_bridge_compaction(
+                &continuity_context,
+                &snapshot,
+                "test-bridge-provider",
+                "canonical history summary",
+            )
+            .unwrap();
+        let compact_request = json!({
+            "model":"gpt-native",
+            "stream":true,
+            "input":[bridge_item.clone(),{"type":"compaction_trigger"}]
+        });
+        let target = MaterializationTarget {
+            provider_id: crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            model: "gpt-native".to_string(),
+            realm: ProviderRealm::Official,
+            realm_key: format!("native:{}", crate::database::CODEX_OFFICIAL_PROVIDER_ID),
+        };
+        let plan = server
+            .state
+            .compaction_service
+            .prepare_official_recompact(&compact_request, &target)
+            .unwrap()
+            .expect("bridge request needs official re-compaction");
+        server
+            .state
+            .compaction_service
+            .finish_official_recompact(
+                &continuity_context,
+                &plan,
+                &target,
+                &json!({
+                    "id":"cmp-native-ws",
+                    "type":"compaction",
+                    "encrypted_content":"opaque-native-ws"
+                }),
+            )
+            .unwrap();
+
+        let info = server.start().await.unwrap();
+        let mut request = format!("ws://127.0.0.1:{}/v1/responses", info.port)
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer test-official-token"),
+        );
+        request.headers_mut().insert(
+            http::HeaderName::from_static("thread-id"),
+            http::HeaderValue::from_static("ws-compact-thread"),
+        );
+        request.headers_mut().insert(
+            http::HeaderName::from_static("session-id"),
+            http::HeaderValue::from_static("ws-compact-session"),
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"gpt-native",
+                    "generate":false
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let prewarm = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let prewarm: Value = serde_json::from_str(prewarm.as_ref()).unwrap();
+        assert_eq!(prewarm["response"]["id"], "resp-official-ws");
+
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"gpt-native",
+                    "generate":true,
+                    "stream":true,
+                    "input":[bridge_item,{"type":"compaction_trigger"}]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let compact = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let compact: Value = serde_json::from_str(compact.as_ref()).unwrap();
+        let output = compact["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "compaction");
+        let compact_item = output[0].clone();
+
+        // Reproduce the production transition: the native compaction token
+        // returned over the official WebSocket must resolve through the durable
+        // journal when the next turn selects a third-party Chat model.
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"ccs-compact-0-third-model",
+                    "generate":true,
+                    "stream":true,
+                    "input":[
+                        compact_item,
+                        {"type":"message","role":"user","content":"THIRD_PARTY_AFTER_OFFICIAL_COMPACT"}
+                    ]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let third_party_completed =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while let Some(message) = socket.next().await {
+                    let message = message.unwrap();
+                    if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                        let event: Value = serde_json::from_str(text.as_ref()).unwrap();
+                        if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                            return event;
+                        }
+                    }
+                }
+                panic!("socket closed before third-party compact continuation completed");
+            })
+            .await
+            .expect("third-party compact continuation timeout");
+        let third_party_response_id = third_party_completed
+            .pointer("/response/id")
+            .and_then(Value::as_str)
+            .expect("third-party response id")
+            .to_string();
+        let chat_wire = captured_chat
+            .lock()
+            .unwrap()
+            .last()
+            .expect("third-party continuation request")
+            .to_string();
+        assert!(chat_wire.contains("canonical history"));
+        assert!(chat_wire.contains("THIRD_PARTY_AFTER_OFFICIAL_COMPACT"));
+        assert!(!chat_wire.contains("opaque-remote-result"));
+
+        // The Chat bridge records the original Responses exchange so it can
+        // hydrate a later previous_response_id. That cached exchange still
+        // contains the native compaction item. It must be materialized again
+        // after history hydration, not allowed to reach the Chat transform.
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"ccs-compact-0-third-model",
+                    "generate":true,
+                    "stream":true,
+                    "previous_response_id":third_party_response_id,
+                    "input":[
+                        {"type":"message","role":"user","content":"FOLLOW_UP_AFTER_CHAT_HISTORY_HYDRATION"}
+                    ]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(message) = socket.next().await {
+                let message = message.unwrap();
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    let event: Value = serde_json::from_str(text.as_ref()).unwrap();
+                    if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                        return;
+                    }
+                }
+            }
+            panic!("socket closed before hydrated third-party continuation completed");
+        })
+        .await
+        .expect("hydrated third-party continuation timeout");
+        let hydrated_chat_wire = captured_chat
+            .lock()
+            .unwrap()
+            .last()
+            .expect("hydrated third-party continuation request")
+            .to_string();
+        assert!(hydrated_chat_wire.contains("canonical history"));
+        assert!(hydrated_chat_wire.contains("FOLLOW_UP_AFTER_CHAT_HISTORY_HYDRATION"));
+        assert!(!hydrated_chat_wire.contains("\"type\":\"compaction\""));
+        assert!(!hydrated_chat_wire.contains("opaque-remote-result"));
+
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"gpt-native",
+                    "generate":true,
+                    "stream":true,
+                    "input":[{"type":"message","role":"user","content":"still connected"}]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let follow_up = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let follow_up: Value = serde_json::from_str(follow_up.as_ref()).unwrap();
+        assert_eq!(follow_up["response"]["id"], "resp-follow-up");
+
+        let _ = socket.close(None).await;
+        server.stop().await.unwrap();
+        upstream_task.await.unwrap();
+        let _ = chat_shutdown.send(());
+        chat_task.await.unwrap();
+        std::env::remove_var("CC_SWITCH_TEST_OFFICIAL_WS_URL");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn legacy_unjournaled_official_compaction_recovers_from_codex_session() {
+        use crate::proxy::compaction::{
+            CompactionContext, CompactionService, MaterializationTarget, ProviderRealm,
+        };
+
+        let environment = TestEnvironment::new();
+        let db = Arc::new(Database::init().expect("legacy recovery database"));
+        let service = CompactionService::new(db);
+        let session_id = "legacy-session-019f";
+        let sessions = environment
+            ._home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("23");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let native_item = json!({
+            "id":"cmp-legacy-session",
+            "type":"compaction",
+            "encrypted_content":"opaque-legacy-session"
+        });
+        let record = json!({
+            "timestamp":"2026-07-23T08:02:07.229Z",
+            "type":"compacted",
+            "payload":{
+                "replacement_history":[
+                    {"type":"message","role":"user","content":"RECOVERED_CANONICAL_HISTORY"},
+                    native_item.clone()
+                ]
+            }
+        });
+        std::fs::write(
+            sessions.join(format!("rollout-{session_id}.jsonl")),
+            format!("{}\n", record),
+        )
+        .unwrap();
+
+        let context = CompactionContext {
+            thread_id: "legacy-thread".to_string(),
+            session_id: session_id.to_string(),
+            request_id: "legacy-request".to_string(),
+        };
+        let body = json!({
+            "model":"third-model",
+            "input":[
+                native_item,
+                {"type":"message","role":"user","content":"LEGACY_SUFFIX"}
+            ]
+        });
+        assert_eq!(
+            service
+                .recover_native_compactions_from_codex_session(
+                    &context,
+                    &body,
+                    crate::database::CODEX_OFFICIAL_PROVIDER_ID,
+                )
+                .unwrap(),
+            1
+        );
+        let materialized = service
+            .materialize_for_target(
+                &body,
+                &MaterializationTarget {
+                    provider_id: "third-provider".to_string(),
+                    model: "third-model".to_string(),
+                    realm: ProviderRealm::Bridge,
+                    realm_key: "bridge".to_string(),
+                },
+            )
+            .unwrap();
+        let wire = materialized.body.to_string();
+        assert!(wire.contains("RECOVERED_CANONICAL_HISTORY"));
+        assert!(wire.contains("LEGACY_SUFFIX"));
+        assert!(!wire.contains("opaque-legacy-session"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn official_websocket_routes_later_third_party_model_and_can_switch_back() {
+        use crate::proxy::model_routes::{self, CatalogModelInput, ModelRoute, ModelRouteSettings};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let _environment = TestEnvironment::new();
+        let (chat_url, captured_chat, chat_shutdown, chat_task) = start_mock_chat_upstream().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        std::env::set_var(
+            "CC_SWITCH_TEST_OFFICIAL_WS_URL",
+            format!("ws://{upstream_addr}/responses"),
+        );
+        let official_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let prewarm = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let prewarm: Value = serde_json::from_str(prewarm.as_ref()).unwrap();
+            assert_eq!(prewarm["model"], "gpt-native");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":"resp-route-prewarm","status":"completed","output":[]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            // The ccs-* request must be handled by the HTTP Chat bridge and
+            // must not appear here. The next native message is the explicit
+            // switch back to the official model.
+            let switched_back = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let switched_back: Value = serde_json::from_str(switched_back.as_ref()).unwrap();
+            assert_eq!(switched_back["model"], "gpt-native");
+            assert_eq!(switched_back["input"][0]["content"], "back to official");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":"resp-route-official","status":"completed","output":[]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = socket.close(None).await;
+        });
+
+        let db = Arc::new(Database::init().expect("dynamic websocket route database"));
+        let mut official = crate::provider::Provider::with_id(
+            crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            "OpenAI Official".to_string(),
+            json!({"auth":{},"config":""}),
+            None,
+        );
+        official.category = Some("official".to_string());
+        db.save_provider("codex", &official).unwrap();
+        let third_party = crate::provider::Provider::with_id(
+            "dynamic-ws-chat".to_string(),
+            "Dynamic WS Chat".to_string(),
+            json!({
+                "base_url":chat_url,
+                "api_format":"openai_chat",
+                "auth":{"OPENAI_API_KEY":"dynamic-ws-key"}
+            }),
+            None,
+        );
+        db.save_provider("codex", &third_party).unwrap();
+        model_routes::save(
+            &db,
+            &ModelRouteSettings {
+                official_models: vec![CatalogModelInput {
+                    model: "gpt-native".to_string(),
+                    display_name: Some("GPT Native".to_string()),
+                    ..Default::default()
+                }],
+                routes: vec![ModelRoute {
+                    alias: "ccs-dynamic-0-third-model".to_string(),
+                    provider_id: third_party.id.clone(),
+                    upstream_model: "third-model".to_string(),
+                    display_name: "[Dynamic] Third Model".to_string(),
+                    context_window: Some(64_000),
+                }],
+            },
+        )
+        .unwrap();
+        select_codex_provider(&db, crate::database::CODEX_OFFICIAL_PROVIDER_ID);
+        let server = ProxyServer::new(test_proxy_config(), db, None);
+        let info = server.start().await.unwrap();
+
+        let mut request = format!("ws://127.0.0.1:{}/v1/responses", info.port)
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer test-official-token"),
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"gpt-native",
+                    "generate":false
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"ccs-dynamic-0-third-model",
+                    "generate":true,
+                    "stream":true,
+                    "input":[{"type":"message","role":"user","content":"use third party"}]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let third_party_completed =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while let Some(message) = socket.next().await {
+                    let message = message.unwrap();
+                    if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                        let event: Value = serde_json::from_str(text.as_ref()).unwrap();
+                        if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                            return event;
+                        }
+                    }
+                }
+                panic!("socket closed before third-party response.completed");
+            })
+            .await
+            .expect("third-party websocket bridge timeout");
+        assert_eq!(third_party_completed["type"], "response.completed");
+
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type":"response.create",
+                    "model":"gpt-native",
+                    "generate":true,
+                    "stream":true,
+                    "input":[{"type":"message","role":"user","content":"back to official"}]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let official = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let official: Value = serde_json::from_str(official.as_ref()).unwrap();
+        assert_eq!(official["response"]["id"], "resp-route-official");
+
+        let captured = captured_chat.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["model"], "third-model");
+        assert!(captured[0].to_string().contains("use third party"));
+        drop(captured);
+
+        let _ = socket.close(None).await;
+        server.stop().await.unwrap();
+        official_task.await.unwrap();
+        let _ = chat_shutdown.send(());
+        chat_task.await.unwrap();
+        std::env::remove_var("CC_SWITCH_TEST_OFFICIAL_WS_URL");
+    }
+
+    #[derive(Default)]
+    struct QuotaMockState {
+        a_requests: usize,
+        b_requests: usize,
+    }
+
+    async fn quota_a(
+        State(state): State<Arc<Mutex<QuotaMockState>>>,
+        Json(_body): Json<Value>,
+    ) -> impl axum::response::IntoResponse {
+        state.lock().expect("quota state").a_requests += 1;
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": {"code": "insufficient_quota", "message": "usage limit reached"},
+                "retry_after": 600
+            })),
+        )
+    }
+
+    async fn quota_b(
+        State(state): State<Arc<Mutex<QuotaMockState>>>,
+        Json(_body): Json<Value>,
+    ) -> Json<Value> {
+        state.lock().expect("quota state").b_requests += 1;
+        Json(json!({
+            "id": "chatcmpl-fallback",
+            "object": "chat.completion",
+            "model": "fallback-chat",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "fallback succeeded"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        }))
+    }
+
+    async fn start_quota_upstream() -> (
+        String,
+        Arc<Mutex<QuotaMockState>>,
+        oneshot::Sender<()>,
+        JoinHandle<()>,
+    ) {
+        let state = Arc::new(Mutex::new(QuotaMockState::default()));
+        let app = Router::new()
+            .route("/a/v1/chat/completions", post(quota_a))
+            .route("/b/v1/chat/completions", post(quota_b))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind quota upstream");
+        let address = listener.local_addr().expect("quota address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("quota upstream server");
+        });
+        (format!("http://{address}"), state, shutdown_tx, task)
+    }
+
+    #[derive(Default)]
+    struct RealmMockState {
+        chat_requests: Vec<Value>,
+        native_requests: Vec<Value>,
+        failed_native_requests: usize,
+    }
+
+    async fn realm_chat(
+        State(state): State<Arc<Mutex<RealmMockState>>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        state.lock().expect("realm state").chat_requests.push(body);
+        Json(json!({
+            "id": "chatcmpl-realm",
+            "object": "chat.completion",
+            "model": "realm-chat",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "REALM_HANDOFF_SUMMARY"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+        }))
+    }
+
+    async fn realm_native_compact(
+        State(state): State<Arc<Mutex<RealmMockState>>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let mut state = state.lock().expect("realm state");
+        state.native_requests.push(body);
+        let id = format!("cmp_native_e2e_{}", state.native_requests.len());
+        Json(json!({
+            "output": [{
+                "id": id,
+                "type": "compaction",
+                "encrypted_content": "opaque-native-e2e"
+            }]
+        }))
+    }
+
+    async fn realm_native_compact_replacement_history(
+        State(state): State<Arc<Mutex<RealmMockState>>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        state
+            .lock()
+            .expect("realm state")
+            .native_requests
+            .push(body);
+        Json(json!({
+            "output": [{
+                "id": "msg-compacted-history",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type":"output_text","text":"replacement compact history","annotations":[]}]
+            }]
+        }))
+    }
+
+    async fn realm_native_response(
+        State(state): State<Arc<Mutex<RealmMockState>>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        state
+            .lock()
+            .expect("realm state")
+            .native_requests
+            .push(body);
+        Json(json!({
+            "id": "resp-native-e2e",
+            "object": "response",
+            "status": "completed",
+            "model": "native-model",
+            "output": [{
+                "id": "msg-native-e2e",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type":"output_text","text":"native continued","annotations":[]}]
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+        }))
+    }
+
+    async fn realm_native_compact_unavailable(
+        State(state): State<Arc<Mutex<RealmMockState>>>,
+        Json(body): Json<Value>,
+    ) -> (axum::http::StatusCode, Json<Value>) {
+        let mut state = state.lock().expect("realm state");
+        state.failed_native_requests += 1;
+        state.native_requests.push(body);
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": {
+                    "type": "insufficient_quota",
+                    "code": "usage_limit_reached",
+                    "message": "official compaction quota exhausted"
+                }
+            })),
+        )
+    }
+
+    async fn streaming_native_compact(Json(_body): Json<Value>) -> axum::response::Response {
+        let frames = vec![
+            (
+                std::time::Duration::ZERO,
+                "event: response.created\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-stream\",\"status\":\"in_progress\",\"output\":[]}}\r\n\r\n",
+            ),
+            (
+                std::time::Duration::from_millis(300),
+                "event: response.output_item.done\r\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"cmp_stream_e2e\",\"type\":\"compaction\",\"encrypted_content\":\"opaque-stream-e2e\"}}\r\n\r\n",
+            ),
+            (
+                std::time::Duration::ZERO,
+                "event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-stream\",\"status\":\"completed\",\"output\":[{\"id\":\"cmp_stream_e2e\",\"type\":\"compaction\",\"encrypted_content\":\"opaque-stream-e2e\"}]}}\r\n\r\n",
+            ),
+        ];
+        let stream = futures::stream::iter(frames).then(|(delay, frame)| async move {
+            tokio::time::sleep(delay).await;
+            Ok::<_, std::io::Error>(Bytes::from_static(frame.as_bytes()))
+        });
+        let mut response = axum::response::Response::new(axum::body::Body::from_stream(stream));
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        response
+    }
+
+    async fn start_realm_upstream() -> (
+        String,
+        Arc<Mutex<RealmMockState>>,
+        oneshot::Sender<()>,
+        JoinHandle<()>,
+    ) {
+        let state = Arc::new(Mutex::new(RealmMockState::default()));
+        let app = Router::new()
+            .route("/chat/v1/chat/completions", post(realm_chat))
+            .route("/native/v1/responses/compact", post(realm_native_compact))
+            .route("/native/v1/responses", post(realm_native_response))
+            .route(
+                "/replacement/v1/responses/compact",
+                post(realm_native_compact_replacement_history),
+            )
+            .route(
+                "/failing-native/v1/responses/compact",
+                post(realm_native_compact_unavailable),
+            )
+            .route(
+                "/stream/v1/responses/compact",
+                post(streaming_native_compact),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind realm upstream");
+        let address = listener.local_addr().expect("realm address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("realm upstream server");
+        });
+        (format!("http://{address}"), state, shutdown_tx, task)
+    }
+
+    fn select_codex_provider(db: &Database, id: &str) {
+        db.set_current_provider("codex", id)
+            .expect("set selected provider in db");
+        crate::settings::set_current_provider(&crate::app_config::AppType::Codex, Some(id))
+            .expect("set selected effective provider");
+    }
+
+    fn seed_chat_provider(db: &Database, base_url: &str) {
+        let mut provider = crate::provider::Provider::with_id(
+            "continuity-chat".to_string(),
+            "Continuity Chat".to_string(),
+            json!({
+                "base_url": base_url,
+                "api_format": "openai_chat",
+                "auth": {"OPENAI_API_KEY": "e2e-provider-key"}
+            }),
+            None,
+        );
+        provider.sort_index = Some(1);
+        db.save_provider("codex", &provider)
+            .expect("save e2e provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("set db provider");
+        crate::settings::set_current_provider(
+            &crate::app_config::AppType::Codex,
+            Some(&provider.id),
+        )
+        .expect("set effective provider");
+    }
+
+    fn test_proxy_config() -> ProxyConfig {
+        ProxyConfig {
+            listen_address: "127.0.0.1".to_string(),
+            listen_port: 0,
+            ..ProxyConfig::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn local_compact_survives_proxy_and_database_restart_end_to_end() {
+        let environment = TestEnvironment::new();
+        let (upstream_url, captured, shutdown_tx, upstream_task) = start_mock_chat_upstream().await;
+        let db = Arc::new(Database::init().expect("disk database"));
+        seed_chat_provider(&db, &upstream_url);
+        let server = ProxyServer::new(test_proxy_config(), db, None);
+        let info = server.start().await.expect("start proxy");
+        let client = reqwest::Client::new();
+        let secret = "EARLIEST_E2E_CONTEXT_SHOULD_BE_ENCRYPTED";
+
+        let compact_response = client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/responses/compact",
+                info.port
+            ))
+            .header("thread-id", "thread-e2e")
+            .header("session-id", "session-e2e")
+            .header("x-client-request-id", "compact-request-e2e")
+            .json(&json!({
+                "model": "mock-chat",
+                "stream": false,
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type":"input_text","text":secret}]
+                }]
+            }))
+            .send()
+            .await
+            .expect("compact request");
+        assert_eq!(compact_response.status(), reqwest::StatusCode::OK);
+        let compact_json: Value = compact_response.json().await.expect("compact json");
+        let item = compact_json["output"][0].clone();
+        assert_eq!(item["type"], "compaction");
+        assert!(item["encrypted_content"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("bcmp1.")));
+
+        server.stop().await.expect("stop first proxy");
+        drop(server);
+
+        // Reopen the on-disk DB and reconstruct every proxy service. The envelope
+        // must still resolve without any in-memory history from the first process.
+        let reopened = Arc::new(Database::init().expect("reopen database"));
+        let restarted = ProxyServer::new(test_proxy_config(), reopened, None);
+        let restarted_info = restarted.start().await.expect("restart proxy");
+        let resume_response = client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/responses",
+                restarted_info.port
+            ))
+            .header("thread-id", "thread-e2e")
+            .header("session-id", "session-e2e")
+            .header("x-client-request-id", "resume-request-e2e")
+            .json(&json!({
+                "model": "mock-chat",
+                "stream": false,
+                "input": [
+                    item,
+                    {"type":"message","role":"user","content":[{"type":"input_text","text":"E2E_SUFFIX_ONCE"}]}
+                ]
+            }))
+            .send()
+            .await
+            .expect("resume request");
+        assert_eq!(resume_response.status(), reqwest::StatusCode::OK);
+        let resumed: Value = resume_response.json().await.expect("resume json");
+        assert_eq!(resumed["status"], "completed");
+
+        restarted.stop().await.expect("stop restarted proxy");
+        let requests = captured.lock().expect("captured requests");
+        assert!(requests.len() >= 2, "compact + resume must reach upstream");
+        let compact_wire = requests[0].to_string();
+        assert!(compact_wire.contains(secret));
+        assert!(compact_wire.contains("CONTEXT CHECKPOINT COMPACTION"));
+        let resume_wire = requests.last().unwrap().to_string();
+        assert!(resume_wire.contains("HANDOFF_E2E_SUMMARY"));
+        assert_eq!(resume_wire.matches("E2E_SUFFIX_ONCE").count(), 1);
+        assert!(!resume_wire.contains("\"type\":\"compaction\""));
+        drop(requests);
+
+        let database_bytes = std::fs::read(environment.db_path()).expect("read sqlite database");
+        assert!(!database_bytes
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+
+        let _ = shutdown_tx.send(());
+        upstream_task.await.expect("join mock upstream");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn quota_429_falls_back_then_future_request_skips_latched_provider_end_to_end() {
+        let _environment = TestEnvironment::new();
+        let (upstream_origin, counts, shutdown_tx, upstream_task) = start_quota_upstream().await;
+        let db = Arc::new(Database::init().expect("quota e2e database"));
+        for (id, suffix, order) in [("quota-a", "a", 1), ("quota-b", "b", 2)] {
+            let mut provider = crate::provider::Provider::with_id(
+                id.to_string(),
+                id.to_string(),
+                json!({
+                    "base_url": format!("{upstream_origin}/{suffix}/v1"),
+                    "api_format": "openai_chat",
+                    "auth": {"OPENAI_API_KEY": "quota-e2e-key"}
+                }),
+                None,
+            );
+            provider.sort_index = Some(order);
+            db.save_provider("codex", &provider)
+                .expect("save quota provider");
+            db.add_to_failover_queue("codex", id)
+                .expect("queue quota provider");
+        }
+        db.set_current_provider("codex", "quota-a")
+            .expect("set quota current");
+        crate::settings::set_current_provider(&crate::app_config::AppType::Codex, Some("quota-a"))
+            .expect("set effective quota provider");
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+        let server = ProxyServer::new(test_proxy_config(), db.clone(), None);
+        let info = server.start().await.expect("start quota proxy");
+        let client = reqwest::Client::new();
+        for request_id in ["quota-request-1", "quota-request-2"] {
+            let response = client
+                .post(format!("http://127.0.0.1:{}/v1/responses", info.port))
+                .header("session-id", "quota-session")
+                .header("x-client-request-id", request_id)
+                .json(&json!({
+                    "model": "mock-chat",
+                    "stream": false,
+                    "input": [{"type":"message","role":"user","content":"review this"}]
+                }))
+                .send()
+                .await
+                .expect("quota proxy request");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let body: Value = response.json().await.expect("quota response json");
+            assert_eq!(body["status"], "completed");
+        }
+        server.stop().await.expect("stop quota proxy");
+
+        let state = counts.lock().expect("quota counts");
+        assert_eq!(
+            state.a_requests, 1,
+            "latched A must be skipped on request 2"
+        );
+        assert_eq!(state.b_requests, 2, "B serves fallback and next request");
+        drop(state);
+        let health = db.get_provider_health("quota-a", "codex").await.unwrap();
+        assert!(
+            health.is_healthy,
+            "quota exhaustion must not poison circuit health"
+        );
+
+        let _ = shutdown_tx.send(());
+        upstream_task.await.expect("join quota upstream");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn native_and_chat_compactions_migrate_both_directions_end_to_end() {
+        let _environment = TestEnvironment::new();
+        let (origin, captured, shutdown_tx, upstream_task) = start_realm_upstream().await;
+        let db = Arc::new(Database::init().expect("realm e2e database"));
+        for (id, suffix, api_format) in [
+            ("realm-native", "native", "openai_responses"),
+            ("realm-chat", "chat", "openai_chat"),
+        ] {
+            let provider = crate::provider::Provider::with_id(
+                id.to_string(),
+                id.to_string(),
+                json!({
+                    "base_url": format!("{origin}/{suffix}/v1"),
+                    "api_format": api_format,
+                    "auth": {"OPENAI_API_KEY": "realm-e2e-key"}
+                }),
+                None,
+            );
+            db.save_provider("codex", &provider).unwrap();
+        }
+        select_codex_provider(&db, "realm-native");
+        let server = ProxyServer::new(test_proxy_config(), db.clone(), None);
+        let info = server.start().await.expect("start realm proxy");
+        let client = reqwest::Client::new();
+
+        // Native opaque token -> Chat: the proxy indexes the native token against
+        // its encrypted canonical snapshot, then expands that snapshot before the
+        // Chat transform. No opaque token reaches the incompatible gateway.
+        let native_compact = client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/responses/compact",
+                info.port
+            ))
+            .header("thread-id", "realm-thread-native")
+            .header("session-id", "realm-session-native")
+            .json(&json!({
+                "model":"native-model",
+                "input":[{"type":"message","role":"user","content":"NATIVE_EARLY_CONTEXT"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(native_compact.status(), reqwest::StatusCode::OK);
+        let native_item = native_compact.json::<Value>().await.unwrap()["output"][0].clone();
+        select_codex_provider(&db, "realm-chat");
+        let chat_resume = client
+            .post(format!("http://127.0.0.1:{}/v1/responses", info.port))
+            .header("thread-id", "realm-thread-native")
+            .header("session-id", "realm-session-native")
+            .json(&json!({
+                "model":"chat-model",
+                "input":[native_item,{"type":"message","role":"user","content":"NATIVE_TO_CHAT_SUFFIX"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chat_resume.status(), reqwest::StatusCode::OK);
+
+        // Bridge token -> native Responses: recompact the bridge snapshot through
+        // the official compact endpoint, then resume with the returned native
+        // token and preserve the continuation suffix exactly once.
+        let bridge_compact = client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/responses/compact",
+                info.port
+            ))
+            .header("thread-id", "realm-thread-bridge")
+            .header("session-id", "realm-session-bridge")
+            .json(&json!({
+                "model":"chat-model",
+                "input":[{"type":"message","role":"user","content":"BRIDGE_EARLY_CONTEXT"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bridge_compact.status(), reqwest::StatusCode::OK);
+        let bridge_item = bridge_compact.json::<Value>().await.unwrap()["output"][0].clone();
+        select_codex_provider(&db, "realm-native");
+        let native_resume = client
+            .post(format!("http://127.0.0.1:{}/v1/responses", info.port))
+            .header("thread-id", "realm-thread-bridge")
+            .header("session-id", "realm-session-bridge")
+            .json(&json!({
+                "model":"native-model",
+                "input":[bridge_item,{"type":"message","role":"user","content":"BRIDGE_TO_NATIVE_SUFFIX"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(native_resume.status(), reqwest::StatusCode::OK);
+        server.stop().await.unwrap();
+
+        let state = captured.lock().expect("realm captured");
+        let chat_wire = state
+            .chat_requests
+            .iter()
+            .map(Value::to_string)
+            .find(|body| body.contains("NATIVE_TO_CHAT_SUFFIX"))
+            .expect("native->chat request");
+        assert!(chat_wire.contains("NATIVE_EARLY_CONTEXT"));
+        assert_eq!(chat_wire.matches("NATIVE_TO_CHAT_SUFFIX").count(), 1);
+        assert!(!chat_wire.contains("opaque-native-e2e"));
+
+        let native_wire = state
+            .native_requests
+            .iter()
+            .map(Value::to_string)
+            .find(|body| body.contains("BRIDGE_TO_NATIVE_SUFFIX"))
+            .expect("bridge->native request");
+        let official_recompact_wire = state
+            .native_requests
+            .iter()
+            .map(Value::to_string)
+            .find(|body| body.contains("BRIDGE_EARLY_CONTEXT"))
+            .expect("bridge snapshot sent to official compact endpoint");
+        assert!(!official_recompact_wire.contains("bcmp1."));
+        assert!(native_wire.contains("opaque-native-e2e"));
+        assert_eq!(native_wire.matches("BRIDGE_TO_NATIVE_SUFFIX").count(), 1);
+        assert!(!native_wire.contains("bcmp1."));
+        drop(state);
+
+        let _ = shutdown_tx.send(());
+        upstream_task.await.expect("join realm upstream");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn official_compact_failure_uses_hierarchical_bridge_executor_end_to_end() {
+        let _environment = TestEnvironment::new();
+        let (origin, captured, shutdown_tx, upstream_task) = start_realm_upstream().await;
+        let db = Arc::new(Database::init().expect("hierarchical failover database"));
+        for (id, suffix, api_format, order) in [
+            (
+                "hierarchical-native",
+                "failing-native",
+                "openai_responses",
+                1,
+            ),
+            ("hierarchical-chat", "chat", "openai_chat", 2),
+        ] {
+            let mut provider = crate::provider::Provider::with_id(
+                id.to_string(),
+                id.to_string(),
+                json!({
+                    "base_url": format!("{origin}/{suffix}/v1"),
+                    "api_format": api_format,
+                    "auth": {"OPENAI_API_KEY": "hierarchical-e2e-key"}
+                }),
+                None,
+            );
+            provider.sort_index = Some(order);
+            db.save_provider("codex", &provider).unwrap();
+            db.add_to_failover_queue("codex", id).unwrap();
+        }
+        select_codex_provider(&db, "hierarchical-native");
+        let mut app_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        app_config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(app_config).await.unwrap();
+        crate::proxy::compaction::CompactionService::new(db.clone())
+            .update_settings(&crate::proxy::compaction::CompactionSettings {
+                summary_provider_id: Some("hierarchical-chat".to_string()),
+                summary_model: Some("summary-ui-model".to_string()),
+                summary_input_budget: 64_000,
+                summary_max_output_tokens: 4_000,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let server = ProxyServer::new(test_proxy_config(), db, None);
+        let info = server.start().await.expect("start hierarchical proxy");
+        let client = reqwest::Client::new();
+        let input = (0..6)
+            .map(|index| {
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": format!("HIERARCHICAL_SEGMENT_{index}_{}", "x".repeat(220_000))
+                    }]
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/responses/compact",
+                info.port
+            ))
+            .header("thread-id", "hierarchical-failover-thread")
+            .header("session-id", "hierarchical-failover-session")
+            .json(&json!({
+                "model": "large-context-model",
+                "stream": false,
+                "input": input
+            }))
+            .send()
+            .await
+            .expect("hierarchical compact request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let response_body: Value = response.json().await.expect("hierarchical compact json");
+        assert!(response_body["output"][0]["encrypted_content"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("bcmp1.")));
+        server.stop().await.expect("stop hierarchical proxy");
+
+        let state = captured.lock().expect("hierarchical captured state");
+        assert_eq!(state.failed_native_requests, 1);
+        assert!(
+            state.chat_requests.len() >= 2,
+            "large context must make chunk calls followed by a final handoff call"
+        );
+        assert!(state.chat_requests.iter().all(|request| {
+            request.get("model").and_then(Value::as_str) == Some("summary-ui-model")
+        }));
+        let final_request = state.chat_requests.last().unwrap().to_string();
+        assert!(final_request.contains("Earlier chronological checkpoint"));
+        assert!(!final_request.contains("Older chronological segment"));
+        drop(state);
+
+        let _ = shutdown_tx.send(());
+        upstream_task.await.expect("join hierarchical upstream");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn native_compaction_accepts_replacement_history_without_opaque_item() {
+        let _environment = TestEnvironment::new();
+        let (origin, _captured, shutdown_tx, upstream_task) = start_realm_upstream().await;
+        let db = Arc::new(Database::init().expect("replacement compact database"));
+        let provider = crate::provider::Provider::with_id(
+            "replacement-native".to_string(),
+            "Replacement Native".to_string(),
+            json!({
+                "base_url": format!("{origin}/replacement/v1"),
+                "api_format": "openai_responses",
+                "auth": {"OPENAI_API_KEY": "replacement-key"}
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+        select_codex_provider(&db, "replacement-native");
+        let server = ProxyServer::new(test_proxy_config(), db, None);
+        let info = server.start().await.unwrap();
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{}/v1/responses/compact",
+                info.port
+            ))
+            .header("thread-id", "replacement-thread")
+            .header("session-id", "replacement-session")
+            .json(&json!({
+                "model":"native-model",
+                "stream":false,
+                "input":[{"type":"message","role":"user","content":"compact me"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["output"][0]["type"], "message");
+        assert_eq!(
+            body["output"][0]["content"][0]["text"],
+            "replacement compact history"
+        );
+
+        server.stop().await.unwrap();
+        let _ = shutdown_tx.send(());
+        upstream_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn native_compaction_sse_streams_before_completion_and_is_immediately_resumable() {
+        let _environment = TestEnvironment::new();
+        let (origin, captured, shutdown_tx, upstream_task) = start_realm_upstream().await;
+        let db = Arc::new(Database::init().expect("stream e2e database"));
+        let native = crate::provider::Provider::with_id(
+            "stream-native".to_string(),
+            "Stream Native".to_string(),
+            json!({
+                "base_url": format!("{origin}/stream/v1"),
+                "api_format": "openai_responses",
+                "auth": {"OPENAI_API_KEY": "stream-e2e-key"}
+            }),
+            None,
+        );
+        db.save_provider("codex", &native).unwrap();
+        let chat = crate::provider::Provider::with_id(
+            "stream-chat".to_string(),
+            "Stream Chat".to_string(),
+            json!({
+                "base_url": format!("{origin}/chat/v1"),
+                "api_format": "openai_chat",
+                "auth": {"OPENAI_API_KEY": "stream-e2e-key"}
+            }),
+            None,
+        );
+        db.save_provider("codex", &chat).unwrap();
+        select_codex_provider(&db, "stream-native");
+        let server = ProxyServer::new(test_proxy_config(), db.clone(), None);
+        let info = server.start().await.unwrap();
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/responses/compact",
+                info.port
+            ))
+            .header("thread-id", "stream-thread")
+            .header("session-id", "stream-session")
+            .json(&json!({
+                "model":"native-model",
+                "stream":true,
+                "input":[{"type":"message","role":"user","content":"STREAM_EARLY_CONTEXT"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let mut bytes = response.bytes_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_millis(150), bytes.next())
+            .await
+            .expect("first native SSE event must not wait for compact completion")
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("response.created"));
+        let mut wire = first.to_vec();
+        while let Some(chunk) = bytes.next().await {
+            wire.extend_from_slice(&chunk.unwrap());
+        }
+        let wire = String::from_utf8(wire).unwrap();
+        assert!(wire.contains("cmp_stream_e2e"));
+        assert!(
+            wire.contains("\r\n\r\n"),
+            "SSE framing must remain byte-compatible"
+        );
+
+        select_codex_provider(&db, "stream-chat");
+        let resume = client
+            .post(format!("http://127.0.0.1:{}/v1/responses", info.port))
+            .header("thread-id", "stream-thread")
+            .header("session-id", "stream-session")
+            .json(&json!({
+                "model":"chat-model",
+                "stream":false,
+                "input":[
+                    {"id":"cmp_stream_e2e","type":"compaction","encrypted_content":"opaque-stream-e2e"},
+                    {"type":"message","role":"user","content":"STREAM_SUFFIX"}
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resume.status(), reqwest::StatusCode::OK);
+        server.stop().await.unwrap();
+        let state = captured.lock().unwrap();
+        let chat_wire = state.chat_requests.last().unwrap().to_string();
+        assert!(chat_wire.contains("STREAM_EARLY_CONTEXT"));
+        assert_eq!(chat_wire.matches("STREAM_SUFFIX").count(), 1);
+        assert!(!chat_wire.contains("opaque-stream-e2e"));
+        drop(state);
+        let _ = shutdown_tx.send(());
+        upstream_task.await.unwrap();
+    }
+
+    /// Opt-in live evaluation host for replaying public Codex benchmarks through
+    /// the exact in-tree proxy implementation. It is ignored by normal CI and
+    /// requires an isolated `CC_SWITCH_TEST_HOME` containing the providers to
+    /// exercise. The surrounding benchmark process owns the lifetime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    #[ignore = "manual public-dataset Harness evaluation"]
+    async fn live_public_dataset_harness_proxy() {
+        assert_eq!(
+            std::env::var("CC_SWITCH_LIVE_HARNESS_PROXY").as_deref(),
+            Ok("1"),
+            "set CC_SWITCH_LIVE_HARNESS_PROXY=1 and use an isolated CC_SWITCH_TEST_HOME"
+        );
+        let port = std::env::var("CC_SWITCH_LIVE_HARNESS_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(15721);
+        let hold_seconds = std::env::var("CC_SWITCH_LIVE_HARNESS_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1_800);
+
+        let db = Arc::new(Database::init().expect("open isolated Harness database"));
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_port: port,
+                ..ProxyConfig::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.expect("start live Harness proxy");
+        eprintln!("CC_SWITCH_LIVE_HARNESS_READY={}", info.port);
+        tokio::time::sleep(std::time::Duration::from_secs(hold_seconds)).await;
+        server.stop().await.expect("stop live Harness proxy");
     }
 }

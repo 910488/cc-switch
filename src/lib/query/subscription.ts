@@ -1,5 +1,10 @@
 import { useRef } from "react";
-import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type UseQueryResult,
+} from "@tanstack/react-query";
 import { subscriptionApi } from "@/lib/api/subscription";
 import type { AppId } from "@/lib/api/types";
 import type { ProviderMeta } from "@/types";
@@ -81,23 +86,25 @@ export function useSubscriptionQuota(
   enabled: boolean,
   autoQuery = false,
   autoQueryIntervalMinutes = 5,
+  explicitIntervalMs?: number,
 ) {
   const refetchInterval =
-    autoQuery && autoQueryIntervalMinutes > 0
-      ? Math.max(autoQueryIntervalMinutes, 1) * 60 * 1000
-      : false;
+    autoQuery && explicitIntervalMs !== undefined
+      ? explicitIntervalMs > 0
+        ? Math.max(explicitIntervalMs, 1_000)
+        : false
+      : autoQuery && autoQueryIntervalMinutes > 0
+        ? Math.max(autoQueryIntervalMinutes, 1) * 60 * 1000
+        : false;
 
   const query = useQuery({
     queryKey: subscriptionKeys.quota(appId),
-    queryFn: () => subscriptionApi.getQuota(appId),
+    queryFn: () => subscriptionApi.getQuota(appId, true),
     enabled: enabled && ["claude", "codex", "gemini"].includes(appId),
     refetchInterval,
     refetchIntervalInBackground: Boolean(refetchInterval),
     refetchOnWindowFocus: Boolean(refetchInterval),
-    staleTime:
-      autoQueryIntervalMinutes > 0
-        ? Math.max(autoQueryIntervalMinutes, 1) * 60 * 1000
-        : REFETCH_INTERVAL,
+    staleTime: refetchInterval || REFETCH_INTERVAL,
     retry: 1,
   });
 
@@ -108,6 +115,18 @@ export interface UseCodexOauthQuotaOptions {
   enabled?: boolean;
   /** 是否启用自动轮询（5 分钟）与窗口 focus 重取 */
   autoQuery?: boolean;
+  /** Explicit polling interval. Supports short diagnostic intervals such as 5 seconds. */
+  autoQueryIntervalMs?: number;
+}
+
+export function resolveQuotaRefreshIntervalMs(
+  autoQuery: boolean,
+  explicitIntervalMs?: number,
+): number | false {
+  if (!autoQuery) return false;
+  if (explicitIntervalMs === undefined) return REFETCH_INTERVAL;
+  if (explicitIntervalMs <= 0) return false;
+  return Math.max(1_000, explicitIntervalMs);
 }
 
 /**
@@ -123,18 +142,80 @@ export function useCodexOauthQuota(
   meta: ProviderMeta | undefined,
   options: UseCodexOauthQuotaOptions = {},
 ) {
-  const { enabled = true, autoQuery = false } = options;
+  const { enabled = true, autoQuery = false, autoQueryIntervalMs } = options;
   const accountId = resolveManagedAccountId(meta, PROVIDER_TYPES.CODEX_OAUTH);
+  const queryClient = useQueryClient();
+  const queryKey = ["codex_oauth", "quota", accountId ?? "default"] as const;
+  const refetchInterval = resolveQuotaRefreshIntervalMs(
+    autoQuery,
+    autoQueryIntervalMs,
+  );
   const query = useQuery({
-    queryKey: ["codex_oauth", "quota", accountId ?? "default"],
-    queryFn: () => subscriptionApi.getCodexOauthQuota(accountId),
+    queryKey,
+    // A picker change or scheduled refresh must represent the selected
+    // account's current upstream state, not a previously cached snapshot.
+    queryFn: () => subscriptionApi.getCodexOauthQuota(accountId, true),
     enabled,
+    refetchInterval,
+    refetchIntervalInBackground: Boolean(refetchInterval),
+    refetchOnWindowFocus: Boolean(refetchInterval),
+    staleTime: refetchInterval || REFETCH_INTERVAL,
+    retry: 1,
+  });
+
+  const manualRefresh = useMutation({
+    mutationFn: () => subscriptionApi.getCodexOauthQuota(accountId, true),
+    onSuccess: (quota) => queryClient.setQueryData(queryKey, quota),
+  });
+
+  return {
+    ...useQuotaKeepLastGood(query, accountId ?? "default"),
+    refreshNow: manualRefresh.mutateAsync,
+    isRefreshing: query.isFetching || manualRefresh.isPending,
+  };
+}
+
+export function useCodexOauthQuotaByAccount(
+  accountId: string,
+  options: UseCodexOauthQuotaOptions = {},
+) {
+  const { enabled = true, autoQuery = false } = options;
+  const query = useQuery({
+    queryKey: ["codex_oauth", "quota", accountId],
+    queryFn: () => subscriptionApi.getCodexOauthQuota(accountId),
+    enabled: enabled && Boolean(accountId),
     refetchInterval: autoQuery ? REFETCH_INTERVAL : false,
     refetchIntervalInBackground: autoQuery,
     refetchOnWindowFocus: autoQuery,
     staleTime: REFETCH_INTERVAL,
     retry: 1,
   });
+  return useQuotaKeepLastGood(query, accountId);
+}
 
-  return useQuotaKeepLastGood(query, accountId ?? "default");
+export function useCodexOauthResetCredits(accountId: string, enabled = true) {
+  return useQuery({
+    queryKey: ["codex_oauth", "reset-credits", accountId],
+    queryFn: () => subscriptionApi.getCodexOauthResetCredits(accountId),
+    enabled: enabled && Boolean(accountId),
+    staleTime: 30_000,
+    refetchOnWindowFocus: true,
+    retry: 1,
+  });
+}
+
+export function useConsumeCodexOauthReset() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { accountId: string; creditId: string }) =>
+      subscriptionApi.consumeCodexOauthReset(input.accountId, input.creditId),
+    onSuccess: (_result, input) => {
+      queryClient.invalidateQueries({
+        queryKey: ["codex_oauth", "quota", input.accountId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["codex_oauth", "reset-credits", input.accountId],
+      });
+    },
+  });
 }

@@ -61,6 +61,22 @@ fn optional_non_empty_string(table: &toml::value::Table, key: &str) -> Option<St
 
 /// Validate the provider-owned Grok Build TOML document.
 pub fn validate_config_toml(config_toml: &str) -> Result<(), AppError> {
+    validate_config_toml_with_auth_mode(config_toml, false)
+}
+
+/// Validate a Grok Build TOML document used by the CLI proxy.
+///
+/// Account-login mode obtains its short-lived access token from
+/// `~/.grok/auth.json`, so the provider snapshot does not need to persist an
+/// `api_key` or `env_key`.
+pub fn validate_cli_proxy_config_toml(config_toml: &str) -> Result<(), AppError> {
+    validate_config_toml_with_auth_mode(config_toml, true)
+}
+
+fn validate_config_toml_with_auth_mode(
+    config_toml: &str,
+    allow_session_credentials: bool,
+) -> Result<(), AppError> {
     let document = config_toml.parse::<toml::Value>().map_err(|error| {
         AppError::localized(
             "provider.grokbuild.config.invalid_toml",
@@ -111,7 +127,8 @@ pub fn validate_config_toml(config_toml: &str) -> Result<(), AppError> {
     required_non_empty_string(selected_model, "model")?;
     required_non_empty_string(selected_model, "base_url")?;
     required_non_empty_string(selected_model, "name")?;
-    if optional_non_empty_string(selected_model, "api_key").is_none()
+    if !allow_session_credentials
+        && optional_non_empty_string(selected_model, "api_key").is_none()
         && optional_non_empty_string(selected_model, "env_key").is_none()
     {
         return Err(AppError::localized(
@@ -410,6 +427,13 @@ context_window = 500000
         let error = validate_config_toml(&config).expect_err("credentials should be required");
         assert!(error.to_string().contains("api_key"));
         assert!(error.to_string().contains("env_key"));
+    }
+
+    #[test]
+    fn cli_proxy_accepts_account_session_without_persisted_api_key() {
+        let config = valid_config().replace("api_key = \"secret\"\n", "");
+        validate_cli_proxy_config_toml(&config)
+            .expect("CLI proxy should obtain credentials from the local Grok session");
     }
 
     #[test]

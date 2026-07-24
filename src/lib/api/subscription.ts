@@ -1,11 +1,25 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { SubscriptionQuota } from "@/types/subscription";
+import type {
+  CodexResetCredits,
+  CodexResetResult,
+  SubscriptionQuota,
+} from "@/types/subscription";
 
 export const subscriptionApi = {
-  getQuota: (tool: string): Promise<SubscriptionQuota> =>
-    invoke("get_subscription_quota", { tool }),
-  getCodexOauthQuota: (accountId: string | null): Promise<SubscriptionQuota> =>
-    invoke("get_codex_oauth_quota", { accountId }),
+  getQuota: (tool: string, forceRefresh = false): Promise<SubscriptionQuota> =>
+    invoke("get_subscription_quota", { tool, forceRefresh }),
+  getCodexOauthQuota: (
+    accountId: string | null,
+    forceRefresh = false,
+  ): Promise<SubscriptionQuota> =>
+    invoke("get_codex_oauth_quota", { accountId, forceRefresh }),
+  getCodexOauthResetCredits: (accountId: string): Promise<CodexResetCredits> =>
+    invoke("get_codex_oauth_reset_credits", { accountId }),
+  consumeCodexOauthReset: (
+    accountId: string,
+    creditId: string,
+  ): Promise<CodexResetResult> =>
+    invoke("consume_codex_oauth_reset", { accountId, creditId }),
   getCodingPlanQuota: (
     baseUrl: string,
     apiKey: string,
