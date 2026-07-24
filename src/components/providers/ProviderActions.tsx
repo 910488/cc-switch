@@ -39,6 +39,8 @@ interface ProviderActionsProps {
   isInFailoverQueue?: boolean;
   onToggleFailover?: (enabled: boolean) => void;
   isOfficialBlockedByProxy?: boolean;
+  isOfficial?: boolean;
+  codexConfiguredModelCount?: number;
   // Hermes v12+ providers: dict overlay — edit/delete must go through Web UI
   isReadOnly?: boolean;
   // OpenClaw: default model
@@ -79,6 +81,8 @@ export function ProviderActions({
   isInFailoverQueue = false,
   onToggleFailover,
   isOfficialBlockedByProxy = false,
+  isOfficial = false,
+  codexConfiguredModelCount = 0,
   isReadOnly = false,
   // OpenClaw: default model
   isDefaultModel = false,
@@ -96,9 +100,16 @@ export function ProviderActions({
   // 故障转移模式下的按钮逻辑（累加模式和 OMO 应用不支持故障转移）
   const isFailoverMode =
     !isAdditiveMode && !isOmo && isAutoFailoverEnabled && onToggleFailover;
+  const isCodexCoexistenceMode =
+    appId === "codex" && isProxyTakeover && !isFailoverMode;
+  const isCodexModelConfiguration =
+    isCodexCoexistenceMode && !isOfficial && Boolean(onConfigureModels);
+  const hideMainButton = isCodexCoexistenceMode && isOfficial;
 
   const handleMainButtonClick = () => {
-    if (isOmo) {
+    if (isCodexModelConfiguration) {
+      onConfigureModels?.();
+    } else if (isOmo) {
       if (isCurrent) {
         onDisableOmo?.();
       } else {
@@ -123,6 +134,22 @@ export function ProviderActions({
   };
 
   const getMainButtonState = (): MainButtonState => {
+    if (isCodexModelConfiguration) {
+      const configured = codexConfiguredModelCount > 0;
+      return {
+        disabled: false,
+        variant: configured ? "secondary" : "default",
+        className: configured
+          ? "bg-emerald-100 text-emerald-700 hover:bg-emerald-200 dark:bg-emerald-900/50 dark:text-emerald-300 dark:hover:bg-emerald-900/70"
+          : "bg-sky-500 hover:bg-sky-600 dark:bg-sky-600 dark:hover:bg-sky-700",
+        icon: <ListPlus className="h-4 w-4" />,
+        text: configured
+          ? t("codex.modelsConfigured", { count: codexConfiguredModelCount })
+          : t("codex.configureModels"),
+        title: t("codex.configureModelsHint"),
+      };
+    }
+
     if (isOmo) {
       if (isCurrent) {
         return {
@@ -264,24 +291,31 @@ export function ProviderActions({
 
       {/* wrapper span 承接 hover：disabled 按钮自身 pointer-events:none，
           原生 title 与 cursor 都必须挂在未禁用的外层元素上才会生效 */}
-      <span
-        title={buttonState.title}
-        className={cn(
-          "inline-flex",
-          buttonState.disabled && "cursor-not-allowed",
-        )}
-      >
-        <Button
-          size="sm"
-          variant={buttonState.variant}
-          onClick={handleMainButtonClick}
-          disabled={buttonState.disabled}
-          className={cn("w-[4.5rem] px-2.5", buttonState.className)}
+      {!hideMainButton && (
+        <span
+          title={buttonState.title}
+          className={cn(
+            "inline-flex",
+            buttonState.disabled && "cursor-not-allowed",
+          )}
         >
-          {buttonState.icon}
-          {buttonState.text}
-        </Button>
-      </span>
+          <Button
+            size="sm"
+            variant={buttonState.variant}
+            onClick={handleMainButtonClick}
+            disabled={buttonState.disabled}
+            className={cn(
+              isCodexModelConfiguration
+                ? "w-auto min-w-[7rem] px-2.5"
+                : "w-[4.5rem] px-2.5",
+              buttonState.className,
+            )}
+          >
+            {buttonState.icon}
+            {buttonState.text}
+          </Button>
+        </span>
+      )}
 
       <div className="flex items-center gap-1">
         <Button
@@ -340,7 +374,7 @@ export function ProviderActions({
           <BarChart3 className="h-4 w-4" />
         </Button>
 
-        {onConfigureModels && (
+        {onConfigureModels && !isCodexModelConfiguration && (
           <Button
             size="icon"
             variant="ghost"

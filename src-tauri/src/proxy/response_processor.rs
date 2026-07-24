@@ -8,6 +8,7 @@ use super::{
     handler_config::{StreamUsageEventFilter, UsageParserConfig},
     handler_context::{RequestContext, StreamingTimeoutConfig},
     hyper_client::ProxyResponse,
+    reasoning_visibility::{hide_reasoning_summaries, hide_reasoning_summaries_stream},
     server::ProxyState,
     sse::{strip_sse_field, take_sse_block},
     usage::parser::TokenUsage,
@@ -176,8 +177,15 @@ pub async fn handle_streaming(
         builder = builder.header(key, value);
     }
 
-    // 创建字节流
+    // Hide raw chain-of-thought only for third-party Codex providers. Official
+    // OpenAI traffic remains byte-for-byte untouched.
     let stream = response.bytes_stream();
+    let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+        if ctx.app_type_str == "codex" && ctx.provider.category.as_deref() != Some("official") {
+            Box::pin(hide_reasoning_summaries_stream(stream))
+        } else {
+            Box::pin(stream)
+        };
 
     // 创建使用量收集器；关闭 usage logging 时不要在流式热路径上解析每个 SSE event。
     let usage_collector = create_usage_collector(ctx, state, status.as_u16(), parser_config);
@@ -301,6 +309,24 @@ pub async fn handle_non_streaming(
     } else {
         log::debug!("[{}] usage logging 已关闭，跳过非流式 usage 解析", ctx.tag);
     }
+
+    let body_bytes =
+        if ctx.app_type_str == "codex" && ctx.provider.category.as_deref() != Some("official") {
+            match serde_json::from_slice::<Value>(&body_bytes) {
+                Ok(mut value) => {
+                    hide_reasoning_summaries(&mut value);
+                    strip_entity_headers_for_rebuilt_body(&mut response_headers);
+                    Bytes::from(serde_json::to_vec(&value).map_err(|error| {
+                        ProxyError::TransformError(format!(
+                            "Failed to serialize reasoning-safe response: {error}"
+                        ))
+                    })?)
+                }
+                Err(_) => body_bytes,
+            }
+        } else {
+            body_bytes
+        };
 
     // 构建响应
     let mut builder = axum::response::Response::builder().status(status);

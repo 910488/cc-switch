@@ -115,49 +115,10 @@ fn provider_catalog_models(provider: &Provider) -> Vec<CatalogModelInput> {
         .collect()
 }
 
-fn ensure_configured_with_official_models(
+pub fn rebuild_with_official_models(
     db: &Database,
     official_models: Vec<CatalogModelInput>,
 ) -> Result<ModelRouteSettings, AppError> {
-    let existing = load(db)?;
-    if !existing.routes.is_empty() {
-        return Ok(existing);
-    }
-
-    let providers = db.get_all_providers("codex")?;
-    let remembered = db
-        .get_setting(PROVIDER_KEY)?
-        .filter(|provider_id| !provider_id.trim().is_empty());
-    let candidates = providers
-        .values()
-        .filter(|provider| {
-            provider.category.as_deref() != Some("official")
-                && !provider_catalog_models(provider).is_empty()
-        })
-        .collect::<Vec<_>>();
-    let provider = remembered
-        .as_deref()
-        .and_then(|provider_id| {
-            candidates
-                .iter()
-                .copied()
-                .find(|provider| provider.id == provider_id)
-        })
-        .or_else(|| (candidates.len() == 1).then(|| candidates[0]));
-    let Some(provider) = provider else {
-        // Even without a selected third-party catalog, persist the native
-        // model identities. Request routing must still distinguish official
-        // Codex models from the currently selected third-party provider.
-        if official_models.is_empty() || existing.official_models == official_models {
-            return Ok(existing);
-        }
-        let official_only = ModelRouteSettings {
-            official_models,
-            routes: Vec::new(),
-        };
-        save(db, &official_only)?;
-        return Ok(official_only);
-    };
     if official_models.is_empty() {
         return Err(AppError::Config(
             "Codex Desktop official model cache is empty; load the native model menu first"
@@ -165,14 +126,34 @@ fn ensure_configured_with_official_models(
         ));
     }
 
-    let settings = build_settings(
-        &provider.id,
-        &provider.name,
-        official_models,
-        provider_catalog_models(provider),
-    )?;
+    let providers = db.get_all_providers("codex")?;
+    let catalogs = providers
+        .values()
+        .filter(|provider| provider.category.as_deref() != Some("official"))
+        .filter_map(|provider| {
+            let models = provider_catalog_models(provider);
+            (!models.is_empty()).then(|| (provider.id.clone(), provider.name.clone(), models))
+        })
+        .collect::<Vec<_>>();
+    let single_provider_id = (catalogs.len() == 1).then(|| catalogs[0].0.clone());
+
+    let settings = if catalogs.is_empty() {
+        ModelRouteSettings {
+            official_models: official_models
+                .into_iter()
+                .filter(|model| {
+                    !is_managed_virtual_model(&model.model, model.display_name.as_deref())
+                })
+                .collect(),
+            routes: Vec::new(),
+        }
+    } else {
+        build_settings_for_providers(official_models, catalogs)?
+    };
     save(db, &settings)?;
-    remember_provider(db, &provider.id)?;
+    if let Some(provider_id) = single_provider_id {
+        remember_provider(db, &provider_id)?;
+    }
     Ok(settings)
 }
 
@@ -180,7 +161,7 @@ fn ensure_configured_with_official_models(
 /// leave the provider's selected modelCatalog intact while clearing the route
 /// table, so merely opening the proxy produced an official-only/stale menu.
 pub fn ensure_configured_for_takeover(db: &Database) -> Result<ModelRouteSettings, AppError> {
-    ensure_configured_with_official_models(db, cached_official_models()?)
+    rebuild_with_official_models(db, cached_official_models()?)
 }
 
 /// Persist the model choices in the provider SSOT without applying the provider
@@ -263,11 +244,26 @@ pub fn cached_official_models() -> Result<Vec<CatalogModelInput>, AppError> {
     Ok(models)
 }
 
+#[cfg(test)]
 pub fn build_settings(
     provider_id: &str,
     provider_name: &str,
     official_models: Vec<CatalogModelInput>,
     third_party_models: Vec<CatalogModelInput>,
+) -> Result<ModelRouteSettings, AppError> {
+    build_settings_for_providers(
+        official_models,
+        vec![(
+            provider_id.to_string(),
+            provider_name.to_string(),
+            third_party_models,
+        )],
+    )
+}
+
+pub fn build_settings_for_providers(
+    official_models: Vec<CatalogModelInput>,
+    provider_catalogs: Vec<(String, String, Vec<CatalogModelInput>)>,
 ) -> Result<ModelRouteSettings, AppError> {
     let official_models = official_models
         .into_iter()
@@ -278,38 +274,36 @@ pub fn build_settings(
             "Official Codex model list is required for coexistence mode".to_string(),
         ));
     }
-    if third_party_models.is_empty() {
-        return Err(AppError::InvalidInput(
-            "Select at least one third-party model".to_string(),
-        ));
-    }
-    let short_provider = provider_id.chars().take(8).collect::<String>();
+
     let mut routes = Vec::new();
-    for (index, model) in third_party_models.into_iter().enumerate() {
-        let upstream = model.model.trim();
-        if upstream.is_empty() {
-            continue;
+    for (provider_id, provider_name, third_party_models) in provider_catalogs {
+        let short_provider = provider_id.chars().take(8).collect::<String>();
+        for (index, model) in third_party_models.into_iter().enumerate() {
+            let upstream = model.model.trim();
+            if upstream.is_empty() {
+                continue;
+            }
+            let safe_model = upstream
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                        character
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>();
+            routes.push(ModelRoute {
+                alias: format!("ccs-{short_provider}-{index}-{safe_model}"),
+                provider_id: provider_id.clone(),
+                upstream_model: upstream.to_string(),
+                display_name: format!(
+                    "[{provider_name}] {}",
+                    model.display_name.unwrap_or_else(|| upstream.to_string())
+                ),
+                context_window: model.context_window,
+            });
         }
-        let safe_model = upstream
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                    character
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>();
-        routes.push(ModelRoute {
-            alias: format!("ccs-{short_provider}-{index}-{safe_model}"),
-            provider_id: provider_id.to_string(),
-            upstream_model: upstream.to_string(),
-            display_name: format!(
-                "[{provider_name}] {}",
-                model.display_name.unwrap_or_else(|| upstream.to_string())
-            ),
-            context_window: model.context_window,
-        });
     }
     if routes.is_empty() {
         return Err(AppError::InvalidInput(
@@ -468,7 +462,7 @@ mod tests {
         db.save_provider("codex", &provider).unwrap();
         save(&db, &ModelRouteSettings::default()).unwrap();
 
-        let repaired = ensure_configured_with_official_models(
+        let repaired = rebuild_with_official_models(
             &db,
             vec![CatalogModelInput {
                 model: "gpt-5.6-sol".into(),
@@ -496,7 +490,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let settings = ensure_configured_with_official_models(&db, official.clone()).unwrap();
+        let settings = rebuild_with_official_models(&db, official.clone()).unwrap();
 
         assert_eq!(settings.official_models, official);
         assert!(settings.routes.is_empty());
@@ -505,6 +499,76 @@ mod tests {
             resolve(&db, "gpt-5.6-sol").unwrap(),
             Some(ResolvedModelRoute::Official)
         );
+    }
+
+    #[test]
+    fn rebuild_combines_catalogs_from_multiple_providers() {
+        let db = Database::memory().unwrap();
+        for (id, name, model) in [
+            ("353e58f4-weikuwu", "weikuwu", "GLM-5.2"),
+            ("4598b9a7-grok", "Grok Build", "grok-4.5"),
+        ] {
+            let provider = Provider::with_id(
+                id.into(),
+                name.into(),
+                serde_json::json!({
+                    "modelCatalog": {"models": [{"model": model, "displayName": model}]}
+                }),
+                None,
+            );
+            db.save_provider("codex", &provider).unwrap();
+        }
+
+        let settings = rebuild_with_official_models(
+            &db,
+            vec![CatalogModelInput {
+                model: "gpt-5.6-sol".into(),
+                display_name: Some("GPT-5.6 Sol".into()),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(settings.routes.len(), 2);
+        assert!(settings.routes.iter().any(|route| {
+            route.provider_id == "353e58f4-weikuwu" && route.upstream_model == "GLM-5.2"
+        }));
+        assert!(settings.routes.iter().any(|route| {
+            route.provider_id == "4598b9a7-grok" && route.upstream_model == "grok-4.5"
+        }));
+        assert_eq!(load(&db).unwrap(), settings);
+    }
+
+    #[test]
+    fn rebuild_replaces_stale_single_provider_projection_with_union() {
+        let db = Database::memory().unwrap();
+        let official = vec![CatalogModelInput {
+            model: "gpt-5.6-sol".into(),
+            ..Default::default()
+        }];
+        for (id, model) in [("provider-a", "GLM-5.2"), ("provider-b", "grok-4.5")] {
+            let provider = Provider::with_id(
+                id.into(),
+                id.into(),
+                serde_json::json!({"modelCatalog":{"models":[{"model":model}]}}),
+                None,
+            );
+            db.save_provider("codex", &provider).unwrap();
+        }
+        let stale = build_settings(
+            "provider-a",
+            "provider-a",
+            official.clone(),
+            vec![CatalogModelInput {
+                model: "GLM-5.2".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        save(&db, &stale).unwrap();
+
+        let rebuilt = rebuild_with_official_models(&db, official).unwrap();
+        assert_eq!(rebuilt.routes.len(), 2);
     }
 
     #[test]

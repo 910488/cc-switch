@@ -28,6 +28,7 @@ pub(crate) mod model_routes;
 pub mod provider_router;
 pub mod providers;
 pub(crate) mod quota_policy;
+pub(crate) mod reasoning_visibility;
 pub mod response_handler;
 pub mod response_processor;
 pub(crate) mod secret_vault;

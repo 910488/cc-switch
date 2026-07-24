@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { UsageHero } from "./UsageHero";
+import { ProviderUsageBreakdown } from "./ProviderUsageBreakdown";
 import { UsageTrendChart } from "./UsageTrendChart";
 import { RequestLogTable } from "./RequestLogTable";
 import { ProviderStatsTable } from "./ProviderStatsTable";
@@ -345,6 +346,14 @@ export function UsageDashboard({
       </div>
 
       <UsageHero
+        range={range}
+        appType={appType === "all" ? undefined : appType}
+        providerName={providerName}
+        model={model}
+        refreshIntervalMs={refreshIntervalMs}
+      />
+
+      <ProviderUsageBreakdown
         range={range}
         appType={appType === "all" ? undefined : appType}
         providerName={providerName}

@@ -1813,6 +1813,12 @@ impl RequestForwarder {
         let mut codex_anthropic_one_m = false;
 
         // 转换请求体（如果需要）
+        let grok_tool_context = is_grok_cli_proxy.then(|| {
+            super::providers::transform_codex_chat::build_codex_tool_context_from_request(
+                &mapped_body,
+            )
+        });
+
         let mut request_body = if codex_responses_to_chat {
             let mut mapped_body = mapped_body;
             let explicit_prompt_cache_key = mapped_body
@@ -1978,11 +1984,23 @@ impl RequestForwarder {
         // Apply bridge-history cleanup to the final body, after every provider
         // override, so no later merge can reintroduce an invalid reference.
         if is_codex_official {
-            let (message_ids, reasoning_items) =
+            let (message_ids, reasoning_items, bridge_reasoning_fields) =
                 sanitize_official_responses_input_items(&mut filtered_body);
-            if message_ids > 0 || reasoning_items > 0 {
+            if message_ids > 0 || reasoning_items > 0 || bridge_reasoning_fields > 0 {
                 log::info!(
-                    "[Codex] sanitized official resume input: message_ids={message_ids}, reasoning_items={reasoning_items}"
+                    "[Codex] sanitized official resume input: message_ids={message_ids}, reasoning_items={reasoning_items}, bridge_reasoning_fields={bridge_reasoning_fields}"
+                );
+            }
+            if effective_endpoint
+                .split('?')
+                .next()
+                .is_some_and(|path| path.ends_with("/responses/compact"))
+                && filtered_body
+                    .as_object_mut()
+                    .is_some_and(|object| object.remove("include").is_some())
+            {
+                log::info!(
+                    "[Codex] removed unsupported include field from official compact request"
                 );
             }
         }
@@ -2616,6 +2634,25 @@ impl RequestForwarder {
             is_copilot,
         );
 
+        // Grok account-login credentials are owned by the local CLI session.
+        // Re-apply them after every inbound-header merge and provider override:
+        // Codex sends its own Authorization header, and a stale override must
+        // never replace either the Grok bearer token or x-xai-token-auth marker.
+        if is_grok_cli_proxy {
+            enforce_managed_auth_headers(&mut ordered_headers, &auth_headers);
+            let has_authorization = ordered_headers.contains_key(http::header::AUTHORIZATION);
+            let has_xai_token_auth = ordered_headers.contains_key("x-xai-token-auth");
+            log::debug!(
+                "[GrokCliProxy] managed auth prepared: authorization={has_authorization}, x_xai_token_auth={has_xai_token_auth}"
+            );
+            if !has_authorization || !has_xai_token_auth {
+                return Err(ProxyError::AuthError(
+                    "Grok account session did not produce the required authentication headers; refresh the Grok login and retry"
+                        .to_string(),
+                ));
+            }
+        }
+
         reject_proxy_placeholder_for_managed_account_upstream(&url, &ordered_headers)?;
 
         // 输出请求信息日志
@@ -2756,7 +2793,10 @@ impl RequestForwarder {
                 } = response
                 {
                     let normalized =
-                        super::providers::grok_cli_proxy::normalize_grok_sse_stream(stream);
+                        super::providers::grok_cli_proxy::normalize_grok_sse_stream_with_context(
+                            stream,
+                            grok_tool_context.clone().unwrap_or_default(),
+                        );
                     response = crate::proxy::hyper_client::ProxyResponse::streamed(
                         status, headers, normalized,
                     );
@@ -3712,6 +3752,15 @@ fn headers_contain_proxy_placeholder(headers: &http::HeaderMap) -> bool {
     })
 }
 
+fn enforce_managed_auth_headers(
+    headers: &mut http::HeaderMap,
+    managed_headers: &[(http::HeaderName, http::HeaderValue)],
+) {
+    for (name, value) in managed_headers {
+        headers.insert(name.clone(), value.clone());
+    }
+}
+
 fn should_preserve_exact_header_case(
     adapter_name: &str,
     provider: &Provider,
@@ -3933,13 +3982,14 @@ fn prepare_upstream_request_body(request_body: Value) -> Value {
     canonicalize_value(filter_private_params_with_whitelist(request_body, &[]))
 }
 
-fn sanitize_official_responses_input_items(body: &mut Value) -> (usize, usize) {
+pub(crate) fn sanitize_official_responses_input_items(body: &mut Value) -> (usize, usize, usize) {
     let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return (0, 0);
+        return (0, 0, 0);
     };
 
     let mut removed_message_ids = 0;
     let mut removed_reasoning_items = 0;
+    let mut removed_bridge_reasoning_fields = 0;
     input.retain_mut(|item| {
         // A bridge can expose visible reasoning summaries, but it cannot mint
         // OpenAI's encrypted reasoning payload. Sending an `rs_*` id without
@@ -3961,6 +4011,20 @@ fn sanitize_official_responses_input_items(body: &mut Value) -> (usize, usize) {
             return false;
         }
 
+        // Chat-compatible bridge providers expose chain-of-thought through
+        // non-standard fields on messages and tool-call items. Codex can replay
+        // those bridge-shaped items when a task switches back to an official
+        // Responses model, but the official API rejects fields such as
+        // `input[n].reasoning_content`. Keep the canonical message/tool payload
+        // and remove only provider-private reasoning metadata at this boundary.
+        if let Some(object) = item.as_object_mut() {
+            for field in ["reasoning_content", "reasoning_details", "thinking_content"] {
+                if object.remove(field).is_some() {
+                    removed_bridge_reasoning_fields += 1;
+                }
+            }
+        }
+
         let is_message = item.get("type").and_then(Value::as_str) == Some("message");
         if !is_message {
             return true;
@@ -3978,7 +4042,11 @@ fn sanitize_official_responses_input_items(body: &mut Value) -> (usize, usize) {
         }
         true
     });
-    (removed_message_ids, removed_reasoning_items)
+    (
+        removed_message_ids,
+        removed_reasoning_items,
+        removed_bridge_reasoning_fields,
+    )
 }
 
 fn log_prompt_cache_trace(
@@ -4302,7 +4370,7 @@ mod tests {
 
         let removed = sanitize_official_responses_input_items(&mut body);
 
-        assert_eq!(removed, (1, 3));
+        assert_eq!(removed, (1, 3, 0));
         assert!(body["input"][0].get("id").is_none());
         assert_eq!(body["input"][1]["id"], "msg_official");
         assert_eq!(body["input"][2]["id"], "rs_official");
@@ -4310,6 +4378,58 @@ mod tests {
         assert_eq!(body["input"][3]["id"], "fc_1");
         assert_eq!(body["input"].as_array().unwrap().len(), 4);
         assert_eq!(body["input"][0]["role"], "assistant");
+    }
+
+    #[test]
+    fn official_resume_strips_bridge_reasoning_fields_without_dropping_tool_history() {
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "reasoning": {"effort": "high"},
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "I inspected the repository.",
+                    "reasoning_content": "Private bridge reasoning"
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}",
+                    "reasoning_content": "Need to inspect the file.",
+                    "reasoning_details": [{"type": "reasoning.text", "text": "private"}],
+                    "thinking_content": "vendor private thinking"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "README contents"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "Continue the existing plan"
+                }
+            ]
+        });
+
+        let removed = sanitize_official_responses_input_items(&mut body);
+
+        assert_eq!(removed, (0, 0, 4));
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["input"].as_array().unwrap().len(), 4);
+        assert_eq!(body["input"][1]["type"], "function_call");
+        assert_eq!(body["input"][1]["call_id"], "call_1");
+        assert_eq!(body["input"][1]["name"], "read_file");
+        assert_eq!(body["input"][2]["type"], "function_call_output");
+        assert_eq!(body["input"][2]["output"], "README contents");
+        for item in body["input"].as_array().unwrap() {
+            assert!(item.get("reasoning_content").is_none());
+            assert!(item.get("reasoning_details").is_none());
+            assert!(item.get("thinking_content").is_none());
+        }
     }
 
     #[test]
@@ -4419,6 +4539,38 @@ mod tests {
                 .get(http::header::USER_AGENT)
                 .and_then(|value| value.to_str().ok()),
             Some("copilot")
+        );
+    }
+
+    #[test]
+    fn grok_managed_auth_overrides_stale_client_and_provider_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer stale-codex-token"),
+        );
+        headers.insert(
+            "x-xai-token-auth",
+            http::HeaderValue::from_static("stale-marker"),
+        );
+        let managed = crate::proxy::providers::grok_cli_proxy::build_grok_session_auth_headers(
+            "current-grok-session-token",
+        )
+        .unwrap();
+
+        enforce_managed_auth_headers(&mut headers, &managed);
+
+        assert_eq!(
+            headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer current-grok-session-token")
+        );
+        assert_eq!(
+            headers
+                .get("x-xai-token-auth")
+                .and_then(|value| value.to_str().ok()),
+            Some("xai-grok-cli")
         );
     }
 

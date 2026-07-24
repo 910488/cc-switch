@@ -18,21 +18,16 @@ use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 /// Authentication mode for the Grok CLI proxy provider.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "auth_mode")]
 pub enum GrokAuthMode {
     /// Use the local Grok Build OIDC session stored in `~/.grok/auth.json`.
     /// CC Switch reads only the access token; refresh is delegated to the
     /// Grok CLI itself.
+    #[default]
     LocalSession,
     /// Use an `XAI_API_KEY` stored in the CC Switch secret vault.
     ApiKey,
-}
-
-impl Default for GrokAuthMode {
-    fn default() -> Self {
-        Self::LocalSession
-    }
 }
 
 /// Configuration for a Grok CLI proxy Codex provider.

@@ -183,7 +183,10 @@
     "needsRouting": "需要路由",
     "noRoutingSupport": "不支援路由",
     "officialRouting": "官方帳號路由",
-    "nativeLogin": "Codex 登入"
+    "nativeLogin": "Codex 登入",
+    "configureModels": "設定 Codex 模型",
+    "modelsConfigured": "已加入 {{count}} 個模型",
+    "configureModelsHint": "設定此 Provider 要加入 Codex 模型選單的模型"
   },
   "claudeDesktop": {
     "officialNotice": "Claude Desktop 官方供應商使用應用程式內建的 1P 登入，無需設定 API Key 和 API 位址。",
@@ -341,7 +344,19 @@
         "enableFailoverToggle": "在主頁面顯示故障轉移開關",
         "enableFailoverToggleDescription": "開啟後，主頁面頂部將獨立顯示故障轉移開關",
         "running": "執行中",
-        "stopped": "已停止"
+        "stopped": "已停止",
+        "repairCodex": {
+          "title": "還原官方 Codex 設定",
+          "description": "不依賴 Provider snapshot，直接以安全的官方預設重建 Codex 即時設定；保留聊天紀錄、專案、MCP Server 與有效的 ChatGPT OAuth 登入。",
+          "button": "一鍵還原官方設定",
+          "confirmTitle": "要還原官方 Codex 設定嗎？",
+          "confirmMessage": "請先關閉 Codex Desktop。CC Switch 會停止路由、備份目前 profile、移除注入模型與 Proxy 路由，並修復 Windows onboarding 狀態。聊天資料庫、專案、MCP Server 與有效的 ChatGPT 登入會保留；若 auth.json 只有第三方 API Key，將移除並要求重新登入。",
+          "confirm": "備份並還原",
+          "success": "官方 Codex 設定已還原，請重新啟動 Codex Desktop。",
+          "successLoginRequired": "官方 Codex 設定已還原，請重新啟動 Codex Desktop 並重新登入。",
+          "backupCreated": "安全備份位置：{{path}}",
+          "failed": "還原官方 Codex 設定失敗"
+        }
       },
       "connectivityCheck": {
         "title": "連通檢測設定",
@@ -1419,6 +1434,10 @@
     "cacheHitRate": "快取命中率",
     "requestLogs": "請求日誌",
     "providerStats": "Provider 統計",
+    "providerBreakdown": {
+      "title": "各 Provider 使用量",
+      "description": "Codex 原生工作階段統一計入 OpenAI Official；相符的工作階段與 Proxy 紀錄只計算一次。"
+    },
     "modelStats": "模型統計",
     "time": "時間",
     "provider": "供應商",

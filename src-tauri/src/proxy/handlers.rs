@@ -44,6 +44,7 @@ use super::{
         transform, transform_codex_anthropic, transform_codex_chat, transform_gemini,
         transform_responses,
     },
+    reasoning_visibility::{hide_reasoning_summaries, hide_reasoning_summaries_stream},
     response_processor::{
         create_logged_passthrough_stream, process_response, read_decoded_body,
         strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
@@ -1068,11 +1069,23 @@ async fn relay_official_responses_websocket(
             log::info!(
                 "[Codex] re-tokenizing the initial bridge-compaction WebSocket request before native relay"
             );
-            rewrite_bridge_compaction_for_official_websocket(uri, client_headers, state, body)
-                .await?
-                .to_string()
+            let mut rewritten =
+                rewrite_bridge_compaction_for_official_websocket(uri, client_headers, state, body)
+                    .await?;
+            log_official_websocket_sanitization(
+                "initial rewritten",
+                super::forwarder::sanitize_official_responses_input_items(&mut rewritten),
+            );
+            rewritten.to_string()
         }
-        _ => first_message.to_string(),
+        Ok(mut body) => {
+            log_official_websocket_sanitization(
+                "initial",
+                super::forwarder::sanitize_official_responses_input_items(&mut body),
+            );
+            body.to_string()
+        }
+        Err(_) => first_message.to_string(),
     };
     let mut pending_official_compaction = serde_json::from_str::<Value>(&first_message)
         .map_err(|error| error.to_string())
@@ -1085,7 +1098,7 @@ async fn relay_official_responses_websocket(
             )
         })?;
     upstream_write
-        .send(Message::Text(first_message.into()))
+        .send(Message::Text(first_message))
         .await
         .map_err(|error| error.to_string())?;
 
@@ -1094,8 +1107,9 @@ async fn relay_official_responses_websocket(
             local_message = local.recv() => {
                 let Some(local_message) = local_message else { break };
                 let local_message = local_message.map_err(|error| error.to_string())?;
+                let mut sanitized_text = None;
                 if let WebSocketMessage::Text(text) = &local_message {
-                    if let Ok(body) = serde_json::from_str::<Value>(text) {
+                    if let Ok(mut body) = serde_json::from_str::<Value>(text) {
                         if !websocket_model_uses_official_route(state, &body) {
                             log::info!(
                                 "[Codex] routing a later third-party WebSocket request through the HTTP transformation pipeline"
@@ -1134,6 +1148,13 @@ async fn relay_official_responses_websocket(
                             .await
                             {
                                 Ok(rewritten) => {
+                                    let mut rewritten = rewritten;
+                                    log_official_websocket_sanitization(
+                                        "later rewritten",
+                                        super::forwarder::sanitize_official_responses_input_items(
+                                            &mut rewritten,
+                                        ),
+                                    );
                                     if let Some(pending) =
                                         prepare_official_websocket_compaction_journal(
                                             state,
@@ -1145,7 +1166,7 @@ async fn relay_official_responses_websocket(
                                         pending_official_compaction = Some(pending);
                                     }
                                     upstream_write
-                                        .send(Message::Text(rewritten.to_string().into()))
+                                        .send(Message::Text(rewritten.to_string()))
                                         .await
                                         .map_err(|error| error.to_string())?;
                                 }
@@ -1164,6 +1185,10 @@ async fn relay_official_responses_websocket(
                             // same connection.
                             continue;
                         }
+                        log_official_websocket_sanitization(
+                            "later",
+                            super::forwarder::sanitize_official_responses_input_items(&mut body),
+                        );
                         if let Some(pending) = prepare_official_websocket_compaction_journal(
                             state,
                             client_headers,
@@ -1172,10 +1197,13 @@ async fn relay_official_responses_websocket(
                         )? {
                             pending_official_compaction = Some(pending);
                         }
+                        sanitized_text = Some(body.to_string());
                     }
                 }
                 let upstream_message = match local_message {
-                    WebSocketMessage::Text(text) => Message::Text(text.to_string().into()),
+                    WebSocketMessage::Text(text) => Message::Text(
+                        sanitized_text.unwrap_or_else(|| text.to_string())
+                    ),
                     WebSocketMessage::Binary(bytes) => Message::Binary(bytes),
                     WebSocketMessage::Ping(bytes) => Message::Ping(bytes),
                     WebSocketMessage::Pong(bytes) => Message::Pong(bytes),
@@ -1212,7 +1240,7 @@ async fn relay_official_responses_websocket(
                     }
                 }
                 let local_message = match upstream_message {
-                    Message::Text(text) => WebSocketMessage::Text(text.to_string().into()),
+                    Message::Text(text) => WebSocketMessage::Text(text.to_string()),
                     Message::Binary(bytes) => WebSocketMessage::Binary(bytes),
                     Message::Ping(bytes) => WebSocketMessage::Ping(bytes),
                     Message::Pong(bytes) => WebSocketMessage::Pong(bytes),
@@ -1232,6 +1260,17 @@ async fn relay_official_responses_websocket(
         }
     }
     Ok(())
+}
+
+fn log_official_websocket_sanitization(
+    stage: &str,
+    (message_ids, reasoning_items, bridge_reasoning_fields): (usize, usize, usize),
+) {
+    if message_ids > 0 || reasoning_items > 0 || bridge_reasoning_fields > 0 {
+        log::info!(
+            "[Codex] sanitized {stage} official WebSocket input: message_ids={message_ids}, reasoning_items={reasoning_items}, bridge_reasoning_fields={bridge_reasoning_fields}"
+        );
+    }
 }
 
 async fn bridge_responses_websocket_message_to_http(
@@ -3554,7 +3593,7 @@ async fn handle_codex_chat_to_responses_transform(
             ));
         }
     };
-    let responses_response = transform_codex_chat::chat_completion_to_response_with_context(
+    let mut responses_response = transform_codex_chat::chat_completion_to_response_with_context(
         chat_response,
         &tool_context,
     )
@@ -3562,6 +3601,7 @@ async fn handle_codex_chat_to_responses_transform(
         log::error!("[Codex] Chat → Responses 响应转换失败: {e}");
         e
     })?;
+    hide_reasoning_summaries(&mut responses_response);
     state
         .codex_chat_history
         .record_exchange(request_body, &responses_response)
@@ -3725,7 +3765,7 @@ async fn handle_codex_anthropic_to_responses_transform(
     }
 
     let _connection_guard = connection_guard;
-    let responses_response =
+    let mut responses_response =
         transform_codex_anthropic::anthropic_response_to_responses_with_context(
             anthropic_response,
             &codex_tool_context,
@@ -3734,6 +3774,7 @@ async fn handle_codex_anthropic_to_responses_transform(
             log::error!("[Codex] Failed to convert Anthropic response to Responses: {e}");
             e
         })?;
+    hide_reasoning_summaries(&mut responses_response);
 
     if let Some(usage) = TokenUsage::from_codex_response_auto(&responses_response)
         .filter(TokenUsage::has_billable_tokens)
@@ -3866,6 +3907,7 @@ fn build_codex_anthropic_sse_response(
         None
     };
 
+    let sse_stream = hide_reasoning_summaries_stream(sse_stream);
     let logged_stream = create_logged_passthrough_stream(
         sse_stream,
         ctx.tag,
@@ -5068,6 +5110,37 @@ mod tests {
             }]
         });
         assert!(!contains_bridge_compaction(&native));
+    }
+
+    #[test]
+    fn official_websocket_strips_bridge_reasoning_fields_before_native_relay() {
+        let mut body = json!({
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_184",
+                    "name": "shell_command",
+                    "arguments": "{}",
+                    "reasoning_content": "bridge-only reasoning"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_184",
+                    "output": "ok"
+                }
+            ]
+        });
+
+        let removed = crate::proxy::forwarder::sanitize_official_responses_input_items(&mut body);
+
+        assert_eq!(removed, (0, 0, 1));
+        assert_eq!(body["type"], "response.create");
+        assert_eq!(body["input"][0]["call_id"], "call_184");
+        assert_eq!(body["input"][0]["name"], "shell_command");
+        assert!(body["input"][0].get("reasoning_content").is_none());
+        assert_eq!(body["input"][1]["output"], "ok");
     }
 
     #[test]

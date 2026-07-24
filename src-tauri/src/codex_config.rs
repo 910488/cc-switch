@@ -177,6 +177,148 @@ pub fn get_codex_model_catalog_path() -> PathBuf {
 
 /// 获取 Codex 供应商配置文件路径
 #[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexOfficialProfileRepairResult {
+    pub backup_dir: String,
+    pub auth_preserved: bool,
+    pub auth_removed: bool,
+    pub catalog_removed: bool,
+    pub onboarding_repaired: bool,
+}
+
+fn codex_auth_is_official_oauth(auth: &Value) -> bool {
+    let auth_mode_is_chatgpt = auth
+        .get("auth_mode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("chatgpt"));
+    let tokens = auth.get("tokens");
+    let has_oauth_token = ["access_token", "id_token", "refresh_token"]
+        .iter()
+        .any(|key| {
+            tokens
+                .and_then(|value| value.get(*key))
+                .and_then(Value::as_str)
+                .is_some_and(|token| !token.trim().is_empty())
+        });
+    auth_mode_is_chatgpt || has_oauth_token
+}
+
+pub fn reset_codex_config_to_official(config_text: &str) -> Result<String, AppError> {
+    let mut doc = if config_text.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        config_text
+            .parse::<DocumentMut>()
+            .map_err(|error| AppError::Message(format!("Invalid Codex config.toml: {error}")))?
+    };
+
+    for key in [
+        "base_url",
+        "openai_base_url",
+        "experimental_bearer_token",
+        "model_catalog_json",
+        "model",
+    ] {
+        doc.as_table_mut().remove(key);
+    }
+    if doc
+        .get(CODEX_WEB_SEARCH_FIELD)
+        .and_then(|item| item.as_str())
+        == Some(CODEX_WEB_SEARCH_DISABLED)
+    {
+        doc.as_table_mut().remove(CODEX_WEB_SEARCH_FIELD);
+    }
+    doc.as_table_mut().remove("model_providers");
+    doc["model_provider"] = toml_edit::value("openai");
+    Ok(doc.to_string())
+}
+
+pub fn repair_codex_official_profile() -> Result<CodexOfficialProfileRepairResult, AppError> {
+    let codex_dir = get_codex_config_dir();
+    fs::create_dir_all(&codex_dir).map_err(|error| AppError::io(&codex_dir, error))?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let backup_dir = codex_dir
+        .join("cc-switch-repair-backups")
+        .join(timestamp.to_string());
+    fs::create_dir_all(&backup_dir).map_err(|error| AppError::io(&backup_dir, error))?;
+
+    let auth_path = get_codex_auth_path();
+    let config_path = get_codex_config_path();
+    let catalog_path = get_codex_model_catalog_path();
+    let global_state_path = codex_dir.join(".codex-global-state.json");
+    for path in [&auth_path, &config_path, &catalog_path, &global_state_path] {
+        if path.exists() {
+            let filename = path.file_name().ok_or_else(|| {
+                AppError::Message(format!("Invalid Codex profile path: {}", path.display()))
+            })?;
+            let destination = backup_dir.join(filename);
+            fs::copy(path, &destination).map_err(|error| AppError::io(path, error))?;
+        }
+    }
+
+    let current_config = if config_path.exists() {
+        read_and_validate_codex_config_text()?
+    } else {
+        String::new()
+    };
+    let official_config = reset_codex_config_to_official(&current_config)?;
+    write_codex_live_config_atomic(Some(&official_config))?;
+
+    let mut auth_preserved = false;
+    let mut auth_removed = false;
+    if auth_path.exists() {
+        match read_json_file(&auth_path) {
+            Ok(auth) if codex_auth_is_official_oauth(&auth) => auth_preserved = true,
+            Ok(_) | Err(_) => {
+                delete_file(&auth_path)?;
+                auth_removed = true;
+            }
+        }
+    }
+
+    let catalog_removed = catalog_path.exists();
+    delete_codex_generated_model_catalog()?;
+
+    let mut onboarding_repaired = false;
+    if global_state_path.exists() {
+        let mut state: Value = read_json_file(&global_state_path)?;
+        if !state.is_object() {
+            return Err(AppError::Message(format!(
+                "Codex global state must be a JSON object: {}",
+                global_state_path.display()
+            )));
+        }
+        if state.get("electron-persisted-atom-state").is_none() {
+            state["electron-persisted-atom-state"] = json!({});
+        }
+        let atoms = state
+            .get_mut("electron-persisted-atom-state")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                AppError::Message(format!(
+                    "Invalid electron-persisted-atom-state in {}",
+                    global_state_path.display()
+                ))
+            })?;
+        let key = "electron:onboarding-primary-runtime-install-ready";
+        onboarding_repaired = atoms.get(key).and_then(Value::as_bool) != Some(true);
+        atoms.insert(key.to_string(), Value::Bool(true));
+        write_json_file(&global_state_path, &state)?;
+    }
+
+    Ok(CodexOfficialProfileRepairResult {
+        backup_dir: backup_dir.to_string_lossy().to_string(),
+        auth_preserved,
+        auth_removed,
+        catalog_removed,
+        onboarding_repaired,
+    })
+}
+
 pub fn get_codex_provider_paths(
     provider_id: &str,
     provider_name: Option<&str>,
@@ -4007,6 +4149,64 @@ model_catalog_json = "cc-switch-model-catalog.json"
             result, None,
             "user-owned catalog should not be claimed by cc-switch"
         );
+    }
+
+    #[test]
+    fn official_profile_reset_removes_proxy_state_but_preserves_user_settings() {
+        let input = r#"model_provider = "custom"
+model = "grok-4.5"
+model_catalog_json = "C:/Users/me/.codex/cc-switch-model-catalog.json"
+openai_base_url = "http://127.0.0.1:15721/v1"
+experimental_bearer_token = "PROXY_MANAGED"
+web_search = "disabled"
+sandbox = "elevated"
+
+[model_providers.custom]
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+
+[mcp_servers.example]
+command = "example"
+"#;
+
+        let result = reset_codex_config_to_official(input).unwrap();
+        let parsed: toml::Value = toml::from_str(&result).unwrap();
+
+        assert_eq!(
+            parsed
+                .get("model_provider")
+                .and_then(|value| value.as_str()),
+            Some("openai")
+        );
+        for key in [
+            "model",
+            "model_catalog_json",
+            "openai_base_url",
+            "experimental_bearer_token",
+            "web_search",
+            "model_providers",
+        ] {
+            assert!(parsed.get(key).is_none(), "{key} should be removed");
+        }
+        assert_eq!(
+            parsed.get("sandbox").and_then(|value| value.as_str()),
+            Some("elevated")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["example"]["command"].as_str(),
+            Some("example")
+        );
+    }
+
+    #[test]
+    fn official_oauth_detection_rejects_third_party_api_key_profiles() {
+        assert!(codex_auth_is_official_oauth(&json!({
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "oauth-access"}
+        })));
+        assert!(!codex_auth_is_official_oauth(&json!({
+            "OPENAI_API_KEY": "third-party-key"
+        })));
     }
 
     #[test]

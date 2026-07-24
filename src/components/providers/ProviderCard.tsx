@@ -16,6 +16,7 @@ import CopilotQuotaFooter from "@/components/CopilotQuotaFooter";
 import CodexOauthQuotaFooter from "@/components/CodexOauthQuotaFooter";
 import { CodexOfficialAccountControl } from "@/components/providers/CodexOfficialAccountControl";
 import { CodexModelInjectionDialog } from "@/components/providers/CodexModelInjectionDialog";
+import { configuredCodexModels } from "@/components/providers/codexModelInjection";
 import {
   Dialog,
   DialogContent,
@@ -206,6 +207,13 @@ export function ProviderCard({
 
   const usageEnabled = provider.meta?.usage_script?.enabled ?? false;
   const isOfficial = isOfficialProvider(provider, appId);
+  const codexConfiguredModelCount = useMemo(
+    () =>
+      appId === "codex" && provider.category !== "official"
+        ? configuredCodexModels(provider).length
+        : 0,
+    [appId, provider],
+  );
   const supportsOfficialSubscription =
     isOfficial && ["claude", "codex", "gemini"].includes(appId);
   const isOfficialSubscriptionUsage =
@@ -586,6 +594,8 @@ export function ProviderCard({
               isTesting={isTesting}
               isProxyTakeover={isProxyTakeover}
               isOfficialBlockedByProxy={isOfficialBlockedByProxy}
+              isOfficial={provider.category === "official"}
+              codexConfiguredModelCount={codexConfiguredModelCount}
               isReadOnly={isHermesReadOnly}
               isOmo={isAnyOmo}
               onSwitch={() => onSwitch(provider)}

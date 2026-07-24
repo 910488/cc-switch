@@ -11,6 +11,14 @@ import type {
   ContinuityTaskState,
 } from "@/types/proxy";
 
+export interface CodexOfficialProfileRepairResult {
+  backupDir: string;
+  authPreserved: boolean;
+  authRemoved: boolean;
+  catalogRemoved: boolean;
+  onboardingRepaired: boolean;
+}
+
 export const proxyApi = {
   // ========== 代理服务器控制 API ==========
 
@@ -22,6 +30,10 @@ export const proxyApi = {
   // 停止代理服务器并恢复配置
   async stopProxyWithRestore(): Promise<void> {
     return invoke("stop_proxy_with_restore");
+  },
+
+  async repairCodexOfficialProfile(): Promise<CodexOfficialProfileRepairResult> {
+    return invoke("repair_codex_official_profile");
   },
 
   // 获取代理服务器状态

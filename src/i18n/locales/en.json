@@ -183,7 +183,10 @@
     "needsRouting": "Needs Routing",
     "noRoutingSupport": "No Routing Support",
     "officialRouting": "Official Account Routing",
-    "nativeLogin": "Codex Sign-in"
+    "nativeLogin": "Codex Sign-in",
+    "configureModels": "Configure Models",
+    "modelsConfigured": "{{count}} models added",
+    "configureModelsHint": "Choose which models from this provider appear in the Codex model menu"
   },
   "claudeDesktop": {
     "officialNotice": "Claude Desktop official providers use the built-in 1P sign-in. No API key or endpoint URL is required.",
@@ -341,7 +344,19 @@
         "enableFailoverToggle": "Show Failover Toggle on Main Page",
         "enableFailoverToggleDescription": "When enabled, the failover toggle will appear independently at the top of the main page",
         "running": "Running",
-        "stopped": "Stopped"
+        "stopped": "Stopped",
+        "repairCodex": {
+          "title": "Restore Official Codex Profile",
+          "description": "Rebuild the live Codex configuration from safe official defaults without relying on a provider snapshot. Chats, projects, MCP servers, and valid ChatGPT OAuth login are preserved.",
+          "button": "Restore Official Settings",
+          "confirmTitle": "Restore the official Codex profile?",
+          "confirmMessage": "Close Codex Desktop first. CC Switch will stop routing, back up the current profile, remove injected models and proxy routes, repair the Windows onboarding flag, and preserve chat databases, projects, MCP servers, and valid ChatGPT login. If auth.json contains only a third-party API key, it will be removed and you will need to sign in again.",
+          "confirm": "Back up and restore",
+          "success": "Official Codex settings restored. Restart Codex Desktop.",
+          "successLoginRequired": "Official Codex settings restored. Restart Codex Desktop and sign in again.",
+          "backupCreated": "Safety backup: {{path}}",
+          "failed": "Failed to restore the official Codex profile"
+        }
       },
       "connectivityCheck": {
         "title": "Connectivity Check Settings",
@@ -1447,6 +1462,10 @@
     "cacheHitRate": "Cache Hit Rate",
     "requestLogs": "Request Logs",
     "providerStats": "Provider Stats",
+    "providerBreakdown": {
+      "title": "Usage by provider",
+      "description": "Native Codex sessions are counted with OpenAI Official; matching session and proxy records are counted once."
+    },
     "modelStats": "Model Stats",
     "time": "Time",
     "provider": "Provider",

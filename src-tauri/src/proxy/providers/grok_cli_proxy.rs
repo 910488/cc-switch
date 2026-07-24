@@ -12,6 +12,9 @@
 
 use super::adapter::auth_header_value;
 use super::auth::{AuthInfo, AuthStrategy};
+use super::transform_codex_chat::{
+    build_codex_tool_context_from_request, CodexToolContext, CodexToolKind,
+};
 use super::ProviderAdapter;
 use crate::provider::Provider;
 use crate::proxy::error::ProxyError;
@@ -30,6 +33,10 @@ const DEFAULT_GROK_MODEL: &str = "grok-4.5";
 
 /// Default base URL for the Grok CLI chat proxy.
 const DEFAULT_GROK_BASE_URL: &str = "https://cli-chat-proxy.grok.com";
+
+fn is_grok_cli_proxy_base_url(base_url: &str) -> bool {
+    base_url.trim().trim_end_matches('/') == DEFAULT_GROK_BASE_URL
+}
 
 /// Reasoning effort values supported by Grok.
 #[allow(dead_code)]
@@ -91,12 +98,32 @@ impl GrokCliProxyAdapter {
     }
 
     /// Returns `true` when the given provider is a Grok CLI proxy.
+    ///
+    /// Older builds could persist the preset without `meta.providerType`.
+    /// Recover those providers from the exact, trusted CLI proxy endpoint so
+    /// existing installations receive session-managed authentication instead
+    /// of silently delegating to the generic Codex adapter.
     pub fn is_grok_provider(provider: &Provider) -> bool {
-        provider
+        if provider
             .meta
             .as_ref()
             .and_then(|m| m.provider_type.as_deref())
             == Some(GROK_CLI_PROXY_PROVIDER_TYPE_STR)
+        {
+            return true;
+        }
+
+        provider
+            .settings_config
+            .get("config")
+            .and_then(Value::as_str)
+            .and_then(crate::codex_config::extract_codex_base_url)
+            .is_some_and(|base_url| is_grok_cli_proxy_base_url(&base_url))
+            || provider
+                .settings_config
+                .get("base_url")
+                .and_then(Value::as_str)
+                .is_some_and(is_grok_cli_proxy_base_url)
     }
 
     /// Get or create the credential broker for the given provider.
@@ -395,19 +422,9 @@ impl ProviderAdapter for GrokCliProxyAdapter {
             }
         }
 
-        // 3. Reject unsupported built-in tools.
-        if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
-            for tool in tools {
-                if let Some(tool_type) = tool.get("type").and_then(|v| v.as_str()) {
-                    if UNSUPPORTED_BUILTIN_TOOLS.contains(&tool_type) {
-                        return Err(ProxyError::TransformError(format!(
-                            "Grok CLI proxy does not support built-in tool type '{tool_type}'. \
-                             Only function tools are supported in this version."
-                        )));
-                    }
-                }
-            }
-        }
+        // 3. Translate Codex-only tool containers into Grok-compatible function tools
+        // and drop hosted tools that the CLI proxy cannot execute.
+        normalize_grok_tools(&mut body);
 
         // 4. Normalize reasoning effort.
         if let Some(reasoning) = body.get_mut("reasoning").and_then(|v| v.as_object_mut()) {
@@ -423,6 +440,215 @@ impl ProviderAdapter for GrokCliProxyAdapter {
         }
 
         Ok(body)
+    }
+}
+
+fn chat_function_tool_to_grok_responses_tool(tool: &Value) -> Option<Value> {
+    let mut function = tool.get("function")?.as_object()?.clone();
+    function.insert("type".to_string(), Value::String("function".to_string()));
+    Some(Value::Object(function))
+}
+
+fn normalize_grok_input_tool_item(item: &mut Value, tool_context: &CodexToolContext) {
+    let Some(object) = item.as_object_mut() else {
+        return;
+    };
+    match object.get("type").and_then(Value::as_str) {
+        Some("function_call") => {
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let namespace = object
+                .get("namespace")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            if namespace.is_some() {
+                object.insert(
+                    "name".to_string(),
+                    Value::String(
+                        tool_context.chat_name_for_response_function(&name, namespace.as_deref()),
+                    ),
+                );
+                object.remove("namespace");
+            }
+        }
+        Some("custom_tool_call") => {
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let input = object
+                .remove("input")
+                .and_then(|value| value.as_str().map(ToString::to_string))
+                .unwrap_or_default();
+            object.insert(
+                "type".to_string(),
+                Value::String("function_call".to_string()),
+            );
+            object.insert("name".to_string(), Value::String(name));
+            object.insert(
+                "arguments".to_string(),
+                Value::String(serde_json::json!({"input": input}).to_string()),
+            );
+        }
+        Some("tool_search_call") => {
+            let arguments = object
+                .remove("arguments")
+                .unwrap_or_else(|| serde_json::json!({}));
+            object.remove("execution");
+            object.insert(
+                "type".to_string(),
+                Value::String("function_call".to_string()),
+            );
+            object.insert("name".to_string(), Value::String("tool_search".to_string()));
+            object.insert(
+                "arguments".to_string(),
+                Value::String(arguments.to_string()),
+            );
+        }
+        Some("custom_tool_call_output") | Some("tool_search_output") => {
+            let output = object
+                .remove("output")
+                .or_else(|| object.remove("tools"))
+                .unwrap_or(Value::Null);
+            object.insert(
+                "type".to_string(),
+                Value::String("function_call_output".to_string()),
+            );
+            object.insert(
+                "output".to_string(),
+                match output {
+                    Value::String(_) => output,
+                    other => Value::String(other.to_string()),
+                },
+            );
+        }
+        _ => {}
+    }
+}
+
+fn normalize_grok_input_items(value: &mut Value, tool_context: &CodexToolContext) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                normalize_grok_input_items(item, tool_context);
+            }
+        }
+        Value::Object(_) => {
+            normalize_grok_input_tool_item(value, tool_context);
+            if let Value::Object(object) = value {
+                for child in object.values_mut() {
+                    normalize_grok_input_items(child, tool_context);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_grok_tools(body: &mut Value) {
+    let tool_context = build_codex_tool_context_from_request(body);
+    if let Some(input) = body.get_mut("input") {
+        normalize_grok_input_items(input, &tool_context);
+    }
+    let original_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut normalized_tools = Vec::new();
+    let mut removed_builtin_tools = Vec::new();
+
+    for tool in original_tools {
+        let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or_default();
+        if UNSUPPORTED_BUILTIN_TOOLS.contains(&tool_type) {
+            removed_builtin_tools.push(tool_type.to_string());
+            continue;
+        }
+
+        // These Codex tool forms are represented by the flattened function
+        // definitions produced by CodexToolContext below.
+        if matches!(
+            tool_type,
+            "function" | "namespace" | "custom" | "tool_search"
+        ) {
+            continue;
+        }
+        normalized_tools.push(tool);
+    }
+
+    normalized_tools.extend(
+        tool_context
+            .chat_tools()
+            .iter()
+            .filter_map(chat_function_tool_to_grok_responses_tool),
+    );
+
+    if !removed_builtin_tools.is_empty() {
+        log::info!(
+            "[GrokCliProxy] removed unsupported built-in tools: {}",
+            removed_builtin_tools.join(", ")
+        );
+    }
+
+    if normalized_tools.is_empty() {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("tools");
+            object.remove("tool_choice");
+            object.remove("parallel_tool_calls");
+        }
+        return;
+    }
+
+    body["tools"] = Value::Array(normalized_tools);
+    if let Some(tool_choice) = body.get("tool_choice").cloned() {
+        let normalized_choice = match &tool_choice {
+            Value::Object(choice)
+                if choice.get("type").and_then(Value::as_str) == Some("function") =>
+            {
+                let name = choice
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let namespace = choice.get("namespace").and_then(Value::as_str);
+                serde_json::json!({
+                    "type": "function",
+                    "name": tool_context.chat_name_for_response_function(name, namespace)
+                })
+            }
+            Value::Object(choice)
+                if choice.get("type").and_then(Value::as_str) == Some("custom") =>
+            {
+                serde_json::json!({
+                    "type": "function",
+                    "name": choice.get("name").and_then(Value::as_str).unwrap_or_default()
+                })
+            }
+            Value::Object(choice)
+                if choice.get("type").and_then(Value::as_str) == Some("tool_search") =>
+            {
+                serde_json::json!({"type": "function", "name": "tool_search"})
+            }
+            _ if tool_choice_targets_unsupported_builtin(&tool_choice) => {
+                Value::String("auto".to_string())
+            }
+            _ => tool_choice,
+        };
+        body["tool_choice"] = normalized_choice;
+    }
+}
+
+fn tool_choice_targets_unsupported_builtin(tool_choice: &Value) -> bool {
+    match tool_choice {
+        Value::String(choice) => UNSUPPORTED_BUILTIN_TOOLS.contains(&choice.as_str()),
+        Value::Object(choice) => choice
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|tool_type| UNSUPPORTED_BUILTIN_TOOLS.contains(&tool_type)),
+        _ => false,
     }
 }
 
@@ -581,9 +807,117 @@ struct GrokSseNormalizerState {
     synthetic_created_emitted: bool,
 }
 
+fn restore_grok_tool_call_item(item: &mut Value, tool_context: &CodexToolContext) {
+    let Some(object) = item.as_object_mut() else {
+        return;
+    };
+    if object.get("type").and_then(Value::as_str) != Some("function_call") {
+        return;
+    }
+    let Some(chat_name) = object.get("name").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(spec) = tool_context.lookup_chat_name(chat_name).cloned() else {
+        return;
+    };
+
+    match spec.kind {
+        CodexToolKind::Namespace => {
+            object.insert("name".to_string(), Value::String(spec.name));
+            if let Some(namespace) = spec.namespace {
+                object.insert("namespace".to_string(), Value::String(namespace));
+            }
+        }
+        CodexToolKind::Custom => {
+            let arguments = object
+                .remove("arguments")
+                .and_then(|value| value.as_str().map(ToString::to_string))
+                .unwrap_or_default();
+            object.insert(
+                "type".to_string(),
+                Value::String("custom_tool_call".to_string()),
+            );
+            object.insert("name".to_string(), Value::String(spec.name));
+            object.insert(
+                "input".to_string(),
+                Value::String(
+                    super::transform_codex_chat::custom_tool_input_from_chat_arguments(&arguments),
+                ),
+            );
+        }
+        CodexToolKind::ToolSearch => {
+            let arguments = object
+                .remove("arguments")
+                .and_then(|value| value.as_str().map(ToString::to_string))
+                .unwrap_or_default();
+            let parsed = serde_json::from_str::<Value>(&arguments)
+                .ok()
+                .filter(Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({"query": arguments}));
+            object.remove("id");
+            object.remove("name");
+            object.insert(
+                "type".to_string(),
+                Value::String("tool_search_call".to_string()),
+            );
+            object.insert("execution".to_string(), Value::String("client".to_string()));
+            object.insert("arguments".to_string(), parsed);
+        }
+        CodexToolKind::Function => {
+            object.insert("name".to_string(), Value::String(spec.name));
+        }
+    }
+}
+
+fn restore_grok_tool_calls(value: &mut Value, tool_context: &CodexToolContext) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                restore_grok_tool_calls(item, tool_context);
+            }
+        }
+        Value::Object(_) => {
+            restore_grok_tool_call_item(value, tool_context);
+            if let Value::Object(object) = value {
+                for child in object.values_mut() {
+                    restore_grok_tool_calls(child, tool_context);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn restore_grok_tool_calls_in_sse_block(block: &str, tool_context: &CodexToolContext) -> String {
+    block
+        .lines()
+        .map(|line| {
+            let Some(data) = crate::proxy::sse::strip_sse_field(line, "data") else {
+                return line.to_string();
+            };
+            if data.trim() == "[DONE]" {
+                return line.to_string();
+            }
+            let Ok(mut payload) = serde_json::from_str::<Value>(data) else {
+                return line.to_string();
+            };
+            restore_grok_tool_calls(&mut payload, tool_context);
+            format!(
+                "data: {}",
+                serde_json::to_string(&payload).unwrap_or_else(|_| data.to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Normalize a single parsed SSE block. Returns the normalized bytes to
 /// forward (possibly empty if the block is filtered), plus updated state.
-fn normalize_sse_block(block: &str, state: &mut GrokSseNormalizerState) -> Vec<bytes::Bytes> {
+fn normalize_sse_block_with_context(
+    block: &str,
+    state: &mut GrokSseNormalizerState,
+    tool_context: &CodexToolContext,
+) -> Vec<bytes::Bytes> {
     // Empty block (keepalive or trailing) — nothing to emit.
     if block.is_empty() {
         return Vec::new();
@@ -651,10 +985,16 @@ fn normalize_sse_block(block: &str, state: &mut GrokSseNormalizerState) -> Vec<b
     }
 
     // Pass the original block through unchanged.
-    let block_bytes = format!("{}\n\n", block);
+    let restored_block = restore_grok_tool_calls_in_sse_block(block, tool_context);
+    let block_bytes = format!("{}\n\n", restored_block);
     output.push(bytes::Bytes::from(block_bytes));
 
     output
+}
+
+#[cfg(test)]
+fn normalize_sse_block(block: &str, state: &mut GrokSseNormalizerState) -> Vec<bytes::Bytes> {
+    normalize_sse_block_with_context(block, state, &CodexToolContext::default())
 }
 
 /// Wrap a byte stream from the Grok upstream with an SSE normalizer that:
@@ -662,8 +1002,16 @@ fn normalize_sse_block(block: &str, state: &mut GrokSseNormalizerState) -> Vec<b
 /// - Supplements missing lifecycle events (response.created)
 /// - Converts context_overflow events into response.failed
 /// - Passes through all standard Responses events unchanged
+#[cfg(test)]
 pub fn normalize_grok_sse_stream(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send {
+    normalize_grok_sse_stream_with_context(stream, CodexToolContext::default())
+}
+
+pub(crate) fn normalize_grok_sse_stream_with_context(
+    stream: impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
+    tool_context: CodexToolContext,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send {
     use futures::StreamExt;
     let stream = Box::pin(stream);
@@ -692,7 +1040,8 @@ pub fn normalize_grok_sse_stream(
                             utf8_remainder: Vec::new(),
                             synthetic_created_emitted: state.synthetic_created_emitted,
                         };
-                        let normalized = normalize_sse_block(&block, &mut st);
+                        let normalized =
+                            normalize_sse_block_with_context(&block, &mut st, &tool_context);
                         state.seen_created = st.seen_created;
                         state.seen_in_progress = st.seen_in_progress;
                         state.seen_terminal = st.seen_terminal;
@@ -770,6 +1119,29 @@ mod tests {
     }
 
     #[test]
+    fn is_grok_provider_recovers_legacy_preset_from_exact_cli_endpoint() {
+        let legacy = create_plain_codex_provider(json!({
+            "config": r#"model_provider = "custom"
+model = "grok-4.5"
+[model_providers.custom]
+base_url = "https://cli-chat-proxy.grok.com"
+wire_api = "responses"
+"#
+        }));
+        let lookalike = create_plain_codex_provider(json!({
+            "config": r#"model_provider = "custom"
+model = "grok-4.5"
+[model_providers.custom]
+base_url = "https://cli-chat-proxy.grok.com.evil.example"
+wire_api = "responses"
+"#
+        }));
+
+        assert!(GrokCliProxyAdapter::is_grok_provider(&legacy));
+        assert!(!GrokCliProxyAdapter::is_grok_provider(&lookalike));
+    }
+
+    #[test]
     fn extract_base_url_uses_grok_endpoint() {
         let adapter = GrokCliProxyAdapter::new();
         let provider = create_grok_provider(json!({
@@ -830,18 +1202,41 @@ mod tests {
     }
 
     #[test]
-    fn transform_request_rejects_unsupported_builtin_tools() {
+    fn transform_request_drops_unsupported_builtin_tools() {
         let adapter = GrokCliProxyAdapter::new();
         let provider = create_grok_provider(json!({}));
         let body = json!({
             "model": "grok-4.5",
             "input": [],
-            "tools": [{"type": "web_search"}]
+            "tools": [{"type": "web_search"}],
+            "tool_choice": "auto"
         });
-        let result = adapter.transform_request(body, &provider);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("web_search"));
+        let result = adapter.transform_request(body, &provider).unwrap();
+        assert!(result.get("tools").is_none());
+        assert!(result.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn transform_request_keeps_function_tools_when_builtin_tools_are_removed() {
+        let adapter = GrokCliProxyAdapter::new();
+        let provider = create_grok_provider(json!({}));
+        let body = json!({
+            "model": "grok-4.5",
+            "input": [],
+            "tools": [
+                {"type": "web_search"},
+                {
+                    "type": "function",
+                    "name": "shell",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            ],
+            "tool_choice": {"type": "web_search"}
+        });
+        let result = adapter.transform_request(body, &provider).unwrap();
+        assert_eq!(result["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(result["tools"][0]["type"], "function");
+        assert_eq!(result["tool_choice"], "auto");
     }
 
     #[test]
@@ -859,6 +1254,107 @@ mod tests {
         });
         let result = adapter.transform_request(body, &provider).unwrap();
         assert!(result.get("tools").is_some());
+    }
+
+    #[test]
+    fn transform_request_flattens_namespace_tools_for_grok() {
+        let adapter = GrokCliProxyAdapter::new();
+        let provider = create_grok_provider(json!({}));
+        let body = json!({
+            "model": "grok-4.5",
+            "input": [],
+            "tools": [{
+                "type": "namespace",
+                "name": "mcp__codex_apps__github",
+                "tools": [{
+                    "type": "function",
+                    "name": "_fetch_pr",
+                    "description": "Fetch a pull request",
+                    "parameters": {"type": "object", "properties": {}}
+                }]
+            }],
+            "tool_choice": {
+                "type": "function",
+                "namespace": "mcp__codex_apps__github",
+                "name": "_fetch_pr"
+            }
+        });
+
+        let result = adapter.transform_request(body, &provider).unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "mcp__codex_apps__github___fetch_pr");
+        assert!(tools.iter().all(|tool| tool["type"] != "namespace"));
+        assert_eq!(
+            result["tool_choice"]["name"],
+            "mcp__codex_apps__github___fetch_pr"
+        );
+        assert!(result["tool_choice"].get("namespace").is_none());
+    }
+
+    #[test]
+    fn transform_request_flattens_namespace_in_tool_history() {
+        let adapter = GrokCliProxyAdapter::new();
+        let provider = create_grok_provider(json!({}));
+        let body = json!({
+            "model": "grok-4.5",
+            "tools": [{
+                "type": "namespace",
+                "name": "mcp__codex_apps__github",
+                "tools": [{
+                    "type": "function",
+                    "name": "_fetch_pr",
+                    "parameters": {"type": "object"}
+                }]
+            }],
+            "input": [{
+                "type": "function_call",
+                "namespace": "mcp__codex_apps__github",
+                "name": "_fetch_pr",
+                "call_id": "call_1",
+                "arguments": "{}"
+            }]
+        });
+
+        let result = adapter.transform_request(body, &provider).unwrap();
+
+        assert_eq!(
+            result["input"][0]["name"],
+            "mcp__codex_apps__github___fetch_pr"
+        );
+        assert!(result["input"][0].get("namespace").is_none());
+    }
+
+    #[test]
+    fn restores_namespace_on_grok_function_call_items() {
+        let request = json!({
+            "tools": [{
+                "type": "namespace",
+                "name": "mcp__codex_apps__github",
+                "tools": [{
+                    "type": "function",
+                    "name": "_fetch_pr",
+                    "parameters": {"type": "object"}
+                }]
+            }]
+        });
+        let context = build_codex_tool_context_from_request(&request);
+        let mut payload = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "name": "mcp__codex_apps__github___fetch_pr",
+                "call_id": "call_1",
+                "arguments": "{}"
+            }
+        });
+
+        restore_grok_tool_calls(&mut payload, &context);
+
+        assert_eq!(payload["item"]["type"], "function_call");
+        assert_eq!(payload["item"]["name"], "_fetch_pr");
+        assert_eq!(payload["item"]["namespace"], "mcp__codex_apps__github");
     }
 
     #[test]

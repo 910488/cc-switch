@@ -43,6 +43,37 @@ pub async fn stop_proxy_with_restore(state: tauri::State<'_, AppState>) -> Resul
 
 /// 获取各应用接管状态
 #[tauri::command]
+pub async fn repair_codex_official_profile(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::codex_config::CodexOfficialProfileRepairResult, String> {
+    if let Err(error) = state.proxy_service.stop_with_restore().await {
+        log::warn!("Codex profile repair is continuing after snapshot restore failed: {error}");
+    }
+
+    let result =
+        crate::codex_config::repair_codex_official_profile().map_err(|error| error.to_string())?;
+    crate::proxy::model_routes::clear(&state.db).map_err(|error| error.to_string())?;
+    crate::proxy::model_routes::forget_provider(&state.db).map_err(|error| error.to_string())?;
+
+    if let Ok(mut config) = state.db.get_proxy_config_for_app("codex").await {
+        config.enabled = false;
+        state
+            .db
+            .update_proxy_config_for_app(config)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    state
+        .db
+        .set_live_takeover_active(false)
+        .await
+        .map_err(|error| error.to_string())?;
+    let _ = state.db.delete_all_live_backups().await;
+
+    Ok(result)
+}
+
+#[tauri::command]
 pub async fn get_proxy_takeover_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<ProxyTakeoverStatus, String> {
@@ -154,26 +185,34 @@ pub async fn apply_codex_model_routes(
                 .to_string(),
         );
     }
-    let next = crate::proxy::model_routes::build_settings(
-        &provider.id,
-        &provider.name,
-        official_models,
-        third_party_models,
-    )
-    .map_err(|error| error.to_string())?;
     let previous =
         crate::proxy::model_routes::load(&state.db).map_err(|error| error.to_string())?;
     // Save only to the database SSOT. Do not use ProviderService::update here:
     // it can sync a current third-party provider into live auth.json and change
     // Codex from ChatGPT authentication to API-key authentication.
+    let mut updated_provider = updated_provider;
+    if crate::proxy::providers::GrokCliProxyAdapter::is_grok_provider(&updated_provider) {
+        updated_provider
+            .meta
+            .get_or_insert_with(Default::default)
+            .provider_type =
+            Some(crate::proxy::providers::GROK_CLI_PROXY_PROVIDER_TYPE.to_string());
+    }
     state
         .db
         .save_provider("codex", &updated_provider)
         .map_err(|error| error.to_string())?;
-    if let Err(error) = crate::proxy::model_routes::save(&state.db, &next) {
-        let _ = state.db.save_provider("codex", &provider);
-        return Err(error.to_string());
-    }
+    let next = match crate::proxy::model_routes::rebuild_with_official_models(
+        &state.db,
+        official_models,
+    ) {
+        Ok(settings) => settings,
+        Err(error) => {
+            let _ = state.db.save_provider("codex", &provider);
+            let _ = crate::proxy::model_routes::save(&state.db, &previous);
+            return Err(error.to_string());
+        }
+    };
     crate::proxy::model_routes::remember_provider(&state.db, &provider.id)
         .map_err(|error| error.to_string())?;
 

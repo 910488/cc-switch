@@ -183,7 +183,10 @@
     "needsRouting": "ルーティングが必要",
     "noRoutingSupport": "ルーティング非対応",
     "officialRouting": "公式アカウントルーティング",
-    "nativeLogin": "Codex ログイン"
+    "nativeLogin": "Codex ログイン",
+    "configureModels": "Codexモデルを設定",
+    "modelsConfigured": "{{count}}モデル追加済み",
+    "configureModelsHint": "Codexのモデルメニューに表示するモデルを設定します"
   },
   "claudeDesktop": {
     "officialNotice": "Claude Desktop の公式プロバイダーは内蔵の 1P サインインを使用します。API キーやエンドポイントの設定は不要です。",
@@ -341,7 +344,19 @@
         "enableFailoverToggle": "メインページにフェイルオーバー切り替えを表示",
         "enableFailoverToggleDescription": "有効にすると、メインページ上部にフェイルオーバー切り替えが独立して表示されます",
         "running": "実行中",
-        "stopped": "停止中"
+        "stopped": "停止中",
+        "repairCodex": {
+          "title": "公式Codexプロファイルを復元",
+          "description": "Providerスナップショットに依存せず、安全な公式設定からCodexのライブ設定を再構築します。会話、プロジェクト、MCPサーバー、有効なChatGPT OAuthログインは保持されます。",
+          "button": "公式設定に復元",
+          "confirmTitle": "公式Codexプロファイルを復元しますか？",
+          "confirmMessage": "先にCodex Desktopを閉じてください。CC Switchはルーティングを停止し、現在のプロファイルをバックアップして、注入モデルとProxy経路を削除し、Windowsオンボーディング状態を修復します。会話DB、プロジェクト、MCPサーバー、有効なChatGPTログインは保持されます。auth.jsonが第三者APIキーのみの場合は削除され、再ログインが必要です。",
+          "confirm": "バックアップして復元",
+          "success": "公式Codex設定を復元しました。Codex Desktopを再起動してください。",
+          "successLoginRequired": "公式Codex設定を復元しました。Codex Desktopを再起動して再ログインしてください。",
+          "backupCreated": "安全バックアップ: {{path}}",
+          "failed": "公式Codexプロファイルの復元に失敗しました"
+        }
       },
       "connectivityCheck": {
         "title": "接続チェック設定",
@@ -1447,6 +1462,10 @@
     "cacheHitRate": "キャッシュヒット率",
     "requestLogs": "リクエストログ",
     "providerStats": "プロバイダー統計",
+    "providerBreakdown": {
+      "title": "プロバイダー別使用量",
+      "description": "Codex のネイティブセッションは OpenAI Official に集約し、対応するセッションとプロキシ記録は1回だけ計上します。"
+    },
     "modelStats": "モデル統計",
     "time": "時間",
     "provider": "プロバイダー",

@@ -211,7 +211,7 @@ fn provider_name_coalesce(log_alias: &str, provider_alias: &str) -> String {
     format!(
         "COALESCE({provider_alias}.name, CASE {log_alias}.provider_id \
          WHEN '_session' THEN 'Claude (Session)' \
-         WHEN '_codex_session' THEN 'Codex (Session)' \
+         WHEN '_codex_session' THEN 'OpenAI Official' \
          WHEN '_gemini_session' THEN 'Gemini (Session)' \
          WHEN '_opencode_session' THEN 'OpenCode (Session)' \
          ELSE {log_alias}.provider_id END)"
@@ -267,6 +267,24 @@ fn effective_model_sql(alias: &str) -> String {
     format!("COALESCE(NULLIF({alias}.pricing_model, ''), {alias}.model)")
 }
 
+/// Model identity used for matching a Codex session row back to the proxy row
+/// that produced it. Request aliases are preferred because generated CC Switch
+/// model names differ from the upstream billing model.
+fn route_model_sql(alias: &str) -> String {
+    format!(
+        "COALESCE(NULLIF({alias}.request_model, ''), NULLIF({alias}.model, ''), {alias}.pricing_model)"
+    )
+}
+
+/// Fold native Codex session usage into the built-in OpenAI Official provider.
+/// Third-party Codex session rows are removed by effective_usage_log_filter
+/// whenever their matching proxy record exists.
+fn provider_group_id_sql(alias: &str) -> String {
+    format!(
+        "CASE WHEN {alias}.provider_id = '_codex_session' THEN 'codex-official' ELSE {alias}.provider_id END"
+    )
+}
+
 /// 把 Dashboard 顶部的 Provider/模型筛选追加到查询条件。
 ///
 /// Provider 按展示名精确匹配（复用 [`provider_name_coalesce`]，会话占位行的
@@ -297,6 +315,8 @@ fn push_provider_model_filters(
 pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
     let data_source = data_source_expr(log_alias);
     let proxy_data_source = data_source_expr("proxy_dedup");
+    let log_route_model = route_model_sql(log_alias);
+    let proxy_route_model = route_model_sql("proxy_dedup");
     format!(
         "NOT (
             {data_source} IN ('session_log', 'codex_session', 'gemini_session', 'opencode_session')
@@ -321,7 +341,8 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
                       {log_alias}.created_at - {SESSION_PROXY_DEDUP_WINDOW_SECONDS}
                       AND {log_alias}.created_at + {SESSION_PROXY_DEDUP_WINDOW_SECONDS}
                   AND (
-                      LOWER(proxy_dedup.model) = LOWER({log_alias}.model)
+                      LOWER({proxy_route_model}) = LOWER({log_route_model})
+                      OR LOWER(proxy_dedup.model) = LOWER({log_alias}.model)
                       OR LOWER(proxy_dedup.model) = 'unknown'
                       OR LOWER({log_alias}.model) = 'unknown'
                   )
@@ -377,6 +398,7 @@ pub(crate) fn has_matching_proxy_usage_log(
         matches!(key.app_type, "codex" | "gemini" | "opencode") && key.cache_creation_tokens == 0;
 
     let l_data_source = data_source_expr("l");
+    let l_route_model = route_model_sql("l");
     let sql = format!(
         "SELECT EXISTS (
             SELECT 1
@@ -391,7 +413,8 @@ pub(crate) fn has_matching_proxy_usage_log(
               AND (l.cache_creation_tokens = ?6 OR ?9 = 1)
               AND l.created_at BETWEEN ?7 - ?8 AND ?7 + ?8
               AND (
-                  LOWER(l.model) = LOWER(?2)
+                  LOWER({l_route_model}) = LOWER(?2)
+                  OR LOWER(l.model) = LOWER(?2)
                   OR LOWER(l.model) = 'unknown'
                   OR LOWER(?2) = 'unknown'
               )
@@ -1238,6 +1261,8 @@ impl Database {
         };
 
         // UNION detail logs + rollup data, then aggregate
+        let detail_pid = provider_group_id_sql("l");
+        let rollup_pid = provider_group_id_sql("r");
         let detail_pname = provider_name_coalesce("l", "p");
         let rollup_pname = provider_name_coalesce("r", "p2");
         let fresh_input_detail = fresh_input_sql("l");
@@ -1253,7 +1278,7 @@ impl Database {
                     THEN SUM(latency_sum) / SUM(request_count)
                     ELSE 0 END as avg_latency
             FROM (
-                SELECT l.provider_id, l.app_type,
+                SELECT {detail_pid} as provider_id, l.app_type,
                     {detail_pname} as provider_name,
                     COUNT(*) as request_count,
                     COALESCE(SUM({fresh_input_detail} + l.output_tokens), 0) as total_tokens,
@@ -1263,9 +1288,9 @@ impl Database {
                 FROM proxy_request_logs l
                 LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
                 {detail_where}
-                GROUP BY l.provider_id, l.app_type
+                GROUP BY {detail_pid}, l.app_type
                 UNION ALL
-                SELECT r.provider_id, r.app_type,
+                SELECT {rollup_pid} as provider_id, r.app_type,
                     {rollup_pname} as provider_name,
                     COALESCE(SUM(r.request_count), 0),
                     COALESCE(SUM({fresh_input_rollup} + r.output_tokens), 0),
@@ -1275,7 +1300,7 @@ impl Database {
                 FROM usage_daily_rollups r
                 LEFT JOIN providers p2 ON r.provider_id = p2.id AND r.app_type = p2.app_type
                 {rollup_where}
-                GROUP BY r.provider_id, r.app_type
+                GROUP BY {rollup_pid}, r.app_type
             )
             GROUP BY provider_id, app_type
             ORDER BY total_cost DESC"
@@ -2332,6 +2357,8 @@ mod tests {
                 request_id TEXT PRIMARY KEY,
                 app_type TEXT NOT NULL,
                 model TEXT NOT NULL,
+                request_model TEXT,
+                pricing_model TEXT,
                 input_tokens INTEGER NOT NULL,
                 output_tokens INTEGER NOT NULL,
                 cache_read_tokens INTEGER NOT NULL,
@@ -3349,9 +3376,11 @@ mod tests {
                 .sum::<u64>(),
             4
         );
-        assert!(provider_stats
-            .iter()
-            .any(|stat| stat.provider_id == "_codex_session" && stat.request_count == 1));
+        assert!(provider_stats.iter().any(|stat| {
+            stat.provider_id == "codex-official"
+                && stat.provider_name == "OpenAI Official"
+                && stat.request_count == 1
+        }));
         assert!(!provider_stats
             .iter()
             .any(|stat| stat.provider_id == "_gemini_session"));
@@ -3404,6 +3433,63 @@ mod tests {
         assert_eq!(codex_session_count, Some(1));
         assert_eq!(gemini_session_count, None);
         assert_eq!(session_log_count, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_effective_usage_dedup_matches_generated_request_alias() -> Result<(), AppError> {
+        let db = Database::memory()?;
+
+        {
+            let conn = lock_conn!(db.conn);
+            insert_usage_log(
+                &conn,
+                "proxy-alias",
+                "codex",
+                "weikuwu",
+                "GLM-5.2",
+                "proxy",
+                10_000,
+                66_521,
+                259,
+                4_224,
+                0,
+                200,
+                "0.0954",
+            )?;
+            conn.execute(
+                "UPDATE proxy_request_logs SET request_model = 'ccs-provider-1-GLM-5.2' WHERE request_id = 'proxy-alias'",
+                [],
+            )?;
+            insert_usage_log(
+                &conn,
+                "session-alias",
+                "codex",
+                "_codex_session",
+                "ccs-provider-1-glm-5.2",
+                "codex_session",
+                10_000,
+                66_521,
+                259,
+                4_224,
+                0,
+                200,
+                "0",
+            )?;
+        }
+
+        let logs = db.get_request_logs(&LogFilters::default(), 0, 10)?;
+        assert_eq!(logs.total, 1);
+        assert_eq!(logs.data[0].request_id, "proxy-alias");
+
+        let summary = db.get_usage_summary(None, None, Some("codex"), None, None)?;
+        assert_eq!(summary.total_requests, 1);
+
+        let provider_stats = db.get_provider_stats(None, None, Some("codex"), None, None)?;
+        assert_eq!(provider_stats.len(), 1);
+        assert_eq!(provider_stats[0].provider_id, "weikuwu");
+        assert_eq!(provider_stats[0].request_count, 1);
 
         Ok(())
     }
